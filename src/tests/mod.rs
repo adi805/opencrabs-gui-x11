@@ -715,6 +715,7 @@ pub mod onboarding_keys_test;
 pub mod onboarding_layout_test;
 pub mod onboarding_navigation_test;
 pub mod onboarding_no_silent_commit_test;
+pub mod onboarding_provider_sweep_test;
 pub mod onboarding_qr_popup_size_test;
 pub mod onboarding_setup_gaps_test;
 pub mod onboarding_shift_tab_hint_test;
