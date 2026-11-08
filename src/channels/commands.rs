@@ -2386,8 +2386,20 @@ pub async fn direct_model_switch(
         Ok(msg) => {
             if scope_all {
                 let session_svc = crate::services::SessionService::new(agent.context().clone());
+                // Canonicalise to the catalogue spelling BEFORE the bulk
+                // write: a catalogue that stores provider-qualified ids
+                // (ngodeai) must not receive the bare form, or the leak
+                // guard would treat every bulk-pinned session as stale.
+                let supported_all = config
+                    .providers
+                    .custom_by_name(&provider)
+                    .map(|c| c.models.clone())
+                    .unwrap_or_default();
+                let canonical =
+                    crate::utils::provider_pair::canonical_model(&provider, &model, &supported_all)
+                        .unwrap_or_else(|| model.clone());
                 match session_svc
-                    .set_provider_model_all_sessions(&provider, &model)
+                    .set_provider_model_all_sessions(&provider, &canonical)
                     .await
                 {
                     Ok(n) => format!(
@@ -2439,7 +2451,21 @@ pub async fn switch_model(
                 tracing::warn!("Failed to create provider after model switch: {}", e);
                 format!("Model saved but failed to reload provider: {}", e)
             })?;
-    let display_name = provider_display_name(&provider_name);
+    // Resolve the picked/typed model to the spelling the provider's own
+    // catalogue uses (2026-10-31 double-prefix regression). Catalogues
+    // disagree about whether the wire id carries the provider prefix
+    // (ngodeai stores `ngodeai/...`, everyone else stores bare ids), and a
+    // pin persisted in the OTHER spelling made the leak guard substitute
+    // the provider default on every turn while banners composed
+    // `provider/` over an already-qualified id (`ngodeai/ngodeai/...`).
+    // Canonicalise once here so every persisted surface (session swap,
+    // manual pin, DB row) agrees on one spelling. Unknown-but-typed names
+    // pass through unchanged: the request-time guard stays the last resort
+    // for genuinely foreign models.
+    let supported = new_provider.supported_models();
+    let model_name =
+        crate::utils::provider_pair::canonical_model(&provider_name, model_name, &supported)
+            .unwrap_or_else(|| model_name.to_string());
     // Pin per-session when possible; only touch the global slot for
     // callers without a session (kept for the bootstrap path).
     match session_id {
@@ -2455,7 +2481,13 @@ pub async fn switch_model(
         None => agent.swap_provider(new_provider),
     }
 
-    let change_msg = format!("[Model changed to {}/{}]", display_name, model_name);
+    // display_model never repeats the provider over an id that already
+    // carries it: `ngodeai` + `ngodeai/glm-5.3-flash` renders as
+    // `ngodeai/glm-5.3-flash`, not `ngodeai/ngodeai/glm-5.3-flash`.
+    let change_msg = format!(
+        "[Model changed to {}]",
+        crate::utils::provider_pair::display_model(&provider_name, &model_name)
+    );
 
     // Persist provider + model to session DB record so it survives restarts
     if let Some(sid) = session_id {

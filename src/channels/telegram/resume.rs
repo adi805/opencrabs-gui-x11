@@ -929,8 +929,8 @@ pub(crate) async fn resume_session_inner(
             } => {
                 if let Ok(mut s) = st.lock() {
                     s.display_queue.push(DisplayItem::System(format!(
-                        "🔄 Now using {}/{}",
-                        to_name, to_model
+                        "🔄 Now using {}",
+                        crate::utils::provider_pair::display_model(&to_name, &to_model)
                     )));
                 }
             }

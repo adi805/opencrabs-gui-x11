@@ -7,6 +7,7 @@ use crate::brain::agent::error::{AgentError, Result};
 use crate::brain::provider::{ContentBlock, LLMRequest, LLMResponse, Message, Role};
 use crate::brain::tools::ToolExecutionContext;
 use crate::services::{MessageService, SessionService};
+use crate::utils::provider_pair;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -257,12 +258,16 @@ pub(crate) fn compute_streaming_tok_per_sec(
 /// should ship with, plus `Some(stale)` when the resolved pin had to be
 /// substituted (so the caller can log the swap once with rich context).
 ///
-/// Logic: if the active provider's `supported_models()` list is non-empty
-/// AND the pinned model isn't in it, substitute the provider's own default
-/// and report the original as stale. Empty `supported_models()` means the
-/// provider hasn't declared a catalogue (no `/v1/models` impl, manual config
-/// without a `models = [...]` array) — accept the pin in that case so those
-/// providers still work.
+/// Logic: resolve the pin through `provider_pair::canonical_model` first, so
+/// a model that exists in the active provider's catalogue under a DIFFERENT
+/// spelling (bare id vs `provider/`-prefixed id — some catalogues store the
+/// provider-qualified wire id, e.g. ngodeai's `models = ["ngodeai/..."]`)
+/// passes through as the catalogue spelling instead of being dropped. Only
+/// a pin absent from the catalogue in BOTH spellings is treated as a stale
+/// cross-provider leak and substituted with the provider's own default.
+/// Empty `supported_models()` means the provider hasn't declared a catalogue
+/// (no `/v1/models` impl, manual config without a `models = [...]` array) —
+/// accept the pin in that case so those providers still work.
 ///
 /// Why a free function: the caller is an async method on `AgentService` with
 /// DB / provider lookups, but the substitution itself is pure. Factoring it
@@ -270,13 +275,13 @@ pub(crate) fn compute_streaming_tok_per_sec(
 /// `src/tests/` without spinning a runtime or mocking SessionService.
 pub(crate) fn guard_cross_provider_model_leak(
     resolved: String,
+    provider_name: &str,
     provider_default: &str,
     supported: &[String],
 ) -> (String, Option<String>) {
-    if supported.is_empty() || supported.iter().any(|m| m == &resolved) {
-        (resolved, None)
-    } else {
-        (provider_default.to_string(), Some(resolved))
+    match provider_pair::canonical_model(provider_name, &resolved, supported) {
+        Some(canonical) => (canonical, None),
+        None => (provider_default.to_string(), Some(resolved)),
     }
 }
 
@@ -963,8 +968,12 @@ impl AgentService {
             .unwrap_or_else(|| session_provider.default_model().to_string());
         let provider_default = session_provider.default_model().to_string();
         let supported = session_provider.supported_models();
-        let (mut model_name, leaked) =
-            guard_cross_provider_model_leak(resolved_model, &provider_default, &supported);
+        let (mut model_name, leaked) = guard_cross_provider_model_leak(
+            resolved_model,
+            session_provider.name(),
+            &provider_default,
+            &supported,
+        );
         if let Some(stale) = leaked {
             tracing::warn!(
                 "Stale model pin '{}' for session {} is not in active provider '{}' catalogue ({} entries) — \
@@ -2552,13 +2561,21 @@ impl AgentService {
                     let actual_model = {
                         let p = self.provider_for_session(session_id);
                         let supported = p.supported_models();
-                        if !supported.is_empty() && !supported.iter().any(|m| m == &model_name) {
-                            p.default_model().to_string()
-                        } else {
-                            model_name.clone()
-                        }
+                        // #2312 (2026-10-31): resolve through canonical_model instead of a
+                        // bare membership test. Providers whose catalogue stores names WITH
+                        // the provider prefix (ngodeai) rejected every bare pin here and the
+                        // telemetry key then read "ngodeai/ngodeai/<model>".
+                        crate::utils::provider_pair::canonical_model(
+                            &primary_from_name,
+                            &model_name,
+                            &supported,
+                        )
+                        .unwrap_or_else(|| model_name.clone())
                     };
-                    let provider_model_dim = format!("{}/{}", primary_from_name, actual_model);
+                    let provider_model_dim = crate::utils::provider_pair::display_model(
+                        &primary_from_name,
+                        &actual_model,
+                    );
 
                     self.record_provider_feedback(
                         session_id,
@@ -2889,13 +2906,21 @@ impl AgentService {
                     let actual_model = {
                         let p = self.provider_for_session(session_id);
                         let supported = p.supported_models();
-                        if !supported.is_empty() && !supported.iter().any(|m| m == &model_name) {
-                            p.default_model().to_string()
-                        } else {
-                            model_name.clone()
-                        }
+                        // #2312 (2026-10-31): resolve through canonical_model instead of a
+                        // bare membership test. Providers whose catalogue stores names WITH
+                        // the provider prefix (ngodeai) rejected every bare pin here and the
+                        // telemetry key then read "ngodeai/ngodeai/<model>".
+                        crate::utils::provider_pair::canonical_model(
+                            &primary_from_name,
+                            &model_name,
+                            &supported,
+                        )
+                        .unwrap_or_else(|| model_name.clone())
                     };
-                    let provider_model_dim = format!("{}/{}", primary_from_name, actual_model);
+                    let provider_model_dim = crate::utils::provider_pair::display_model(
+                        &primary_from_name,
+                        &actual_model,
+                    );
                     self.record_provider_feedback(
                         session_id,
                         "provider_error",
@@ -3337,13 +3362,21 @@ impl AgentService {
                     let actual_model = {
                         let p = self.provider_for_session(session_id);
                         let supported = p.supported_models();
-                        if !supported.is_empty() && !supported.iter().any(|m| m == &model_name) {
-                            p.default_model().to_string()
-                        } else {
-                            model_name.clone()
-                        }
+                        // #2312 (2026-10-31): resolve through canonical_model instead of a
+                        // bare membership test. Providers whose catalogue stores names WITH
+                        // the provider prefix (ngodeai) rejected every bare pin here and the
+                        // telemetry key then read "ngodeai/ngodeai/<model>".
+                        crate::utils::provider_pair::canonical_model(
+                            &primary_from_name,
+                            &model_name,
+                            &supported,
+                        )
+                        .unwrap_or_else(|| model_name.clone())
                     };
-                    let provider_model_dim = format!("{}/{}", primary_from_name, actual_model);
+                    let provider_model_dim = crate::utils::provider_pair::display_model(
+                        &primary_from_name,
+                        &actual_model,
+                    );
                     self.record_provider_feedback(
                         session_id,
                         "provider_error",
@@ -3704,7 +3737,9 @@ impl AgentService {
                     self.record_provider_feedback(
                         session_id,
                         "provider_error",
-                        &format!("{}/{}", active_name, model_name),
+                        // #2312: compose through display_model so a model id that
+                        // already carries the provider prefix is not doubled.
+                        &crate::utils::provider_pair::display_model(&active_name, &model_name),
                         Some(&err_msg),
                     );
 
@@ -3906,11 +3941,15 @@ impl AgentService {
                         session_id,
                         ProgressEvent::SelfHealingAlert {
                             message: format!(
-                                "Switched to {}/{} — {}/{} {}",
-                                swap.to_name,
-                                swap.to_model,
-                                swap.from_name,
-                                swap.from_model,
+                                "Switched to {} — {} {}",
+                                crate::utils::provider_pair::display_model(
+                                    &swap.to_name,
+                                    &swap.to_model
+                                ),
+                                crate::utils::provider_pair::display_model(
+                                    &swap.from_name,
+                                    &swap.from_model
+                                ),
                                 reason
                             ),
                         },

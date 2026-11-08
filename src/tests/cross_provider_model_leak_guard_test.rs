@@ -37,6 +37,7 @@ fn stale_pin_from_other_provider_is_substituted_with_active_default() {
     ];
     let (chosen, leaked) = guard_cross_provider_model_leak(
         "qwen-3.7-max-thinking".to_string(),
+        "modelscope-qwen",
         "Qwen-Ambassador/Qwen3.7-Max",
         &supported,
     );
@@ -56,6 +57,7 @@ fn pinned_model_in_active_catalogue_passes_through_untouched() {
     let supported = vec!["Qwen-Ambassador/Qwen3.7-Max".to_string()];
     let (chosen, leaked) = guard_cross_provider_model_leak(
         "Qwen-Ambassador/Qwen3.7-Max".to_string(),
+        "modelscope-qwen",
         "Qwen-Ambassador/Qwen3.7-Max",
         &supported,
     );
@@ -77,6 +79,7 @@ fn empty_catalogue_accepts_any_pin() {
     let supported: Vec<String> = vec![];
     let (chosen, leaked) = guard_cross_provider_model_leak(
         "any-model-name-the-user-typed".to_string(),
+        "minimal",
         "provider-default",
         &supported,
     );
@@ -92,8 +95,12 @@ fn substitution_uses_active_provider_default_not_the_pin() {
     // substitute-on-miss test but break the user's intent (the active
     // provider may have a curated default that isn't supported[0]).
     let supported = vec!["list-first-model".to_string(), "active-default".to_string()];
-    let (chosen, leaked) =
-        guard_cross_provider_model_leak("stale-pin".to_string(), "active-default", &supported);
+    let (chosen, leaked) = guard_cross_provider_model_leak(
+        "stale-pin".to_string(),
+        "modelscope-qwen",
+        "active-default",
+        &supported,
+    );
     assert_eq!(chosen, "active-default");
     assert_eq!(leaked.as_deref(), Some("stale-pin"));
 }
@@ -107,6 +114,7 @@ fn case_sensitive_match_no_partial_substring_pass_through() {
     let supported = vec!["Qwen-Ambassador/Qwen3.7-Max".to_string()];
     let (chosen, leaked) = guard_cross_provider_model_leak(
         "qwen-ambassador/qwen3.7-max".to_string(),
+        "modelscope-qwen",
         "Qwen-Ambassador/Qwen3.7-Max",
         &supported,
     );
@@ -115,6 +123,73 @@ fn case_sensitive_match_no_partial_substring_pass_through() {
         "lowercased pin must be substituted, not silently coerced"
     );
     assert!(leaked.is_some());
+}
+
+// ── 2026-10-31 regression: prefix-tolerant canonicalisation ────────
+//
+// ngodeai is the ONLY custom provider whose catalogue stores the
+// provider-qualified wire id (`models = ["ngodeai/...", ...]`), while every
+// other provider stores bare ids. Two failures fell out of that:
+//   1. A `/models ngodeai/glm-5.3-flash-fast` switch persisted the BARE
+//      `glm-5.3-flash-fast` in some surfaces; the old guard saw a bare pin
+//      against a prefixed catalogue and silently substituted the provider
+//      default EVERY TURN — the user's pick never survived.
+//   2. Banners composed `provider/model` over a model id that already
+//      carried the prefix → `ngodeai/ngodeai/glm-5.3-flash` (204 log hits
+//      on 2026-10-31 alone).
+// The guard now resolves EITHER spelling to the catalogue's own via
+// `provider_pair::canonical_model` before declaring anything stale.
+
+#[test]
+fn bare_pin_against_prefixed_catalogue_resolves_not_substituted() {
+    // `glm-5.3-flash-fast` IS a real ngodeai model, just stored prefixed.
+    let supported = vec!["ngodeai/glm-5.3-flash".to_string()];
+    let (chosen, leaked) = guard_cross_provider_model_leak(
+        "glm-5.3-flash".to_string(),
+        "ngodeai",
+        "ngodeai/glm-5.3-flash",
+        &supported,
+    );
+    assert_eq!(
+        chosen, "ngodeai/glm-5.3-flash",
+        "a bare pin for a prefixed-catalogue model must resolve to the catalogue spelling, \
+         not be substituted with the default"
+    );
+    assert!(leaked.is_none());
+}
+
+#[test]
+fn prefixed_pin_against_bare_catalogue_resolves_not_substituted() {
+    // Symmetric case: catalogue stores bare ids, pin carries the provider
+    // prefix (e.g. restored from a display string).
+    let supported = vec![
+        "glm-5.3-flash".to_string(),
+        "glm-5.3-flash-fast".to_string(),
+    ];
+    let (chosen, leaked) = guard_cross_provider_model_leak(
+        "ngodeai/glm-5.3-flash-fast".to_string(),
+        "ngodeai",
+        "glm-5.3-flash",
+        &supported,
+    );
+    assert_eq!(chosen, "glm-5.3-flash-fast");
+    assert!(leaked.is_none());
+}
+
+#[test]
+fn self_prefixed_pin_in_prefixed_catalogue_passes_through() {
+    // Double-prefix-shaped pin `ngodeai/ngodeai/glm-5.3-flash`: stripping the
+    // provider prefix leaves `ngodeai/glm-5.3-flash`, which IS the catalogue
+    // spelling — accept it as-is so a display artifact never breaks routing.
+    let supported = vec!["ngodeai/glm-5.3-flash".to_string()];
+    let (chosen, leaked) = guard_cross_provider_model_leak(
+        "ngodeai/ngodeai/glm-5.3-flash".to_string(),
+        "ngodeai",
+        "ngodeai/glm-5.3-flash",
+        &supported,
+    );
+    assert_eq!(chosen, "ngodeai/ngodeai/glm-5.3-flash");
+    assert!(leaked.is_none());
 }
 
 // ── Source-level invariant guard ──────────────────────────────────

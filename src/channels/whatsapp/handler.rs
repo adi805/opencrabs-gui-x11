@@ -1857,7 +1857,11 @@ pub(crate) async fn handle_message(
             } => {
                 let client = client_cb.clone();
                 let jid = jid_cb.clone();
-                let text = format!("{}\n\n🔄 Now using {}/{}", MSG_HEADER, to_name, to_model);
+                let text = format!(
+                    "{}\n\n🔄 Now using {}",
+                    MSG_HEADER,
+                    crate::utils::provider_pair::display_model(&to_name, &to_model)
+                );
                 tokio::spawn(async move {
                     let msg = waproto::whatsapp::Message {
                         conversation: Some(text),

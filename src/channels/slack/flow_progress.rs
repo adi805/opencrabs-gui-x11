@@ -242,7 +242,10 @@ pub(crate) fn build_flow_progress(
                 } => {
                     tokio::spawn(async move {
                         let session = client.open_session(&token);
-                        let text = format!("🔄 Now using {to_name}/{to_model}");
+                        let text = format!(
+                            "🔄 Now using {}",
+                            crate::utils::provider_pair::display_model(&to_name, &to_model)
+                        );
                         let req = SlackApiChatPostMessageRequest::new(
                             channel,
                             SlackMessageContent::new().with_text(text),
