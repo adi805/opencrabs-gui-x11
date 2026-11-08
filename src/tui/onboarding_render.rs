@@ -943,6 +943,14 @@ fn render_provider_auth(
 
     lines.push(Line::from(""));
 
+    // #2265: say what saving from this step does to the other providers BEFORE
+    // the user presses it. The exclusive-enable sweep is deliberate (one active
+    // provider per config, #2262), but it used to be silent.
+    lines.push(Line::from(Span::styled(
+        "   Saving enables this provider only; other provider sections are disabled.",
+        Style::default().fg(theme::role(Role::Gray)),
+    )));
+
     if is_custom {
         let name_focused = wizard.auth_field == AuthField::CustomName;
         let base_focused = wizard.auth_field == AuthField::CustomBaseUrl;

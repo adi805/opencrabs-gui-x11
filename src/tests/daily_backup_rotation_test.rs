@@ -140,3 +140,88 @@ fn prune_counts_rotated_siblings_under_max_days() {
         "oldest backup must be pruned, got {names:?}"
     );
 }
+
+/// #2265: one wizard save fires 20+ writes back to back. Once the live file
+/// has been rotated, the NEXT call must compare against that rotation, not
+/// against the day's older snapshot — otherwise every key write copies the
+/// same unchanged state again (five byte-identical .bak files, 2026-10-29).
+#[test]
+fn unchanged_content_after_rotation_does_not_spawn_more_backups() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("f.toml");
+
+    fs::write(&file, "v1").expect("write v1");
+    daily_backup(&file, 20);
+    fs::write(&file, "v2").expect("write v2");
+    daily_backup(&file, 20);
+
+    let after_rotation = bak_names(tmp.path());
+    assert_eq!(after_rotation.len(), 2, "seed state: {after_rotation:?}");
+
+    // A wizard save keeps calling daily_backup while the live file stays at v2.
+    for _ in 0..4 {
+        daily_backup(&file, 20);
+    }
+
+    let names = bak_names(tmp.path());
+    assert_eq!(
+        names.len(),
+        2,
+        "unchanged live content must not rotate again: {names:?}"
+    );
+    assert_eq!(
+        names.iter().filter(|n| read(tmp.path(), n) == "v2").count(),
+        1,
+        "v2 must be captured exactly once: {names:?}"
+    );
+}
+
+/// #2265: prune must drop the OLDEST snapshot by mtime. The previous name
+/// sort put `f.toml.bak` last alphabetically, so in a reverse-sorted list it
+/// ranked as "newest" and a genuinely fresher dated snapshot got evicted.
+#[test]
+fn prune_keeps_newest_by_mtime_not_by_name() {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn write_with_mtime(path: &std::path::Path, body: &str, secs: u64) {
+        fs::write(path, body).expect("write");
+        let stamp = UNIX_EPOCH + Duration::from_secs(secs);
+        let handle = fs::File::options().write(true).open(path).expect("open");
+        handle.set_modified(stamp).expect("set_modified");
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("f.toml");
+
+    // Stale plain-named backup sorts LAST alphabetically but is the oldest.
+    write_with_mtime(&tmp.path().join("f.toml.bak"), "stale", 1_600_000_000);
+    write_with_mtime(
+        &tmp.path().join("f.toml.2026-09-01.bak"),
+        "older",
+        1_700_000_000,
+    );
+    write_with_mtime(
+        &tmp.path().join("f.toml.2026-09-20.bak"),
+        "newer",
+        1_750_000_000,
+    );
+
+    fs::write(&file, "current").expect("write live");
+    // max_days=3: today's new snapshot + the two newest dated ones survive.
+    daily_backup(&file, 3);
+
+    let names = bak_names(tmp.path());
+    assert_eq!(names.len(), 3, "expected 3 survivors, got {names:?}");
+    assert!(
+        !names.iter().any(|n| n == "f.toml.bak"),
+        "oldest plain backup must be pruned: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "f.toml.2026-09-01.bak"),
+        "fresher dated snapshot must survive: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "f.toml.2026-09-20.bak"),
+        "freshest dated snapshot must survive: {names:?}"
+    );
+}

@@ -170,6 +170,10 @@ pub struct OnboardingWizard {
     /// preserves on-disk `[providers.stt.*]` / `[providers.tts.*]` truth
     /// instead of rewriting it from page state.
     pub voice_step_touched: bool,
+    /// True only after this run actually went through the provider step (#2265).
+    /// Gates provider writes so a quick-jump save from `Complete` cannot rewrite
+    /// the enabled flags and model of a provider the user never picked.
+    pub provider_step_touched: bool,
     /// Whether onboarding auto-triggered because no config exists (true) vs
     /// user manually re-ran it via /onboard (false). Used to decide whether
     /// to send the first-time welcome message on completion.
@@ -532,6 +536,7 @@ impl OnboardingWizard {
             quick_jump: false,
             quick_jump_done: false,
             voice_step_touched: false,
+            provider_step_touched: false,
             is_first_time: false,
             resume_notice: None,
             user_scroll_offset: 0,

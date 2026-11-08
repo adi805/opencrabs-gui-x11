@@ -53,18 +53,24 @@ pub fn daily_backup(path: &Path, max_days: usize) {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let today_backup = parent.join(format!("{stem}.{today}.bak"));
 
-    // Today's backup exists: skip only when content is identical. On a real
-    // change, rotate the current file to a timestamped sibling first — the
-    // day's first snapshot stays intact AND every later pre-write state gets
-    // its own copy. On read error, do nothing (never destroy on uncertainty).
-    if today_backup.exists() {
-        let identical = match (fs::read(path), fs::read(&today_backup)) {
-            (Ok(cur), Ok(bak)) => cur == bak,
-            _ => true,
-        };
-        if identical {
-            return;
+    // #2265: compare the live file against the MOST RECENT snapshot, not only
+    // today's first one. One wizard save writes 20+ keys back to back; with the
+    // day-snapshot-only test every write rotated another full copy of a file
+    // that had not changed since the previous rotation (five byte-identical
+    // .bak files from a single save, 2026-10-29). Reading the newest backup by
+    // mtime collapses that to one copy per distinct state.
+    if let Some(newest) = newest_backup(parent, &stem) {
+        match (fs::read(path), fs::read(&newest)) {
+            (Ok(cur), Ok(bak)) if cur == bak => return,
+            (Ok(_), Ok(_)) => {}
+            // On read error, do nothing (never destroy on uncertainty).
+            _ => return,
         }
+    }
+
+    if today_backup.exists() {
+        // Rotate the current state to a timestamped sibling so the day's first
+        // snapshot stays intact AND every later pre-write state keeps a copy.
         let stamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S");
         let mut rotated = parent.join(format!("{stem}.{stamp}.bak"));
         let mut n = 1u32;
@@ -86,28 +92,40 @@ pub fn daily_backup(path: &Path, max_days: usize) {
         tracing::debug!("Daily backup: {}", today_backup.display());
     }
 
-    // Prune old backups beyond max_days
-    let prefix = format!("{stem}.");
-    let suffix = ".bak";
-    if let Ok(entries) = fs::read_dir(parent) {
-        let mut backups: Vec<String> = entries
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with(&prefix) && name.ends_with(suffix) && name != stem {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        backups.sort();
-        backups.reverse(); // newest first
-        for old in backups.iter().skip(max_days) {
-            let _ = fs::remove_file(parent.join(old));
-            tracing::debug!("Pruned old backup: {old}");
-        }
+    // Prune beyond `max_days`, oldest first BY MTIME. The previous name sort
+    // evicted dated snapshots before `config.toml.bak` (alphabetically last),
+    // so the newest real snapshot could disappear while a stale one stayed
+    // (#2265).
+    for old in backups_by_mtime(parent, &stem).into_iter().skip(max_days) {
+        let _ = fs::remove_file(&old);
+        tracing::debug!("Pruned old backup: {}", old.display());
     }
+}
+
+/// Every backup of `stem` in `parent`, newest first by mtime.
+fn backups_by_mtime(parent: &Path, stem: &str) -> Vec<PathBuf> {
+    let prefix = format!("{stem}.");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !(name.starts_with(&prefix) && name.ends_with(".bak")) {
+                return None;
+            }
+            let mtime = e.metadata().and_then(|m| m.modified()).ok()?;
+            Some((mtime, e.path()))
+        })
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Newest backup of `stem` in `parent`, by mtime.
+fn newest_backup(parent: &Path, stem: &str) -> Option<PathBuf> {
+    backups_by_mtime(parent, stem).into_iter().next()
 }
 
 /// Snapshot current config + keys as "last known good".

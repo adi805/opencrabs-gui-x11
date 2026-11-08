@@ -337,12 +337,16 @@ impl OnboardingWizard {
     /// Shared body of the two save entry points. `sweep_providers` is the
     /// provider-pick flag documented on `apply_config_preserving_providers`.
     fn apply_config_inner(&self, sweep_providers: bool) -> Result<(), String> {
-        // Determine which sections to write based on quick_jump + current step
+        // Determine which sections to write based on quick_jump + current step.
+        //
+        // #2265: `Complete` is NOT in the provider clause. Landing on the last
+        // step to change an unrelated setting used to write the provider
+        // section from whatever the selector happened to hold, enabling a
+        // provider the user never picked and overwriting its model. Only a run
+        // that actually went through ProviderAuth carries a provider pick.
         let write_provider = !self.quick_jump
-            || matches!(
-                self.step,
-                OnboardingStep::ProviderAuth | OnboardingStep::Complete
-            );
+            || self.provider_step_touched
+            || matches!(self.step, OnboardingStep::ProviderAuth);
         let write_channels = !self.quick_jump
             || matches!(
                 self.step,
@@ -492,6 +496,10 @@ impl OnboardingWizard {
                         .map(|p| p.config_section.to_string())
                         .collect()
                 };
+                tracing::info!(
+                    "Onboarding: sweeping {} provider section(s), enabling {section} only (#2265)",
+                    all_sections.len()
+                );
                 for s in &all_sections {
                     if let Err(e) = Config::write_key(s, "enabled", "false") {
                         tracing::warn!("Failed to write {}.enabled: {}", s, e);

@@ -99,6 +99,9 @@ impl OnboardingWizard {
                         Some("Select a model, or type its name in the Model field".to_string());
                     return;
                 }
+                // This run went through the provider step, so its writes carry
+                // the user's own pick and may sweep the other flags (#2265).
+                self.provider_step_touched = true;
                 // QuickStart: skip channels, go straight to daemon
                 if self.mode == WizardMode::QuickStart {
                     self.step = OnboardingStep::Daemon;
