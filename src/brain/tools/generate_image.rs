@@ -14,7 +14,9 @@
 //!   DashScope/Qwen-Image, or any custom provider that exposes the
 //!   OpenAI images endpoint by setting `[providers.<name>]
 //!   generation_model = "..."` in `config.toml` (and api_key + base_url
-//!   already there for chat). img2img is NOT supported on this backend.
+//!   already there for chat). img2img sends `/images/edits` as JSON with
+//!   `image` (a `data:` URL, or an array of them) and retries as multipart
+//!   `image[]` when the endpoint rejects that body shape.
 //!
 //! Candidate selection mirrors the vision chain (#1672, parity with
 //! #1318): the session's current provider first, then the ordered
@@ -68,7 +70,7 @@ impl GenerationCandidate {
     }
 
     /// Every backend takes input images (#2045): Gemini as `inlineData`
-    /// parts, the OpenAI-compatible wire as `/images/edits` with `image[]`.
+    /// parts, the OpenAI-compatible wire as `/images/edits` (JSON `image`, multipart `image[]` fallback).
     fn supports_image_input(&self) -> bool {
         true
     }
@@ -481,20 +483,59 @@ impl GenerateImageTool {
             .build()
             .map_err(|e| super::error::ToolError::Execution(e.to_string()))?;
 
-        let request = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", api_key));
-        let request = if images.is_empty() {
-            request
+        let response = if images.is_empty() {
+            client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
                 .header("Content-Type", "application/json")
                 .json(&body)
+                .send()
+                .await
+                .map_err(|e| super::error::ToolError::Execution(e.to_string()))?
         } else {
-            request.multipart(openai_edit_form(model, prompt, images).await?)
+            // Relay-style and InferHub endpoints take edits as JSON with
+            // `image` (a data URL, or an array of them); classic [OI] only
+            // understands multipart `image[]`. Send JSON first, and retry as
+            // multipart only when the endpoint rejects the body shape — never
+            // on auth, budget, rate-limit or upstream errors, where a second
+            // call would just burn the same failure again.
+            let data_urls = image_data_urls(images).await?;
+            let edit_body = openai_edit_body(model, prompt, &data_urls);
+            let json_response = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .json(&edit_body)
+                .send()
+                .await
+                .map_err(|e| super::error::ToolError::Execution(e.to_string()))?;
+            let status = json_response.status();
+            if status.is_success() || !json_edit_body_rejected(status.as_u16()) {
+                json_response
+            } else {
+                let json_err = json_response.text().await.unwrap_or_default();
+                let multipart_response = client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .multipart(openai_edit_form(model, prompt, images).await?)
+                    .send()
+                    .await
+                    .map_err(|e| super::error::ToolError::Execution(e.to_string()))?;
+                if multipart_response.status().is_success() {
+                    multipart_response
+                } else {
+                    let mp_status = multipart_response.status().as_u16();
+                    let mp_err = multipart_response.text().await.unwrap_or_default();
+                    return Ok(ToolResult::error(format!(
+                        "[OI] images API error {} (json) / {} (multipart): {} | {}",
+                        status.as_u16(),
+                        mp_status,
+                        json_err,
+                        mp_err
+                    )));
+                }
+            }
         };
-        let response = request
-            .send()
-            .await
-            .map_err(|e| super::error::ToolError::Execution(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -675,6 +716,43 @@ async fn build_image_part(src: &str) -> super::error::Result<Value> {
     Ok(serde_json::json!({
         "inlineData": { "mimeType": mime_type, "data": base64_encode(&bytes) }
     }))
+}
+
+/// Statuses that mean "this endpoint did not accept the JSON edit body" — the
+/// shapes a multipart-only `/images/edits` answers with. Anything else (auth,
+/// budget, rate limit, upstream) is reported without a second call.
+pub(crate) fn json_edit_body_rejected(status: u16) -> bool {
+    matches!(status, 400 | 404 | 405 | 406 | 415 | 422 | 501)
+}
+
+/// One `data:` URL per input image, in order — the JSON wire's image payload.
+async fn image_data_urls(images: &[String]) -> super::error::Result<Vec<String>> {
+    use super::analyze_image::base64_encode;
+
+    let mut urls = Vec::with_capacity(images.len());
+    for src in images {
+        let (bytes, mime, _) = fetch_image_bytes(src).await?;
+        urls.push(format!("data:{};base64,{}", mime, base64_encode(&bytes)));
+    }
+    Ok(urls)
+}
+
+/// The JSON body for `/images/edits`: `image` is a bare string for one input
+/// and an array for several. Relay-style and InferHub endpoints accept this
+/// shape; [OI] proper answers 400/415 and the caller retries as multipart.
+pub(crate) fn openai_edit_body(model: &str, prompt: &str, data_urls: &[String]) -> Value {
+    let image = if data_urls.len() == 1 {
+        Value::String(data_urls[0].clone())
+    } else {
+        Value::Array(data_urls.iter().cloned().map(Value::String).collect())
+    };
+    serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "response_format": "b64_json",
+        "image": image,
+    })
 }
 
 /// The multipart body for `/images/edits`: the fields, then one `image[]` per input.

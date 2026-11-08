@@ -3,7 +3,8 @@
 //! then the text; OpenAI-compatible inputs switch the call to `/images/edits`.
 
 use crate::brain::tools::generate_image::{
-    GenerateImageTool, gemini_request_parts, openai_images_path, parse_image_inputs,
+    GenerateImageTool, gemini_request_parts, json_edit_body_rejected, openai_edit_body,
+    openai_images_path, parse_image_inputs,
 };
 use crate::brain::tools::r#trait::Tool;
 use serde_json::{Value, json};
@@ -92,4 +93,43 @@ fn the_schema_accepts_one_string_or_a_list() {
         .expect("array form");
     assert_eq!(list["items"]["type"], "string");
     assert_eq!(list["maxItems"], 8);
+}
+
+#[test]
+fn openai_json_edit_body_carries_one_image_as_a_string() {
+    let body = openai_edit_body(
+        "img-model",
+        "make it green",
+        &["data:image/png;base64,AAA".to_string()],
+    );
+    assert_eq!(body["model"], "img-model");
+    assert_eq!(body["prompt"], "make it green");
+    assert_eq!(body["response_format"], "b64_json");
+    assert_eq!(body["image"], "data:image/png;base64,AAA");
+}
+
+#[test]
+fn openai_json_edit_body_carries_several_images_as_an_array_in_order() {
+    let urls = vec![
+        "data:image/png;base64,AAA".to_string(),
+        "data:image/jpeg;base64,BBB".to_string(),
+    ];
+    let body = openai_edit_body("img-model", "combine", &urls);
+    let arr = body["image"].as_array().expect("image is an array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0], "data:image/png;base64,AAA");
+    assert_eq!(arr[1], "data:image/jpeg;base64,BBB");
+}
+
+#[test]
+fn only_body_shape_rejections_fall_back_to_multipart() {
+    for status in [400u16, 404, 405, 406, 415, 422, 501] {
+        assert!(json_edit_body_rejected(status), "{status} should fall back");
+    }
+    for status in [401u16, 402, 403, 413, 429, 500, 502] {
+        assert!(
+            !json_edit_body_rejected(status),
+            "{status} must not be retried"
+        );
+    }
 }
