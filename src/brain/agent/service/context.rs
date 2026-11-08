@@ -1313,24 +1313,9 @@ impl AgentService {
 
         let summary = Self::extract_text_from_response(&response);
 
-        if let Err(e) = Self::save_compaction_summary_to_memory(&summary).await {
-            tracing::warn!("Failed to save compaction summary to daily log: {}", e);
+        if let Err(e) = Self::save_compaction_summary_to_memory(&summary, session_id).await {
+            tracing::warn!("Failed to archive compaction summary: {}", e);
         }
-
-        // Index the updated memory file in the background so memory_search picks it up.
-        let memory_path = crate::config::opencrabs_home()
-            .join("memory")
-            .join(format!("{}.md", chrono::Local::now().format("%Y-%m-%d")));
-        tokio::spawn(async move {
-            match crate::memory::get_store() {
-                Ok(store) => {
-                    if let Err(e) = crate::memory::index_file(store, &memory_path).await {
-                        tracing::warn!("Failed to index daily note after compaction: {e}");
-                    }
-                }
-                Err(e) => tracing::warn!("Memory store unavailable, daily note not indexed: {e}"),
-            }
-        });
 
         // #1930: the prompt ASKS for a ~3 000-token document, but asking is not
         // enforcing — measured 2026-10-04, 208 of the 210 live markers exceeded
@@ -1783,23 +1768,35 @@ impl AgentService {
         applied_marker
     }
 
-    /// Save a compaction summary to a daily memory log at `~/.opencrabs/memory/YYYY-MM-DD.md`.
+    /// Archive a compaction summary under
+    /// `~/.opencrabs/memory/compaction/<session>/YYYY-MM-DD.md`.
     ///
-    /// Multiple compactions per day append to the same file. The brain workspace's
-    /// `MEMORY.md` is left untouched — it stays as user-curated durable memory.
+    /// #2285: this used to append the verbatim continuation document to the
+    /// profile-wide daily note (`memory/YYYY-MM-DD.md`). That document opens
+    /// with `## 0. IMMEDIATE TASK` and `**Obligation status: OPEN**`, so every
+    /// other session in the profile that read the daily note was primed to
+    /// resume an unrelated session's task. The archive sits one level below the
+    /// paths `reindex` walks (`memory/*.md` and `memory/archive/*.md`) and is
+    /// never indexed into the shared store, so the imperative text stays with
+    /// the session that produced it. The brain workspace's `MEMORY.md` is left
+    /// untouched either way.
     pub(super) async fn save_compaction_summary_to_memory(
         summary: &str,
+        session_id: Uuid,
     ) -> std::result::Result<(), String> {
-        let memory_dir = crate::config::opencrabs_home().join("memory");
+        let archive_dir = crate::config::opencrabs_home()
+            .join("memory")
+            .join("compaction")
+            .join(session_id.to_string());
 
-        std::fs::create_dir_all(&memory_dir)
-            .map_err(|e| format!("Failed to create memory directory: {}", e))?;
+        std::fs::create_dir_all(&archive_dir)
+            .map_err(|e| format!("Failed to create compaction archive directory: {}", e))?;
 
         let date = chrono::Local::now().format("%Y-%m-%d");
-        let memory_path = memory_dir.join(format!("{}.md", date));
+        let archive_path = archive_dir.join(format!("{}.md", date));
 
         // Read existing content (if any — multiple compactions per day stack)
-        let existing = std::fs::read_to_string(&memory_path).unwrap_or_default();
+        let existing = std::fs::read_to_string(&archive_path).unwrap_or_default();
 
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         let new_content = format!(
@@ -1809,10 +1806,10 @@ impl AgentService {
             summary
         );
 
-        std::fs::write(&memory_path, new_content.trim_start())
-            .map_err(|e| format!("Failed to write daily memory log: {}", e))?;
+        std::fs::write(&archive_path, new_content.trim_start())
+            .map_err(|e| format!("Failed to write compaction archive: {}", e))?;
 
-        tracing::info!("Saved compaction summary to {}", memory_path.display());
+        tracing::info!("Saved compaction summary to {}", archive_path.display());
         Ok(())
     }
 }
