@@ -1031,14 +1031,25 @@ pub(crate) async fn handle_message(
 
             async move {
                 let (file_id, msg_type, fname) = file_info?;
-                let file = bot.get_file(file_id).await.ok()?;
+                let file = match get_file_with_retry(&bot, file_id).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!("Telegram: attachment get_file failed: {e}");
+                        return None;
+                    }
+                };
                 let url = format!(
                     "https://api.telegram.org/file/bot{}/{}",
                     token.as_str(),
                     file.path
                 );
-                let bytes = reqwest::get(&url).await.ok()?.bytes().await.ok()?.to_vec();
-                Some((msg_type, bytes, fname))
+                match crate::utils::download::fetch_bytes(&url).await {
+                    Ok(bytes) => Some((msg_type, bytes, fname)),
+                    Err(e) => {
+                        tracing::warn!("Telegram: attachment prefetch failed: {e}");
+                        None
+                    }
+                }
             }
         };
 

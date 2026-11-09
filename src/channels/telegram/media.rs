@@ -7,7 +7,37 @@
 //! keeps every existing call site and test import stable).
 
 use super::send::message_in_thread;
+use crate::utils::retry::{RetryConfig, retry_with_check};
 use teloxide::prelude::*;
+
+/// `get_file` with retry for transient transport failures (#2261).
+///
+/// Telegram's file endpoint is a short-lived HTTPS path; a DNS blip or a reset
+/// usually succeeds a second later. Terminal API answers (bad `file_id`, the
+/// 20 MB cap, auth, forbidden) are returned immediately so the caller can tell
+/// the user what actually went wrong instead of retrying a hopeless request.
+pub(crate) async fn get_file_with_retry(
+    bot: &Bot,
+    file_id: teloxide::types::FileId,
+) -> Result<teloxide::types::File, teloxide::RequestError> {
+    retry_with_check(
+        || {
+            let bot = bot.clone();
+            let file_id = file_id.clone();
+            async move { bot.get_file(file_id).await }
+        },
+        &RetryConfig::default(),
+        |e| {
+            let s = e.to_string();
+            !(s.contains("file is too big")
+                || s.contains("Bad Request")
+                || s.contains("Unauthorized")
+                || s.contains("Forbidden")
+                || s.contains("Not Found"))
+        },
+    )
+    .await
+}
 
 pub(crate) fn prepend_caption(caption: &str, body: String) -> String {
     if caption.trim().is_empty() {
@@ -247,7 +277,7 @@ pub(crate) async fn save_telegram_file(
     dir: &std::path::Path,
     filename: &str,
 ) {
-    let file = match bot.get_file(file_id).await {
+    let file = match get_file_with_retry(bot, file_id).await {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!("Telegram: tmp save: get_file failed: {e}");
@@ -255,14 +285,8 @@ pub(crate) async fn save_telegram_file(
         }
     };
     let url = format!("https://api.telegram.org/file/bot{bot_token}/{}", file.path);
-    let bytes = match reqwest::get(&url).await {
-        Ok(r) => match r.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("Telegram: tmp save: read bytes failed: {e}");
-                return;
-            }
-        },
+    let bytes = match crate::utils::download::fetch_bytes(&url).await {
+        Ok(b) => b,
         Err(e) => {
             tracing::warn!("Telegram: tmp save: download failed: {e}");
             return;
@@ -439,7 +463,7 @@ pub(crate) async fn fetch_file_or_notify(
     kind: &str,
 ) -> Option<teloxide::types::File> {
     use teloxide::payloads::SendMessageSetters;
-    match bot.get_file(file_id.clone()).await {
+    match get_file_with_retry(bot, file_id.clone()).await {
         Ok(f) => Some(f),
         Err(e) => {
             let s = e.to_string();

@@ -619,10 +619,9 @@ pub(crate) async fn handle_message(
 
     if let Some(audio) = audio_attachment
         && voice_config.stt_enabled
-        && let Ok(resp) = reqwest::get(&audio.url).await
-        && let Ok(bytes) = resp.bytes().await
+        && let Ok(bytes) = crate::utils::download::fetch_bytes(&audio.url).await
     {
-        match crate::channels::voice::transcribe(bytes.to_vec(), &voice_config).await {
+        match crate::channels::voice::transcribe(bytes, &voice_config).await {
             Ok(transcript) => {
                 tracing::info!(
                     "Discord: transcribed voice: {}",
@@ -690,14 +689,8 @@ pub(crate) async fn handle_message(
                 content.push_str(&format!(" <<IMG:{}>>", attachment.url));
             }
 
-            let bytes = match reqwest::get(attachment.url.as_str()).await {
-                Ok(resp) => match resp.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!("Discord: failed to read attachment {fname}: {e}");
-                        continue;
-                    }
-                },
+            let bytes = match crate::utils::download::fetch_bytes(attachment.url.as_str()).await {
+                Ok(b) => b,
                 Err(e) => {
                     tracing::warn!("Discord: failed to download attachment {fname}: {e}");
                     continue;
