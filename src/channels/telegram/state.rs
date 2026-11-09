@@ -133,6 +133,20 @@ struct ChannelOwnershipMirror {
     channel_owner: HashMap<(i64, Option<i32>), Uuid>,
 }
 
+/// Where a poll the bot created came from (#2288).
+///
+/// `PollAnswer` updates identify the poll only by id, so the chat, thread,
+/// session and option labels are captured when the poll is sent.
+#[derive(Debug, Clone)]
+pub(crate) struct PollRoute {
+    pub poll_id: String,
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub session_id: Uuid,
+    pub question: String,
+    pub options: Vec<String>,
+}
+
 /// Shared Telegram state for proactive messaging.
 ///
 /// Set when the bot connects (agent stores Bot) and when the owner
@@ -380,6 +394,12 @@ pub struct TelegramState {
     /// chat.  Entries are ephemeral, in-memory, and evictable (LIFO
     /// overwrite is fine; one active set per session is the norm).
     callback_origins: std::sync::Mutex<HashMap<String, Uuid>>,
+    /// Polls the bot created, keyed by poll id (#2288): `PollAnswer` updates
+    /// carry no chat id, so this is the only way to route a vote back to the
+    /// conversation that asked the question. Bounded FIFO (128 entries): old
+    /// polls fall out and a vote on one logs as unknown instead of leaking
+    /// memory for the life of the process.
+    poll_routes: std::sync::Mutex<std::collections::VecDeque<PollRoute>>,
 }
 
 impl Default for TelegramState {
@@ -489,6 +509,7 @@ impl TelegramState {
             last_sticky_action: std::sync::Mutex::new(HashMap::new()),
             media_dedup: super::outbound_dedup::MediaSendDedup::default(),
             callback_origins: std::sync::Mutex::new(HashMap::new()),
+            poll_routes: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -598,6 +619,31 @@ impl TelegramState {
             .lock()
             .ok()
             .and_then(|map| map.get(callback_data).copied())
+    }
+
+    /// Remember which conversation/session a poll came from (#2288).
+    ///
+    /// Telegram's `PollAnswer` update carries only the poll id, the voter and
+    /// the chosen option indexes: no chat, no thread, no session. Recording
+    /// the route at send time is what lets a vote reach the agent at all.
+    pub(crate) fn record_poll_route(&self, route: PollRoute) {
+        const MAX_ROUTES: usize = 128;
+        if let Ok(mut routes) = self.poll_routes.lock() {
+            routes.push_back(route);
+            while routes.len() > MAX_ROUTES {
+                routes.pop_front();
+            }
+        }
+    }
+
+    /// Resolve a poll id back to the route recorded when it was sent (#2288).
+    pub(crate) fn poll_route(&self, poll_id: &str) -> Option<PollRoute> {
+        self.poll_routes
+            .lock()
+            .ok()?
+            .iter()
+            .find(|r| r.poll_id == poll_id)
+            .cloned()
     }
 
     /// Store the connected Bot instance.

@@ -474,6 +474,10 @@ impl Tool for TelegramSendTool {
                     "items": {"type": "string"},
                     "description": "Array of poll option strings (2–10) for send_poll"
                 },
+                "poll_anonymous": {
+                    "type": "boolean",
+                    "description": "For send_poll: make the poll anonymous. Default false, so the incoming poll_answer names the voter and the agent can attribute the vote."
+                },
                 "buttons": {
                     "type": "array",
                     "items": {
@@ -1264,6 +1268,12 @@ impl TelegramSendTool {
         }
         let poll_opts: Vec<teloxide::types::InputPollOption> =
             opts.into_iter().map(|s| s.into()).collect();
+        // #2288: non-anonymous by default so `poll_answer` can name the voter.
+        let anonymous = input
+            .get("poll_anonymous")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let option_labels: Vec<String> = poll_opts.iter().map(|o| o.text.clone()).collect();
         match send_retrying_rate_limit("telegram_send send_poll", || {
             crate::channels::telegram::send::poll_in_thread(
                 bot,
@@ -1271,11 +1281,26 @@ impl TelegramSendTool {
                 thread_id,
                 question.clone(),
                 poll_opts.clone(),
+                anonymous,
             )
         })
         .await
         {
             Ok(m) => {
+                // #2288: PollAnswer carries only a poll id. Remember where this
+                // poll was asked so a vote can resume the right session.
+                if let Some(poll) = m.poll() {
+                    self.telegram_state.record_poll_route(
+                        crate::channels::telegram::state::PollRoute {
+                            poll_id: poll.id.0.clone(),
+                            chat_id,
+                            thread_id: thread_id.map(|t| t.0.0),
+                            session_id: context.session_id,
+                            question: question.clone(),
+                            options: option_labels,
+                        },
+                    );
+                }
                 log_send_success(
                     "tool",
                     "send_poll",

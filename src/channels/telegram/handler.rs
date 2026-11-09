@@ -3278,6 +3278,164 @@ pub(crate) async fn handle_reaction(
     Ok(())
 }
 
+/// Handle a `poll_answer` update (#2288).
+///
+/// `PollAnswer` carries only a poll id: no chat, no thread, no session. The
+/// route recorded when the poll was sent (see `TelegramState::record_poll_route`)
+/// is therefore the only way back, and a vote with no recorded route is
+/// DROPPED rather than guessed into whatever session happens to be current.
+pub(crate) async fn handle_poll_answer(
+    bot: Bot,
+    answer: teloxide::types::PollAnswer,
+    agent: Arc<AgentService>,
+    telegram_state: Arc<TelegramState>,
+    config_rx: tokio::sync::watch::Receiver<Config>,
+    channel_msg_repo: ChannelMessageRepository,
+) -> ResponseResult<()> {
+    // ── 1. Resolve the poll → session route ─────────────────────────────
+    let Some(route) = telegram_state.poll_route(&answer.poll_id.0) else {
+        tracing::debug!(
+            "Telegram poll_answer: no route recorded for poll {} — skipping",
+            answer.poll_id.0
+        );
+        return Ok(());
+    };
+
+    // ── 2. Identify the voter and the chosen options ────────────────────
+    let voter_user = answer.voter.user();
+    let user_id = voter_user.map(|u| u.id.0 as i64);
+    let user_name = match (&answer.voter, voter_user) {
+        (_, Some(u)) => u.first_name.clone(),
+        // A voter that is a chat has no `first_name`; its title is optional,
+        // so fall back to the id rather than dropping the vote.
+        (teloxide::types::MaybeAnonymousUser::Chat(c), None) => c
+            .title()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("chat {}", c.id)),
+        // Only the `voter_chat`/`user` pair exists; unreachable in practice.
+        _ => return Ok(()),
+    };
+
+    let cfg = config_rx.borrow().clone();
+    let chat_id = ChatId(route.chat_id);
+    let thread_id = route.thread_id.map(|t| ThreadId(MessageId(t)));
+    // Telegram chat ids are positive for a private chat, negative for a
+    // group/supergroup/channel, so the sign is the DM test here.
+    let is_dm = route.chat_id > 0;
+    if let Some(uid) = user_id
+        && !cfg
+            .channels
+            .telegram
+            .user_allowed(&uid.to_string(), &route.chat_id.to_string(), is_dm)
+    {
+        tracing::debug!(
+            "Telegram poll_answer: ignoring non-allowed voter {} on poll {}",
+            uid,
+            answer.poll_id.0
+        );
+        return Ok(());
+    }
+
+    let chosen: Vec<String> = answer
+        .option_ids
+        .iter()
+        .filter_map(|i| route.options.get(*i as usize).cloned())
+        .collect();
+    let choice_text = if chosen.is_empty() {
+        "retracted their vote (no option selected)".to_string()
+    } else {
+        chosen.join(", ")
+    };
+
+    tracing::info!(
+        "Telegram poll_answer: {} voted '{}' on poll '{}' in chat {} — session {}",
+        user_name,
+        choice_text,
+        route.question,
+        route.chat_id,
+        route.session_id
+    );
+
+    // ── 3. Build the prompt ─────────────────────────────────────────────
+    // The vote is a real user decision, so it reads as a user message in the
+    // transcript (compact system tag only), not as scaffolding the agent has
+    // to interpret on every later turn.
+    let prompt = format!(
+        "[Poll vote] {user_name} answered the poll you sent.\n\
+         Question: {question}\n\
+         Answer: {choice}\n\n\
+         Treat this as the user's reply and continue from it.",
+        question = route.question,
+        choice = choice_text,
+    );
+    let display = format!("[System: {user_name} voted {choice_text}]");
+
+    // ── 4. Claim the turn, or queue into the live one ───────────────────
+    let _turn_guard = match telegram_state.try_begin_turn(route.session_id) {
+        Some(guard) => guard,
+        None => {
+            let queued = build_midturn_queued_message(None, &prompt, &display);
+            telegram_state.enqueue_reaction(route.session_id, queued);
+            tracing::info!(
+                "Telegram poll_answer: vote on poll {} queued mid-turn for session {}",
+                answer.poll_id.0,
+                route.session_id
+            );
+            return Ok(());
+        }
+    };
+
+    let response = match agent
+        .send_message_with_display(route.session_id, prompt, Some(display), None)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "Telegram poll_answer: agent error for session {}: {}",
+                route.session_id,
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    let (text_only, _img_paths) = crate::utils::extract_img_markers(&response.content);
+    let text_only = crate::utils::sanitize::strip_llm_artifacts(&text_only);
+    let text_only = redact_secrets(&text_only);
+    if text_only.trim().is_empty() {
+        return Ok(());
+    }
+
+    let html = md_to_html(&text_only);
+    if let Err(e) = message_in_thread(&bot, chat_id, thread_id, html).await {
+        tracing::warn!("Telegram poll_answer: failed to send reply: {}", e);
+        return Ok(());
+    }
+
+    let bot_display_name = telegram_state
+        .bot_username()
+        .await
+        .map(|u| format!("@{}", u))
+        .unwrap_or_else(|| "OpenCrabs".to_string());
+    let cm = DbChannelMessage::new(
+        "telegram".to_string(),
+        route.chat_id.to_string(),
+        None,
+        "bot:opencrabs".to_string(),
+        bot_display_name,
+        text_only,
+        "text".to_string(),
+        None,
+    )
+    .with_thread(route.thread_id.map(|t| t.to_string()), None);
+    if let Err(e) = channel_msg_repo.insert(&cm).await {
+        tracing::warn!("Telegram poll_answer: failed to record bot reply: {}", e);
+    }
+
+    Ok(())
+}
+
 /// Format a reply-to context line for the agent prompt.
 ///
 /// When a Telegram user replies to a message they can optionally

@@ -3,7 +3,7 @@
 //! Agent struct and startup logic.
 
 use super::TelegramState;
-use super::handler::{handle_message, handle_reaction};
+use super::handler::{handle_message, handle_poll_answer, handle_reaction};
 use crate::brain::agent::AgentService;
 use crate::config::Config;
 use crate::db::ChannelMessageRepository;
@@ -2220,12 +2220,26 @@ impl TelegramAgent {
                 }
             });
 
+            // #2288: votes on a poll the bot sent. `PollAnswer` carries no chat id,
+            // so the route recorded at send time is what resolves the session.
+            let poll_answer_handler = Update::filter_poll_answer().endpoint({
+                let deps = deps.clone();
+                move |bot: Bot, answer: teloxide::types::PollAnswer| {
+                    let deps = deps.clone();
+                    async move {
+                        spawn_handle_poll_answer(bot, answer, deps);
+                        ResponseResult::Ok(())
+                    }
+                }
+            });
+
             let tree = dptree::entry()
                 .branch(msg_handler)
                 .branch(edited_handler)
                 .branch(cb_handler)
                 .branch(reaction_handler)
-                .branch(my_chat_member_handler);
+                .branch(my_chat_member_handler)
+                .branch(poll_answer_handler);
 
             // Guest queries (#2087) never reach the typed dispatcher: the
             // pinned teloxide-core 0.13.0 has no `guest_message` kind, so a
@@ -2446,6 +2460,32 @@ fn spawn_handle_reaction(
             Ok(Err(e)) => tracing::error!("Telegram handle_reaction error: {e}"),
             Err(panic_err) => {
                 tracing::error!("Telegram handle_reaction panicked: {:?}", panic_err)
+            }
+        }
+    });
+}
+
+/// Dispatch an inbound poll vote to the agent in the background (#2288).
+/// Same pattern as `spawn_handle_reaction`: isolate panics, keep dispatcher free.
+fn spawn_handle_poll_answer(bot: Bot, answer: teloxide::types::PollAnswer, deps: DispatchDeps) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn(async move {
+            handle_poll_answer(
+                bot,
+                answer,
+                deps.agent,
+                deps.telegram_state,
+                deps.config_rx,
+                deps.channel_msg_repo,
+            )
+            .await
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("Telegram handle_poll_answer error: {e}"),
+            Err(panic_err) => {
+                tracing::error!("Telegram handle_poll_answer panicked: {:?}", panic_err)
             }
         }
     });

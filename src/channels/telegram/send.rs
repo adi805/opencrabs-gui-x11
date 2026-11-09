@@ -197,17 +197,25 @@ where
 }
 
 /// `bot.send_poll(chat_id, question, options)` with optional `message_thread_id` (#1079).
+///
+/// #2288: the poll is NON-anonymous by default. Telegram's default is
+/// anonymous, and with an anonymous poll the `poll_answer` update cannot name
+/// the voter, so the agent learned only "somebody voted". Callers that really
+/// want an anonymous poll pass `anonymous = true`.
 pub fn poll_in_thread<C>(
     bot: &Bot,
     chat_id: C,
     thread_id: Option<ThreadId>,
     question: String,
     options: Vec<teloxide::types::InputPollOption>,
+    anonymous: bool,
 ) -> JsonRequest<teloxide::payloads::SendPoll>
 where
     C: Into<ChatId>,
 {
-    let req = bot.send_poll(chat_id.into(), question, options);
+    let req = bot
+        .send_poll(chat_id.into(), question, options)
+        .is_anonymous(anonymous);
     match thread_id {
         Some(t) => req.message_thread_id(t),
         None => req,

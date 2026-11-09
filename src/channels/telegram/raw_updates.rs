@@ -221,6 +221,9 @@ async fn poll_once_inner(st: &mut RawPollState) -> usize {
             "callback_query",
             "message_reaction",
             "my_chat_member",
+            // #2288: votes on polls the bot sent. `allowed_updates` is a
+            // FILTER, so omitting this type meant no vote ever arrived.
+            "poll_answer",
             // Guest mode (#2087). Bot API 10.0 added the update type; the
             // pinned teloxide-core does not know it, so this list is the only
             // place it can be asked for. `allowed_updates` is a FILTER: an
