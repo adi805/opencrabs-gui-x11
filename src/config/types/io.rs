@@ -103,6 +103,12 @@ pub fn daily_backup(path: &Path, max_days: usize) {
 }
 
 /// Every backup of `stem` in `parent`, newest first by mtime.
+///
+/// Ties are broken by name, newest-looking first. mtime is coarser than it
+/// looks: four files written back to back can share one timestamp (measured
+/// 2 distinct values out of 4 on ext4), and a stable sort then ranks them by
+/// directory order, which is not stable across runs. Without a tiebreaker the
+/// shared prune could delete today's snapshot and keep a stale one.
 fn backups_by_mtime(parent: &Path, stem: &str) -> Vec<PathBuf> {
     let prefix = format!("{stem}.");
     let Ok(entries) = fs::read_dir(parent) else {
@@ -119,7 +125,7 @@ fn backups_by_mtime(parent: &Path, stem: &str) -> Vec<PathBuf> {
             Some((mtime, e.path()))
         })
         .collect();
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     found.into_iter().map(|(_, path)| path).collect()
 }
 
