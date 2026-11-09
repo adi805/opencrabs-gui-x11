@@ -2838,6 +2838,20 @@ pub(crate) async fn handle_message(
         return Ok(());
     }
 
+    // #2370: a tool-less turn can still have a block open — a status tick
+    // opens one for the thinking preview alone. That block holds no log, so
+    // settling it would just re-edit a truncated preview fragment above the
+    // answer, which reads as a stale draft of the reply. Remove it instead of
+    // rendering it, and skip the settle render so nothing re-posts it.
+    let flow_torn_down = super::flow::flow_block_is_chrome_only(&streaming)
+        && super::flow::tear_down_chrome_only_flow(
+            &bot,
+            msg.chat.id,
+            &streaming,
+            "settle teardown",
+        )
+        .await;
+
     // Stamp the settled outcome on the block and re-render its header once, now
     // that delivery and folded-answer promotion have left the block in its
     // final shape (#480). A no-op when no block was opened this turn (no tools
@@ -2861,14 +2875,17 @@ pub(crate) async fn handle_message(
     super::flow_chrome::refresh_sections(&streaming, &agent, session_id).await;
     // Settle render (#1211 G2 Final): never dropped — if the edit bucket is
     // empty the payload queues latest-wins and the governor's drainer lands
-    // it on refill.
-    refresh_flow(
-        &bot,
-        msg.chat.id,
-        &streaming,
-        super::governor::EditClass::Final,
-    )
-    .await;
+    // it on refill. Skipped when the block was just torn down (#2370): a
+    // render there would re-post the bubble we deleted.
+    if !flow_torn_down {
+        refresh_flow(
+            &bot,
+            msg.chat.id,
+            &streaming,
+            super::governor::EditClass::Final,
+        )
+        .await;
+    }
     // #1377: register the settled card's state handle so later background-task
     // completions fold their acks into THIS card instead of standalone
     // bubbles. Same contract as the resume path's registration.

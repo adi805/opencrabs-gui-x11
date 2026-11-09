@@ -1108,6 +1108,17 @@ pub(crate) async fn resume_session_inner(
         return Ok(());
     }
 
+    // #2370: same teardown as the main handler's settle — a block with no log
+    // and no plan chrome must not be re-rendered above the answer.
+    let flow_torn_down = super::flow::flow_block_is_chrome_only(&streaming)
+        && super::flow::tear_down_chrome_only_flow(
+            &bot,
+            chat_id,
+            &streaming,
+            "resume settle teardown",
+        )
+        .await;
+
     // Resume parity with the main handler: settle the flow header once the
     // final delivery has left the block in its final shape.
     {
@@ -1125,7 +1136,11 @@ pub(crate) async fn resume_session_inner(
     // main handler does the same right after stamping the outcome.
     super::flow_chrome::refresh_sections(&streaming, &agent, session_id).await;
     // Crash-resume settle render (#1211 G2 Final): queued, never dropped.
-    refresh_flow(&bot, chat_id, &streaming, super::governor::EditClass::Final).await;
+    // Skipped after a chrome-only teardown (#2370) so the render cannot
+    // re-post the bubble it just deleted.
+    if !flow_torn_down {
+        refresh_flow(&bot, chat_id, &streaming, super::governor::EditClass::Final).await;
+    }
     // #1377: if a flow card survived to settle, register its state handle so
     // later background-task completions fold their acks into THIS card
     // instead of spraying standalone bubbles. Overwritten by the next

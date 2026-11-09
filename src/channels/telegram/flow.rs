@@ -1637,6 +1637,57 @@ pub(crate) fn detach_flow_for_followup(streaming: &Arc<std::sync::Mutex<Streamin
     }
 }
 
+/// #2370: a flow block with no log and no plan chrome exists only because a
+/// status tick opened it for the thinking preview. After settle it renders as
+/// a truncated preview fragment above the answer, which reads as a stale
+/// draft of the reply, so it must not survive the turn.
+pub(crate) fn flow_block_is_chrome_only(streaming: &Arc<std::sync::Mutex<StreamingState>>) -> bool {
+    let s = streaming.lock().unwrap_or_else(|e| e.into_inner());
+    if s.open_group_msg_id.is_none() {
+        return false;
+    }
+    let no_log = s.flow_entries.is_empty() && s.tool_msgs.is_empty();
+    let no_plan = s.sections.plan_state.is_none()
+        && s.sections.plan_title.is_none()
+        && s.sections.prose.as_ref().is_none_or(|p| p.is_empty())
+        && s.sections.checklist.is_none()
+        && s.sections.goal.is_none();
+    no_log && no_plan
+}
+
+/// Delete the chrome-only flow block (#2370) and clear the state that could
+/// re-post or re-edit it after the answer has landed. Returns true when a
+/// block was removed, so the settle path can skip its final render instead of
+/// resurrecting the bubble it just deleted.
+pub(crate) async fn tear_down_chrome_only_flow(
+    bot: &Bot,
+    chat: ChatId,
+    streaming: &Arc<std::sync::Mutex<StreamingState>>,
+    reason: &str,
+) -> bool {
+    let mid = {
+        let mut s = streaming.lock().unwrap_or_else(|e| e.into_inner());
+        let mid = s.open_group_msg_id.take();
+        if mid.is_some() {
+            s.flow_entries.clear();
+            s.flow_status = None;
+            s.header_preview = None;
+            s.sections.ctx = None;
+        }
+        mid
+    };
+    let Some(mid) = mid else { return false };
+    tracing::info!(
+        "Telegram: tearing down chrome-only flow block mid={:?} ({reason}) — no log, no plan chrome (#2370)",
+        mid
+    );
+    if let Err(e) = bot.delete_message(chat, mid).await {
+        // Already gone is the successful case for a teardown.
+        tracing::debug!("Telegram: chrome-only flow delete failed for {mid:?}: {e}");
+    }
+    true
+}
+
 pub(crate) fn freeze_flow_block(
     streaming: &Arc<std::sync::Mutex<StreamingState>>,
     mid: MessageId,
