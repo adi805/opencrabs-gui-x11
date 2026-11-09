@@ -2643,3 +2643,58 @@ pub(crate) fn settle_options_reclaim(
     }
     (text, trailer)
 }
+
+#[cfg(test)]
+mod chrome_only_tests {
+    use super::*;
+
+    fn state_with_open_block() -> Arc<std::sync::Mutex<StreamingState>> {
+        let mut s = StreamingState::new_turn(false, false);
+        s.open_group_msg_id = Some(MessageId(42));
+        Arc::new(std::sync::Mutex::new(s))
+    }
+
+    /// Nothing was posted, so there is nothing to tear down.
+    #[test]
+    fn no_open_block_is_never_chrome_only() {
+        let st = Arc::new(std::sync::Mutex::new(StreamingState::new_turn(
+            false, false,
+        )));
+        assert!(!flow_block_is_chrome_only(&st));
+    }
+
+    /// A status tick opened the block but the turn produced no log and no plan
+    /// chrome: exactly the truncated preview #2370 reports.
+    #[test]
+    fn a_status_only_block_is_chrome_only() {
+        assert!(flow_block_is_chrome_only(&state_with_open_block()));
+    }
+
+    /// A real tool line is work the user can still read: keep the block.
+    #[test]
+    fn a_block_with_a_log_entry_is_kept() {
+        let st = state_with_open_block();
+        st.lock()
+            .unwrap()
+            .flow_entries
+            .push(FlowEntry::Text("reading the config".into()));
+        assert!(!flow_block_is_chrome_only(&st));
+    }
+
+    /// Plan chrome (title, state, checklist) also earns the block.
+    #[test]
+    fn a_block_with_plan_chrome_is_kept() {
+        let st = state_with_open_block();
+        st.lock().unwrap().sections.plan_title = Some("Ship it".into());
+        assert!(!flow_block_is_chrome_only(&st));
+    }
+
+    /// An empty prose vector is not prose: `Some(vec![])` must not save the
+    /// block from teardown.
+    #[test]
+    fn empty_prose_does_not_count_as_chrome() {
+        let st = state_with_open_block();
+        st.lock().unwrap().sections.prose = Some(Vec::new());
+        assert!(flow_block_is_chrome_only(&st));
+    }
+}
