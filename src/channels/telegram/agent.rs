@@ -2059,9 +2059,25 @@ impl TelegramAgent {
                                                 match state_cb.try_begin_turn(sid) {
                                                     Some(g) => g,
                                                     None => {
-                                                        tracing::warn!(
-                                                            "Telegram: callback routing — \
-                                                             session {sid} already mid-turn"
+                                                        // #2287: the tap used
+                                                        // to be dropped here —
+                                                        // echo posted, nothing
+                                                        // ran. Queue it into the
+                                                        // live loop instead so
+                                                        // the running turn picks
+                                                        // it up at its next
+                                                        // boundary.
+                                                        let queued =
+                                                            crate::channels::telegram::handler::build_midturn_queued_message(
+                                                                None,
+                                                                &format!("[callback:{data_owned}]"),
+                                                                &format!("[System: button tap '{data_owned}' mid-turn]"),
+                                                            );
+                                                        state_cb.enqueue_reaction(sid, queued);
+                                                        tracing::info!(
+                                                            "Telegram: callback '{data_owned}' \
+                                                             arrived mid-turn on session {sid} — \
+                                                             queued for injection instead of dropped"
                                                         );
                                                         return;
                                                     }
