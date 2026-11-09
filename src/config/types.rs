@@ -1240,6 +1240,15 @@ pub struct WhatsAppConfig {
     /// card. Test it first with `whatsapp_send` action `send_buttons`.
     #[serde(default)]
     pub interactive_buttons: bool,
+    /// Send one living tool block on an ordinary conversation turn (#2609),
+    /// the way background completions already do (#2023). The block opens on
+    /// the turn's first tool call, gains a row per step with a 5 second clock,
+    /// and settles before the answer so the answer is never folded into it
+    /// (#2030). A turn that calls no tools creates no message, which keeps a
+    /// one-line reply as cheap as it is today. Default true for parity with
+    /// Telegram and Discord; set `false` for the old quiet stream.
+    #[serde(default = "default_true")]
+    pub live_tool_block: bool,
     /// Channel-wide disappearing-message TTL in seconds (#1487). Unset or
     /// `0` means messages do not expire, which is the WhatsApp default.
     /// Common values: 86400 (24h), 604800 (7d), 7776000 (90d, the maximum).

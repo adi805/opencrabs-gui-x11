@@ -84,6 +84,21 @@ impl FlowSender {
         })
     }
 
+    /// Hand one already-classified progress event to the block.
+    ///
+    /// `progress_callback` routes events that arrive before the block exists;
+    /// this is for a surface that decided to open the block on the event
+    /// itself (#2609), so that event also draws the first row.
+    pub(crate) fn forward(&self, event: ProgressEvent) {
+        if let Err(e) = self.tx.send(FlowMsg::Progress(event)) {
+            tracing::warn!(
+                target: "whatsapp",
+                error = %e,
+                "flow event arrived after the block settled; not shown"
+            );
+        }
+    }
+
     /// Settle the block with the turn's outcome. Call once, after the turn.
     pub(crate) fn settle(&self, phase: Phase) {
         if let Err(e) = self.tx.send(FlowMsg::Settle(phase)) {

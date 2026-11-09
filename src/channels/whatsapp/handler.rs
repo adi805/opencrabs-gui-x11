@@ -1779,6 +1779,26 @@ pub(crate) async fn handle_message(
         })
     };
     let stream_sink_cb = stream_sink.clone();
+    // #2609: the ordinary turn's live tool block. Built up front but opened
+    // lazily, on the first tool event, so a turn that only chats still posts
+    // nothing but its answer.
+    let live_block = super::live_block::LiveBlock::new(
+        super::live_block::LiveBlockConfig {
+            client: client.clone(),
+            jid: reply_target.clone(),
+            state: wa_state.clone(),
+            rate_limit: wa_cfg.rate_limit.clone(),
+            is_owner: wa_cfg.is_owner(
+                reply_target
+                    .to_string()
+                    .split('@')
+                    .next()
+                    .unwrap_or_default(),
+            ),
+            interactive_buttons: wa_cfg.interactive_buttons,
+        },
+        wa_cfg.live_tool_block,
+    );
     let progress_cb: ProgressCallback = {
         let client_cb = client.clone();
         let jid_cb = reply_target.clone();
@@ -1787,119 +1807,127 @@ pub(crate) async fn handle_message(
         // Copied, not borrowed: the callback must be 'static, so `wa_cfg`
         // cannot be referenced inside it (#1411).
         let interactive_cb = wa_cfg.interactive_buttons;
+        let live_cb = live_block.clone();
         // #1407 gating for streamed text now lives in `stream.rs`, alongside
         // the send-or-edit choice it has to pace.
-        Arc::new(move |session_id, event| match event {
-            ProgressEvent::IntermediateText { text, .. } => {
-                let (clean, _) = crate::utils::extract_img_markers(&text);
-                let clean = redact_secrets(&clean);
-                let clean = crate::utils::sanitize::strip_llm_artifacts(&clean);
-                let clean = crate::utils::slack_fmt::markdown_to_mrkdwn(&clean);
-                if !clean.trim().is_empty() {
-                    // Pre-send dedup: skip if this exact text was already sent
-                    let mut prev = sent_intermediates.lock().unwrap();
-                    if prev.iter().any(|s| s == &clean) {
+        Arc::new(move |session_id, event| {
+            // #2609: tool work draws a row in the live block. Narration and
+            // options keep their own owners in the match below, so observing
+            // never doubles anything.
+            live_cb.observe(&event);
+            match event {
+                ProgressEvent::IntermediateText { text, .. } => {
+                    let (clean, _) = crate::utils::extract_img_markers(&text);
+                    let clean = redact_secrets(&clean);
+                    let clean = crate::utils::sanitize::strip_llm_artifacts(&clean);
+                    let clean = crate::utils::slack_fmt::markdown_to_mrkdwn(&clean);
+                    if !clean.trim().is_empty() {
+                        // Pre-send dedup: skip if this exact text was already sent
+                        let mut prev = sent_intermediates.lock().unwrap();
+                        if prev.iter().any(|s| s == &clean) {
+                            drop(prev);
+                            return;
+                        }
+                        prev.push(clean.clone());
                         drop(prev);
-                        return;
+                        was_streamed_cb.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // Ordering, rate limiting and the send-or-edit decision
+                        // all live in the consumer task (#1408); this side only
+                        // queues, so two fast chunks cannot race.
+                        stream_sink_cb.push(clean);
                     }
-                    prev.push(clean.clone());
-                    drop(prev);
-                    was_streamed_cb.store(true, std::sync::atomic::Ordering::Relaxed);
-                    // Ordering, rate limiting and the send-or-edit decision
-                    // all live in the consumer task (#1408); this side only
-                    // queues, so two fast chunks cannot race.
-                    stream_sink_cb.push(clean);
                 }
+                ProgressEvent::SelfHealingAlert { message } => {
+                    let client = client_cb.clone();
+                    let jid = jid_cb.clone();
+                    let alert = format!(
+                        "{}\n\n🔧 {}",
+                        MSG_HEADER,
+                        crate::utils::sanitize::normalize_dashes(&message)
+                    );
+                    tokio::spawn(async move {
+                        let msg = waproto::whatsapp::Message {
+                            conversation: Some(alert),
+                            ..Default::default()
+                        };
+                        if let Err(e) = client.send_message(jid, msg).await {
+                            tracing::error!("WhatsApp: self-healing alert send failed: {}", e);
+                        }
+                    });
+                }
+                ProgressEvent::RetryAttempt {
+                    attempt,
+                    max,
+                    reason,
+                } => {
+                    let client = client_cb.clone();
+                    let jid = jid_cb.clone();
+                    let text = format!(
+                        "{}\n\n⏳ {} — {}",
+                        MSG_HEADER,
+                        crate::utils::retry::send_label(attempt, max),
+                        reason
+                    );
+                    tokio::spawn(async move {
+                        let msg = waproto::whatsapp::Message {
+                            conversation: Some(text),
+                            ..Default::default()
+                        };
+                        if let Err(e) = client.send_message(jid, msg).await {
+                            tracing::error!("WhatsApp: retry attempt send failed: {}", e);
+                        }
+                    });
+                }
+                ProgressEvent::ProviderSwitched {
+                    to_name, to_model, ..
+                } => {
+                    let client = client_cb.clone();
+                    let jid = jid_cb.clone();
+                    let text = format!(
+                        "{}\n\n🔄 Now using {}",
+                        MSG_HEADER,
+                        crate::utils::provider_pair::display_model(&to_name, &to_model)
+                    );
+                    tokio::spawn(async move {
+                        let msg = waproto::whatsapp::Message {
+                            conversation: Some(text),
+                            ..Default::default()
+                        };
+                        if let Err(e) = client.send_message(jid, msg).await {
+                            tracing::error!("WhatsApp: provider switched send failed: {}", e);
+                        }
+                    });
+                }
+                // Optional follow-up suggestions (#600): a native-flow card when
+                // the owner opted into `interactive_buttons` and the set fits the
+                // 3-button cap (#1411), a single-choice poll when the set is
+                // larger than that cap (#1616), and the numbered text list
+                // otherwise. The typed path survives all three: a bare numeric
+                // reply selects an option via the inbound router, the card body
+                // carries the same instructions, and the poll question does too,
+                // so a client that renders neither is never stuck. Anything else
+                // clears the set.
+                ProgressEvent::SuggestedOptions(options) if !options.is_empty() => {
+                    let client = client_cb.clone();
+                    let jid = jid_cb.clone();
+                    let wa = wa_state_cb.clone();
+                    let interactive = interactive_cb;
+                    let raw_options: Vec<String> =
+                        options.into_iter().map(|item| item.label).collect();
+                    tokio::spawn(async move {
+                        super::followups::send_suggestions(
+                            client,
+                            jid,
+                            wa,
+                            session_id,
+                            raw_options,
+                            interactive,
+                        )
+                        .await;
+                    });
+                }
+                _ => {}
             }
-            ProgressEvent::SelfHealingAlert { message } => {
-                let client = client_cb.clone();
-                let jid = jid_cb.clone();
-                let alert = format!(
-                    "{}\n\n🔧 {}",
-                    MSG_HEADER,
-                    crate::utils::sanitize::normalize_dashes(&message)
-                );
-                tokio::spawn(async move {
-                    let msg = waproto::whatsapp::Message {
-                        conversation: Some(alert),
-                        ..Default::default()
-                    };
-                    if let Err(e) = client.send_message(jid, msg).await {
-                        tracing::error!("WhatsApp: self-healing alert send failed: {}", e);
-                    }
-                });
-            }
-            ProgressEvent::RetryAttempt {
-                attempt,
-                max,
-                reason,
-            } => {
-                let client = client_cb.clone();
-                let jid = jid_cb.clone();
-                let text = format!(
-                    "{}\n\n⏳ {} — {}",
-                    MSG_HEADER,
-                    crate::utils::retry::send_label(attempt, max),
-                    reason
-                );
-                tokio::spawn(async move {
-                    let msg = waproto::whatsapp::Message {
-                        conversation: Some(text),
-                        ..Default::default()
-                    };
-                    if let Err(e) = client.send_message(jid, msg).await {
-                        tracing::error!("WhatsApp: retry attempt send failed: {}", e);
-                    }
-                });
-            }
-            ProgressEvent::ProviderSwitched {
-                to_name, to_model, ..
-            } => {
-                let client = client_cb.clone();
-                let jid = jid_cb.clone();
-                let text = format!(
-                    "{}\n\n🔄 Now using {}",
-                    MSG_HEADER,
-                    crate::utils::provider_pair::display_model(&to_name, &to_model)
-                );
-                tokio::spawn(async move {
-                    let msg = waproto::whatsapp::Message {
-                        conversation: Some(text),
-                        ..Default::default()
-                    };
-                    if let Err(e) = client.send_message(jid, msg).await {
-                        tracing::error!("WhatsApp: provider switched send failed: {}", e);
-                    }
-                });
-            }
-            // Optional follow-up suggestions (#600): a native-flow card when
-            // the owner opted into `interactive_buttons` and the set fits the
-            // 3-button cap (#1411), a single-choice poll when the set is
-            // larger than that cap (#1616), and the numbered text list
-            // otherwise. The typed path survives all three: a bare numeric
-            // reply selects an option via the inbound router, the card body
-            // carries the same instructions, and the poll question does too,
-            // so a client that renders neither is never stuck. Anything else
-            // clears the set.
-            ProgressEvent::SuggestedOptions(options) if !options.is_empty() => {
-                let client = client_cb.clone();
-                let jid = jid_cb.clone();
-                let wa = wa_state_cb.clone();
-                let interactive = interactive_cb;
-                let raw_options: Vec<String> = options.into_iter().map(|item| item.label).collect();
-                tokio::spawn(async move {
-                    super::followups::send_suggestions(
-                        client,
-                        jid,
-                        wa,
-                        session_id,
-                        raw_options,
-                        interactive,
-                    )
-                    .await;
-                });
-            }
-            _ => {}
         })
     };
 
@@ -2069,6 +2097,16 @@ pub(crate) async fn handle_message(
              clone outlived the agent call, so the final edit may be skipped"
         ),
     }
+
+    // #2609: settle the live block BEFORE the answer goes out, so the answer
+    // lands as its own message instead of being folded into the block (#2030).
+    live_block
+        .settle(if result.is_ok() {
+            super::flow_render::Phase::Finished
+        } else {
+            super::flow_render::Phase::Failed
+        })
+        .await;
 
     wa_state.remove_cancel_token(session_id).await;
     typing_cancel.cancel();
