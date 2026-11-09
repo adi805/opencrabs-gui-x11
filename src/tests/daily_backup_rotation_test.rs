@@ -181,7 +181,7 @@ fn unchanged_content_after_rotation_does_not_spawn_more_backups() {
 /// ranked as "newest" and a genuinely fresher dated snapshot got evicted.
 #[test]
 fn prune_keeps_newest_by_mtime_not_by_name() {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn write_with_mtime(path: &std::path::Path, body: &str, secs: u64) {
         fs::write(path, body).expect("write");
