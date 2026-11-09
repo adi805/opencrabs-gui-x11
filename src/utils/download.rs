@@ -111,20 +111,35 @@ mod tests {
     fn serve(responses: Vec<(u16, &'static str)>) -> (String, std::thread::JoinHandle<usize>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         let handle = std::thread::spawn(move || {
+            let want = responses.len();
             let mut served = 0;
-            for (status, body) in responses {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    break;
-                };
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let reply = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(reply.as_bytes());
-                served += 1;
+            // A terminal status (404) makes the client stop after one attempt,
+            // so the remaining scripted responses never arrive. A blocking
+            // accept would then hang `join()` forever instead of failing an
+            // assertion, so cap the wait.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while served < want && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf);
+                        let (status, body) = responses[served];
+                        let reply = format!(
+                            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(reply.as_bytes());
+                        served += 1;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
             }
             served
         });
