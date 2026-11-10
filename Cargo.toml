@@ -42,10 +42,12 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 # NoopTextSystem, which fakes font metrics so layout and colors still work
 # but rasterize_glyph returns zero bytes and every string paints as blank
 # space (found 2026-10-30, first GUI run had no text at all).
-gpui = { version = "0.2.2", default-features = false, features = [
-    "runtime_shaders",
-    "font-kit",
-], optional = true }
+# gpui is declared per target further down, not here: on Linux it needs the
+# `x11` and `wayland` features, otherwise gpui's `guess_compositor()` compiles
+# its Wayland/X11 arms out and returns "Headless" unconditionally, so every
+# `open_window` call bails with "neither DISPLAY nor WAYLAND_DISPLAY is set"
+# even when DISPLAY is set (#2765). macOS and Windows keep the macOS-tuned set
+# unchanged.
 
 # Database (deadpool-sqlite uses rusqlite 0.40, single libsqlite3-sys build).
 # rusqlite 0.40 bundles SQLite 3.53.2: 3.51.1's unix VFS took the inode lock
@@ -264,6 +266,10 @@ reqwest_teloxide = { package = "reqwest", version = "0.12", default-features = f
 # macOS: Metal GPU acceleration for local STT (rwhisper/candle)
 [target.'cfg(target_os = "macos")'.dependencies]
 rwhisper = { version = "0.4", optional = true, features = ["metal", "accelerate"] }
+gpui = { version = "0.2.2", default-features = false, features = [
+    "runtime_shaders",
+    "font-kit",
+], optional = true }
 # GPUI client only: runtime Dock icon. A bare `cargo run` binary has no .app
 # bundle, so macOS shows its generic executable icon; we hand the running
 # NSApplication the embedded logo instead. Optional so the TUI-only build
@@ -271,6 +277,26 @@ rwhisper = { version = "0.4", optional = true, features = ["metal", "accelerate"
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true, features = ["NSData"] }
 objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSImage"] }
+
+# Linux: gpui has to carry a real compositor backend. Without `x11` and
+# `wayland` the crate compiles HeadlessClient only, whose `open_window` bails
+# with "neither DISPLAY nor WAYLAND_DISPLAY is set" no matter what the
+# environment holds (#2765). Both are needed: `wayland` for a native Wayland
+# session, `x11` for X11 and XWayland-only sessions.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui = { version = "0.2.2", default-features = false, features = [
+    "runtime_shaders",
+    "font-kit",
+    "wayland",
+    "x11",
+], optional = true }
+
+# Windows: same set as the declaration this replaced, unchanged.
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui = { version = "0.2.2", default-features = false, features = [
+    "runtime_shaders",
+    "font-kit",
+], optional = true }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"
