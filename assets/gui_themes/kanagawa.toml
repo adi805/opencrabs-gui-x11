@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "kanagawa"
+bg = "#1f1f28"
+panel = "#2a2a37"
+panel_hi = "#39393c"
+track = "#363646"
+text = "#dcd7ba"
+text_strong = "#dcd7ba"
+text_normal = "#727169"
+text_muted = "#67655f"
+text_title = "#8d8a7d"
+text_faint = "#6e6c65"
+text_hint = "#7e7b71"
+green = "#98bb6c"
+blue = "#7e9cd8"
+amber = "#d7a657"
+accent = "#d27e99"
+teal = "#76946a"
+red = "#e82424"
+warn = "#a07d49"
+selection = "#414042"
+focus = "#815366"

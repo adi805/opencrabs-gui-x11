@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "catppuccin-frappe"
+bg = "#303446"
+panel = "#393d51"
+panel_hi = "#454a5f"
+track = "#3f4458"
+text = "#c6d0f5"
+text_strong = "#a5adce"
+text_normal = "#797c8b"
+text_muted = "#696f89"
+text_title = "#878eac"
+text_faint = "#6f7690"
+text_hint = "#7b829e"
+green = "#a6d189"
+blue = "#8caaee"
+amber = "#e5c890"
+accent = "#e5c890"
+teal = "#81c8be"
+red = "#e78284"
+warn = "#af9c7a"
+selection = "#f2d5cf"
+focus = "#93856e"

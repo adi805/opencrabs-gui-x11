@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "vercel"
+bg = "#000000"
+panel = "#1a1a1a"
+panel_hi = "#212121"
+track = "#292929"
+text = "#ededed"
+text_strong = "#ededed"
+text_normal = "#878787"
+text_muted = "#5a5a5a"
+text_title = "#898989"
+text_faint = "#646464"
+text_hint = "#777777"
+green = "#46a758"
+blue = "#0070f3"
+amber = "#ffb224"
+accent = "#8e4ec6"
+teal = "#0ac7ac"
+red = "#e5484d"
+warn = "#b37d19"
+selection = "#2b2b2b"
+focus = "#4e2a6c"

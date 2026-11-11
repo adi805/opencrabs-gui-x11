@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "zenburn"
+bg = "#3f3f3f"
+panel = "#4f4f4f"
+panel_hi = "#555553"
+track = "#5f5f5f"
+text = "#dcdccc"
+text_strong = "#dcdccc"
+text_normal = "#9f9f9f"
+text_muted = "#7b7b75"
+text_title = "#9a9a91"
+text_faint = "#81817a"
+text_hint = "#8e8e86"
+green = "#7f9f7f"
+blue = "#8cd0d3"
+amber = "#f0dfaf"
+accent = "#93e0e3"
+teal = "#93e0e3"
+red = "#cc9393"
+warn = "#bbaf8d"
+selection = "#5b5b58"
+focus = "#6d9799"

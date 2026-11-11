@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "aura"
+bg = "#0f0f0f"
+panel = "#15141b"
+panel_hi = "#2e2e2e"
+track = "#15141b"
+text = "#edecee"
+text_strong = "#edecee"
+text_normal = "#6d6d6d"
+text_muted = "#636364"
+text_title = "#908f90"
+text_faint = "#6c6c6d"
+text_hint = "#7e7e7f"
+green = "#61ffca"
+blue = "#a277ff"
+amber = "#ffca85"
+accent = "#a277ff"
+teal = "#a277ff"
+red = "#ff6767"
+warn = "#b79262"
+selection = "#373737"
+focus = "#5f4893"

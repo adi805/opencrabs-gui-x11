@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "osaka-jade"
+bg = "#111c18"
+panel = "#1a2520"
+panel_hi = "#2a342a"
+track = "#23372b"
+text = "#c1c497"
+text_strong = "#c1c497"
+text_normal = "#53685b"
+text_muted = "#545c48"
+text_title = "#777d62"
+text_faint = "#5b634d"
+text_hint = "#697058"
+green = "#549e6a"
+blue = "#2dd5b7"
+amber = "#e5c736"
+accent = "#549e6a"
+teal = "#549e6a"
+red = "#ff5345"
+warn = "#a5942d"
+selection = "#313a2f"
+focus = "#356345"

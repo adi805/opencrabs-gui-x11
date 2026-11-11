@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "synthwave84"
+bg = "#262335"
+panel = "#1e1a29"
+panel_hi = "#444251"
+track = "#2a2139"
+text = "#ffffff"
+text_strong = "#ffffff"
+text_normal = "#848bbd"
+text_muted = "#787782"
+text_title = "#a4a3aa"
+text_faint = "#817f8a"
+text_hint = "#93919a"
+green = "#72f1b8"
+blue = "#36f9f6"
+amber = "#fede5d"
+accent = "#b084eb"
+teal = "#b084eb"
+red = "#fe4450"
+warn = "#bda651"
+selection = "#4d4b59"
+focus = "#715899"

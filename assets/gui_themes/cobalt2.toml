@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "cobalt2"
+bg = "#193549"
+panel = "#122738"
+panel_hi = "#395162"
+track = "#1f4662"
+text = "#ffffff"
+text_strong = "#ffffff"
+text_normal = "#adb7c9"
+text_muted = "#70828e"
+text_title = "#9eaab3"
+text_faint = "#7a8a95"
+text_hint = "#8c9aa4"
+green = "#9eff80"
+blue = "#0088ff"
+amber = "#ffc600"
+accent = "#2affdf"
+teal = "#2affdf"
+red = "#ff0088"
+warn = "#ba9b16"
+selection = "#42596a"
+focus = "#22a49b"

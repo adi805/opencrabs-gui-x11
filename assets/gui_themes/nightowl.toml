@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "nightowl"
+bg = "#011627"
+panel = "#0b253a"
+panel_hi = "#1f3242"
+track = "#0b253a"
+text = "#d6deeb"
+text_strong = "#d6deeb"
+text_normal = "#5f7e97"
+text_muted = "#526271"
+text_title = "#7d8a99"
+text_faint = "#5a6a79"
+text_hint = "#6c7a89"
+green = "#c5e478"
+blue = "#82aaff"
+amber = "#ecc48d"
+accent = "#c792ea"
+teal = "#82aaff"
+red = "#ef5350"
+warn = "#a6906e"
+selection = "#273a4a"
+focus = "#6d5a92"

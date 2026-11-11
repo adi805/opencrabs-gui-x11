@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "tokyonight-storm"
+bg = "#24283b"
+panel = "#2c3044"
+panel_hi = "#373b51"
+track = "#31364b"
+text = "#a9b1d6"
+text_strong = "#acb0d0"
+text_normal = "#6e7281"
+text_muted = "#575c76"
+text_title = "#717795"
+text_faint = "#5c627c"
+text_hint = "#676d89"
+green = "#9ece6a"
+blue = "#7aa2f7"
+amber = "#e0af68"
+accent = "#ff9e64"
+teal = "#449dab"
+red = "#f7768e"
+warn = "#a8875b"
+selection = "#3c4157"
+focus = "#9c6851"

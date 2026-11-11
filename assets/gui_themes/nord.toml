@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "nord"
+bg = "#2e3440"
+panel = "#3b4252"
+panel_hi = "#494e59"
+track = "#434c5e"
+text = "#eceff4"
+text_strong = "#eceff4"
+text_normal = "#8b95a7"
+text_muted = "#767b84"
+text_title = "#9ca0a8"
+text_faint = "#7e838c"
+text_hint = "#8d929a"
+green = "#a3be8c"
+blue = "#88c0d0"
+amber = "#d08770"
+accent = "#8fbcbb"
+teal = "#8fbcbb"
+red = "#bf616a"
+warn = "#9f6e62"
+selection = "#505660"
+focus = "#637e83"

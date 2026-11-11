@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "vesper"
+bg = "#101010"
+panel = "#101010"
+panel_hi = "#313131"
+track = "#101010"
+text = "#ffffff"
+text_strong = "#ffffff"
+text_normal = "#a0a0a0"
+text_muted = "#6b6b6b"
+text_title = "#9b9b9b"
+text_faint = "#747474"
+text_hint = "#888888"
+green = "#99ffe4"
+blue = "#ffc799"
+amber = "#ffc799"
+accent = "#ffc799"
+teal = "#a0a0a0"
+red = "#ff8080"
+warn = "#b79070"
+selection = "#3b3b3b"
+focus = "#93745b"

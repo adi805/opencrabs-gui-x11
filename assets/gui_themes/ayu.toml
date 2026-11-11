@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "ayu"
+bg = "#0b0e14"
+panel = "#0f131a"
+panel_hi = "#24272b"
+track = "#0d1017"
+text = "#bfbdb6"
+text_strong = "#bfbdb6"
+text_normal = "#565b66"
+text_muted = "#4f5152"
+text_title = "#737472"
+text_faint = "#575858"
+text_hint = "#656665"
+green = "#7fd962"
+blue = "#59c2ff"
+amber = "#e6b673"
+accent = "#e6b450"
+teal = "#39bae6"
+red = "#d95757"
+warn = "#a48457"
+selection = "#2b2e31"
+focus = "#836935"

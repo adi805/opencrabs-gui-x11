@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "catppuccin-macchiato"
+bg = "#24273a"
+panel = "#1e2030"
+panel_hi = "#3b3f54"
+track = "#181926"
+text = "#cad3f5"
+text_strong = "#cad3f5"
+text_normal = "#939ab7"
+text_muted = "#636881"
+text_title = "#848ba6"
+text_faint = "#6a6f89"
+text_hint = "#777d98"
+green = "#a6da95"
+blue = "#8aadf4"
+amber = "#eed49f"
+accent = "#f5bde6"
+teal = "#91d7e3"
+red = "#ed8796"
+warn = "#b1a081"
+selection = "#42465c"
+focus = "#967998"

@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "palenight"
+bg = "#292d3e"
+panel = "#1e2132"
+panel_hi = "#3b3f52"
+track = "#32364a"
+text = "#a6accd"
+text_strong = "#a6accd"
+text_normal = "#676e95"
+text_muted = "#595d74"
+text_title = "#727791"
+text_faint = "#5e627a"
+text_hint = "#686d86"
+green = "#c3e88d"
+blue = "#82aaff"
+amber = "#ffcb6b"
+accent = "#89ddff"
+teal = "#89ddff"
+red = "#f07178"
+warn = "#bf9c5d"
+selection = "#404458"
+focus = "#5d8da8"

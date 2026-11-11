@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "carbonfox"
+bg = "#161616"
+panel = "#1a1a1a"
+panel_hi = "#353536"
+track = "#1e1e1e"
+text = "#f2f4f8"
+text_strong = "#f2f4f8"
+text_normal = "#7d848f"
+text_muted = "#6a6a6c"
+text_title = "#969799"
+text_faint = "#727375"
+text_hint = "#848587"
+green = "#25be6a"
+blue = "#33b1ff"
+amber = "#f1c21b"
+accent = "#ff7eb6"
+teal = "#33b1ff"
+red = "#ee5396"
+warn = "#af8e1a"
+selection = "#3e3e3f"
+focus = "#964f6e"

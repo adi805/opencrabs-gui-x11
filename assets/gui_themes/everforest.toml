@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "everforest"
+bg = "#2d353b"
+panel = "#333c43"
+panel_hi = "#44494b"
+track = "#343f44"
+text = "#d3c6aa"
+text_strong = "#d3c6aa"
+text_normal = "#7a8478"
+text_muted = "#6c6c65"
+text_title = "#8d897b"
+text_faint = "#73726a"
+text_hint = "#807e73"
+green = "#a7c080"
+blue = "#a7c080"
+amber = "#e69875"
+accent = "#d699b6"
+teal = "#83c092"
+red = "#e67e80"
+warn = "#af7a64"
+selection = "#4b4f4f"
+focus = "#896c7e"

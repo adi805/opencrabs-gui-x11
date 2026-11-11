@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "gruvbox-light"
+bg = "#fbf1c7"
+panel = "#f0e6be"
+panel_hi = "#e0d7b3"
+track = "#e8dfb9"
+text = "#3c3836"
+text_strong = "#3c3836"
+text_normal = "#736d60"
+text_muted = "#7b7666"
+text_title = "#867f6e"
+text_faint = "#a19982"
+text_hint = "#7b7666"
+green = "#98971a"
+blue = "#458588"
+amber = "#c88e1f"
+accent = "#b57614"
+teal = "#689d6a"
+red = "#cc241d"
+warn = "#e2b353"
+selection = "#d9d0ad"
+focus = "#d4ad64"

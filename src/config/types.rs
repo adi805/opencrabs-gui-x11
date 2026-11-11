@@ -2578,6 +2578,12 @@ pub struct GuiConfig {
     #[serde(default)]
     pub theme: GuiTheme,
 
+    /// A theme from the catalog (`gui_themes/<name>.toml`), by file stem. It
+    /// overrides the `theme`'s base palette; unset or unknown falls back to the
+    /// four built-in modes.
+    #[serde(default)]
+    pub palette: Option<String>,
+
     /// The accent `custom` paints, as `#RRGGBB`. Unset or unparsable means the
     /// palette's own accent.
     #[serde(default)]

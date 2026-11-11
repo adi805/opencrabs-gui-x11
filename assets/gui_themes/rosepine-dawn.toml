@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "rosepine-dawn"
+bg = "#faf4ed"
+panel = "#f0eae6"
+panel_hi = "#e3dddd"
+track = "#eae4e1"
+text = "#575279"
+text_strong = "#575279"
+text_normal = "#726c8c"
+text_muted = "#7b7592"
+text_title = "#857f99"
+text_faint = "#9f99ac"
+text_hint = "#7b7592"
+green = "#286983"
+blue = "#56949f"
+amber = "#d38e2f"
+accent = "#d38e2f"
+teal = "#d7827e"
+red = "#b4637a"
+warn = "#efb76c"
+selection = "#dfdad9"
+focus = "#e4bb84"

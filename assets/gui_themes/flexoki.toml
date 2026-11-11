@@ -1,0 +1,25 @@
+# GUI palette, generated from the TUI theme catalog by
+# scripts/gen_gui_palettes.py. Do not hand-edit: edit the pack file instead.
+# Twenty fields, one per config::gui_theme::Palette member.
+
+name = "flexoki"
+bg = "#100f0f"
+panel = "#1c1b1a"
+panel_hi = "#2b2a28"
+track = "#282726"
+text = "#cecdc3"
+text_strong = "#cecdc3"
+text_normal = "#6f6e69"
+text_muted = "#585753"
+text_title = "#7e7d77"
+text_faint = "#605f5b"
+text_hint = "#6f6e69"
+green = "#879a39"
+blue = "#da702c"
+amber = "#da702c"
+accent = "#8b7ec8"
+teal = "#3aa99f"
+red = "#d14d41"
+warn = "#9d5323"
+selection = "#32312f"
+focus = "#534c74"

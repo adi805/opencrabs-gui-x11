@@ -158,6 +158,29 @@ pub fn resolve(mode: GuiTheme, system_dark: bool, accent: Option<&str>) -> Palet
     }
 }
 
+/// The palette a mode draws when the catalog names one.
+///
+/// A named catalog theme replaces the mode's base: that is the point of
+/// picking one. `custom` still paints its accent on top, so the wheel keeps
+/// working over a catalog palette. An unknown name is not an error, it is a
+/// theme that was removed or renamed, and the mode's own base is the honest
+/// fallback.
+pub fn resolve_palette(
+    mode: GuiTheme,
+    system_dark: bool,
+    accent: Option<&str>,
+    palette: Option<&str>,
+) -> Palette {
+    let named = palette
+        .filter(|name| !name.trim().is_empty())
+        .and_then(crate::config::gui_palette::lookup);
+    match (named, mode, accent.and_then(parse_accent)) {
+        (Some(base), GuiTheme::Custom, Some(rgb)) => with_accent(base, rgb),
+        (Some(base), _, _) => base,
+        (None, _, _) => resolve(mode, system_dark, accent),
+    }
+}
+
 /// WCAG relative luminance of a 0xRRGGBB colour, for the contrast tests.
 pub fn relative_luminance(rgb: u32) -> f64 {
     let channel = |shift: u32| {
