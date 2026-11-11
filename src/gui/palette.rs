@@ -13,7 +13,7 @@ use opencrabs::config::{Config, GuiTheme};
 
 use crate::logging;
 
-pub use opencrabs::config::gui_theme::{ORGN, Palette, resolve};
+pub use opencrabs::config::gui_theme::{ORGN, Palette, resolve_palette};
 
 /// The live palette. Read on every frame, written only when the appearance or
 /// the config changes.
@@ -25,6 +25,10 @@ static SYSTEM_DARK: AtomicBool = AtomicBool::new(true);
 /// The `[gui]` mode and accent last read or saved. `None` means the mirror has
 /// not been asked yet.
 static SAVED: RwLock<Option<(GuiTheme, Option<String>)>> = RwLock::new(None);
+
+/// The `[gui] palette` last read or saved: a theme from the catalog, by file
+/// stem. Kept apart from `SAVED` so the mode mirror keeps its shape.
+static SAVED_PALETTE: RwLock<Option<Option<String>>> = RwLock::new(None);
 
 /// The palette to draw with right now.
 pub fn current() -> Palette {
@@ -60,16 +64,49 @@ pub fn remember_mode(mode: GuiTheme, accent: Option<String>) {
     }
 }
 
+/// The catalog theme `[gui] palette` names, if any.
+pub fn saved_palette() -> Option<String> {
+    if let Some(saved) = SAVED_PALETTE.read().ok().and_then(|saved| saved.clone()) {
+        return saved;
+    }
+    let name = Config::current()
+        .gui
+        .palette
+        .clone()
+        .filter(|name| !name.trim().is_empty());
+    remember_palette(name.clone());
+    name
+}
+
+/// Record the catalog theme the modal just saved, so the frame after the click
+/// draws it without waiting for the config watcher (#2619).
+pub fn remember_palette(name: Option<String>) {
+    if let Ok(mut saved) = SAVED_PALETTE.write() {
+        *saved = Some(name);
+    }
+}
+
 /// The palette the saved config picks for the last-seen system appearance.
 pub fn saved() -> Palette {
     let (mode, accent) = saved_mode();
-    resolve(mode, system_is_dark(), accent.as_deref())
+    resolve_palette(
+        mode,
+        system_is_dark(),
+        accent.as_deref(),
+        saved_palette().as_deref(),
+    )
 }
 
 /// Show a candidate palette without saving it. The theme modal paints the
 /// colour wheel this way while the user drags, then saves on release.
 pub fn preview(mode: GuiTheme, accent: Option<&str>) {
-    set(resolve(mode, system_is_dark(), accent));
+    let named = saved_palette();
+    set(resolve_palette(
+        mode,
+        system_is_dark(),
+        accent,
+        named.as_deref(),
+    ));
 }
 
 /// Adopt a palette the modal already resolved and previewed.

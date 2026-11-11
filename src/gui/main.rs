@@ -3956,6 +3956,16 @@ impl Dashboard {
             GuiTheme::Custom => 2,
             GuiTheme::Auto => 3,
         };
+        // A catalog theme outranks the mode's card: the cursor should stand on
+        // the card that is actually painting the window, not on the base it
+        // overrides.
+        if let Some(slug) = palette::saved_palette()
+            && let Some(index) = themes_view::cards()
+                .iter()
+                .position(|card| card.slug.as_deref() == Some(slug.as_str()))
+        {
+            self.themes_card = index;
+        }
         self.themes_drag = None;
         self.themes_open = true;
         // The window's root takes the keyboard, not the composer: the modal
@@ -3987,34 +3997,24 @@ impl Dashboard {
     /// closes and leaves the saved theme alone. Every other key is swallowed,
     /// because the window behind the modal is not listening (#2619).
     fn theme_modal_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) {
-        const CARDS: [GuiTheme; 4] = [
-            GuiTheme::Orgn,
-            GuiTheme::Light,
-            GuiTheme::Custom,
-            GuiTheme::Auto,
-        ];
+        // The card list is the built-ins plus the whole catalog, so its length
+        // comes from the theme module, not from a constant.
+        let count = themes_view::cards().len().max(1);
+        let here = self.themes_card.min(count - 1);
         match ks.key.as_str() {
             "escape" => self.close_themes(cx),
             "left" | "up" => {
-                self.themes_card = (self.themes_card + 3) % 4;
-                let card = CARDS[self.themes_card];
-                self.preview_card(card, cx);
+                self.themes_card = (here + count - 1) % count;
+                self.preview_card_at(self.themes_card, cx);
             }
             "right" | "down" | "tab" => {
-                self.themes_card = (self.themes_card + 1) % 4;
-                let card = CARDS[self.themes_card];
-                self.preview_card(card, cx);
+                self.themes_card = (here + 1) % count;
+                self.preview_card_at(self.themes_card, cx);
             }
             "enter" => {
-                let card = CARDS[self.themes_card.min(3)];
-                self.pick_theme(card, cx);
                 // Custom is the only card with something left to do under it:
                 // the wheel edits the accent, so picking it keeps the modal.
-                if card != GuiTheme::Custom {
-                    self.close_themes(cx);
-                } else {
-                    cx.notify();
-                }
+                self.pick_card_at(here, cx);
             }
             _ => {}
         }
@@ -4023,18 +4023,30 @@ impl Dashboard {
     /// Repaint the window in a card's theme without saving it. The arrows walk
     /// the four cards this way, so the choice is made by looking; nothing is
     /// written until a pick, and closing puts the saved theme back.
-    fn preview_card(&mut self, mode: GuiTheme, cx: &mut Context<Self>) {
+    /// Paint the card under the keyboard without saving it.
+    fn preview_card_at(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(card) = themes_view::cards().get(index).cloned() {
+            palette::adopt(self.card_palette(&card));
+            cx.notify();
+        }
+    }
+
+    /// The palette a card would paint. One resolution for both the preview and
+    /// the pick that follows it, so they cannot disagree.
+    fn card_palette(&self, card: &themes_view::Card) -> palette::Palette {
+        let (saved_mode, saved_accent) = palette::saved_mode();
+        let mode = card.mode.unwrap_or(saved_mode);
         let accent = if mode == GuiTheme::Custom {
             Some(gui_theme::format_accent(self.themes_accent()))
         } else {
-            palette::saved_mode().1
+            saved_accent
         };
-        palette::adopt(gui_theme::resolve(
+        gui_theme::resolve_palette(
             mode,
             palette::system_is_dark(),
             accent.as_deref(),
-        ));
-        cx.notify();
+            card.slug.as_deref(),
+        )
     }
 
     /// Turn a point in window coordinates into the accent control under it and
@@ -4104,21 +4116,49 @@ impl Dashboard {
         }
     }
 
-    /// Pick a card: apply the theme and save it in one step (#2619).
-    fn pick_theme(&mut self, mode: GuiTheme, cx: &mut Context<Self>) {
-        let hex = gui_theme::format_accent(self.themes_accent());
-        let name = match mode {
-            GuiTheme::Orgn => "orgn",
-            GuiTheme::Light => "light",
-            GuiTheme::Custom => "custom",
-            GuiTheme::Auto => "auto",
+    /// Pick the card at `index`: apply it and save it in one step (#2619).
+    fn pick_card_at(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(card) = themes_view::cards().get(index).cloned() else {
+            return;
         };
-        match Config::write_key_string("gui", "theme", name) {
-            Ok(()) => logging::info(&format!("themes: kept '{name}' as [gui] theme")),
-            Err(e) => logging::error(&format!("themes: could not save '{name}': {e}")),
+        self.themes_card = index;
+        self.pick_card(&card, cx);
+        // Custom is the only card that keeps the modal: the wheel under it is
+        // the point of picking it.
+        if card.mode != Some(GuiTheme::Custom) {
+            self.close_themes(cx);
+        } else {
+            cx.notify();
         }
-        // Only `custom` carries an accent; the other three keep whatever was
+    }
+
+    /// Save a card's theme and adopt it.
+    fn pick_card(&mut self, card: &themes_view::Card, cx: &mut Context<Self>) {
+        let hex = gui_theme::format_accent(self.themes_accent());
+        // A catalog card leaves the mode alone: it changes the colours, not
+        // which base follows the system.
+        if let Some(mode) = card.mode {
+            let name = match mode {
+                GuiTheme::Orgn => "orgn",
+                GuiTheme::Light => "light",
+                GuiTheme::Custom => "custom",
+                GuiTheme::Auto => "auto",
+            };
+            match Config::write_key_string("gui", "theme", name) {
+                Ok(()) => logging::info(&format!("themes: kept '{name}' as [gui] theme")),
+                Err(e) => logging::error(&format!("themes: could not save '{name}': {e}")),
+            }
+        }
+        // The catalog theme by file stem; empty is the built-in mode's own
+        // palette, and reads back the same as unset.
+        let slug = card.slug.clone().unwrap_or_default();
+        match Config::write_key_string("gui", "palette", &slug) {
+            Ok(()) => logging::info(&format!("themes: kept palette '{slug}'")),
+            Err(e) => logging::error(&format!("themes: could not save palette '{slug}': {e}")),
+        }
+        // Only `custom` carries an accent; every other card keeps whatever was
         // saved, so switching away and back does not lose the wheel's colour.
+        let mode = card.mode.unwrap_or_else(|| palette::saved_mode().0);
         let accent = if mode == GuiTheme::Custom {
             match Config::write_key_string("gui", "custom_accent", &hex) {
                 Ok(()) => logging::info(&format!("themes: kept accent {hex}")),
@@ -4129,11 +4169,8 @@ impl Dashboard {
             palette::saved_mode().1
         };
         palette::remember_mode(mode, accent.clone());
-        palette::adopt(gui_theme::resolve(
-            mode,
-            palette::system_is_dark(),
-            accent.as_deref(),
-        ));
+        palette::remember_palette(card.slug.clone());
+        palette::adopt(self.card_palette(card));
         cx.notify();
     }
 
@@ -4173,21 +4210,27 @@ impl Dashboard {
     /// the surface the user is looking at and the only one the pointer reaches.
     fn themes_modal(&self, cx: &mut Context<Self>) -> AnyElement {
         let saved = palette::saved_mode().0;
+        let saved_slug = palette::saved_palette();
         let accent = palette::current().accent;
-        let mut cards: Vec<Stateful<Div>> = Vec::with_capacity(themes_view::CARDS.len());
-        for (index, &(mode, label, hint)) in themes_view::CARDS.iter().enumerate() {
+        // Built-in modes first, then the whole catalog: `cards()` is the one
+        // place that knows the order, so the keyboard cursor and the paint
+        // cannot drift apart.
+        let list = themes_view::cards();
+        let mut cards: Vec<Stateful<Div>> = Vec::with_capacity(list.len());
+        for (index, item) in list.iter().enumerate() {
             let pick = cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
-                this.themes_card = index;
-                this.pick_theme(mode, cx);
-                // Custom needs the wheel, so its click leaves the modal
-                // standing; the other three are complete on their own.
-                if mode != GuiTheme::Custom {
-                    this.close_themes(cx);
-                }
+                this.pick_card_at(index, cx);
             });
             cards.push(
-                themes_view::card(mode, label, hint, self.themes_card == index, accent)
-                    .on_click(pick),
+                themes_view::card_showing(
+                    item.shown,
+                    item.is_auto(),
+                    &item.label,
+                    &item.hint,
+                    self.themes_card == index || item.is_selected(saved, saved_slug.as_deref()),
+                    accent,
+                )
+                .on_click(pick),
             );
         }
         // The wheel is the only draggable thing in the window: a press seeds
@@ -15773,16 +15816,9 @@ mod tests {
         // opens it lives with the dashboard.
         let scrim = [".id(\"theme-modal-", "scrim\")"].concat();
         let modal = ["themes_view::", "modal("].concat();
-        let card = [
-            "themes_view::card(mode, label, hint, self.themes_card == ",
-            "index, accent)",
-        ]
-        .concat();
-        let cards = [
-            "for (index, &(mode, label, hint)) in themes_view::CARDS",
-            ".iter().enumerate()",
-        ]
-        .concat();
+        let card = ["themes_view::card_", "showing("].concat();
+        let cards = ["for (index, item) in list.iter()", ".enumerate()"].concat();
+        let list = ["let list = themes_view::", "cards();"].concat();
         let close = [".id(\"theme-modal-", "close\")"].concat();
         assert!(view.contains(&scrim), "the scrim is what dismisses");
         assert!(
@@ -15790,8 +15826,15 @@ mod tests {
             "the header carries a close control, as the README says"
         );
         assert!(src.contains(&modal), "the modal is built in one place");
-        assert!(src.contains(&card), "a card is drawn from the pick table");
-        assert!(src.contains(&cards), "four cards, and only four");
+        assert!(src.contains(&card), "a card is drawn from its own palette");
+        assert!(
+            src.contains(&list),
+            "the picker asks the theme module for its cards"
+        );
+        assert!(
+            src.contains(&cards),
+            "the built-ins and the catalog share one list and one order"
+        );
 
         // The sidebar is gone, and so is the draft-and-keep flow it carried.
         for gone in [

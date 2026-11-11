@@ -1,10 +1,11 @@
 //! The theme modal's cards (#2619).
 //!
-//! Four cards only: `orgn`, `light`, `custom`, `auto`. Each card is a
-//! miniature of the window it would paint, so the choice is made by looking
-//! rather than by reading theme names. The modal is centred over the
-//! conversation, the way Telegram's theme picker is; the click handlers live
-//! with the dashboard in `main.rs`.
+//! Four built-in cards, `orgn`, `light`, `custom`, `auto`, then one card per
+//! theme in the catalog (`~/.opencrabs/gui_themes/*.toml`, embedded from the
+//! TUI's own 31-theme pack). Each card is a miniature of the window it would
+//! paint, so the choice is made by looking rather than by reading theme names.
+//! The modal is centred over the conversation, the way Telegram's theme picker
+//! is; the click handlers live with the dashboard in `main.rs`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -31,9 +32,69 @@ pub const CARDS: [(GuiTheme, &str, &str); 4] = [
     (GuiTheme::Auto, "Auto", "follows the system appearance"),
 ];
 
+/// One card in the modal: one of the four built-in modes, or a theme from the
+/// catalog.
+///
+/// `mode` is the `[gui] theme` the card also saves, and is `None` for a catalog
+/// theme: picking one changes the colours and leaves the mode alone, so a user
+/// on `light` who tries `nord` has not silently been switched to `orgn`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Card {
+    pub mode: Option<GuiTheme>,
+    /// The catalog theme's file stem, and what `[gui] palette` stores.
+    pub slug: Option<String>,
+    pub label: String,
+    pub hint: String,
+    /// The colours this card paints, resolved once so the miniature and the
+    /// window cannot disagree.
+    pub shown: Palette,
+}
+
+impl Card {
+    /// Whether this is the auto card, whose miniature is half dark and half
+    /// light.
+    pub fn is_auto(&self) -> bool {
+        self.mode == Some(GuiTheme::Auto)
+    }
+
+    /// Whether the saved config draws this card.
+    pub fn is_selected(&self, mode: GuiTheme, slug: Option<&str>) -> bool {
+        match (&self.slug, slug) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            (None, None) => self.mode == Some(mode),
+            _ => false,
+        }
+    }
+}
+
+/// Every card the modal draws: the four built-ins, then the catalog by label.
+pub fn cards() -> Vec<Card> {
+    let dark = crate::palette::system_is_dark();
+    let mut out: Vec<Card> = CARDS
+        .iter()
+        .map(|&(mode, label, hint)| Card {
+            mode: Some(mode),
+            slug: None,
+            label: label.to_string(),
+            hint: hint.to_string(),
+            shown: gui_theme::base_for(mode, dark),
+        })
+        .collect();
+    for entry in opencrabs::config::gui_palette::catalog() {
+        out.push(Card {
+            mode: None,
+            slug: Some(entry.slug),
+            label: entry.label,
+            hint: "from the theme catalog".to_string(),
+            shown: entry.palette,
+        });
+    }
+    out
+}
+
 /// A miniature of the window: a canvas, two bubbles and an accent chip. It
-/// carries the palette the card would paint, so a card is legible before it
-/// is picked.
+/// carries the palette the card would paint, so a card is legible before it is
+/// picked.
 fn miniature(shown: Palette, accent: u32) -> Div {
     let bubble = |w: f32, color: u32| div().h(px(4.0)).w(px(w)).rounded(px(2.0)).bg(rgb(color));
     div()
@@ -138,8 +199,17 @@ fn split_miniature(accent: u32) -> Div {
 /// theme in force. `selected` is the card the window is drawing: the saved
 /// theme when the modal opens, and the card under the keyboard as the arrows
 /// walk it, because the preview has already repainted the window.
-pub fn card(mode: GuiTheme, label: &str, hint: &str, selected: bool, accent: u32) -> Stateful<Div> {
-    let shown = gui_theme::base_for(mode, crate::palette::system_is_dark());
+/// A card drawn from explicit colours: the four built-ins pass their mode's
+/// base, a catalog theme passes its own palette. `split` draws the auto card's
+/// half-and-half miniature.
+pub fn card_showing(
+    shown: Palette,
+    split: bool,
+    label: &str,
+    hint: &str,
+    selected: bool,
+    accent: u32,
+) -> Stateful<Div> {
     let ring = if selected {
         div()
             .flex_none()
@@ -175,7 +245,7 @@ pub fn card(mode: GuiTheme, label: &str, hint: &str, selected: bool, accent: u32
         .bg(rgb(shown.panel))
         .cursor_pointer()
         .hover(|d| d.bg(rgb(shown.panel_hi)))
-        .child(if mode == GuiTheme::Auto {
+        .child(if split {
             split_miniature(accent)
         } else {
             miniature(shown, accent)
@@ -487,7 +557,17 @@ pub fn modal(
     };
     let scrim_door =
         move |ev: &ClickEvent, window: &mut Window, app: &mut App| dismiss(ev, window, app);
-    let mut rows = div().flex().flex_row().gap_3().justify_center();
+    // The catalog is wider than one row, so the cards wrap and the box scrolls
+    // rather than letting them run off the edge of the modal.
+    let mut rows = div()
+        .id("theme-modal-rows")
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap_3()
+        .justify_center()
+        .max_h(px(430.0))
+        .overflow_y_scroll();
     for card in cards {
         rows = rows.child(card);
     }
