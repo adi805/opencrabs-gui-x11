@@ -1,0 +1,201 @@
+name: Pre-release Build (GUI, Linux)
+
+# Builds the Linux binaries with the `gui` feature actually usable.
+#
+# Why this file exists rather than a plain rerun of prerelease.yml:
+#   1. `prerelease.yml` has a macOS job on a self-hosted Mac Studio runner.
+#      That runner belongs to the upstream repo, so on any other repo the job
+#      queues forever and `publish-prerelease` (which needs all three) never
+#      runs. The macOS jobs are dropped here, not "fixed".
+#   2. `prerelease.yml` installs only `libasound2-dev`. A `gui` build links
+#      gpui against X11, xcb, xkbcommon, Wayland and Vulkan, so the dev headers
+#      have to be present or the build dies at the first `pkg-config` probe.
+#   3. Upstream `Cargo.toml` pins gpui to `default-features = false` with
+#      `runtime_shaders` + `font-kit` only, which compiles gpui's headless
+#      client and nothing else. That is #2765. This repo carries the fix
+#      (commit 8f72a6dc8): gpui is declared per target and the Linux target
+#      gets `x11` + `wayland`.
+#
+# Trigger is manual on purpose: a full `--all-features` release build under
+# fat LTO takes tens of minutes on a 4-core runner, and nobody wants that on
+# every push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "What is in this build (shown in the pre-release body)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Linux (linux-amd64, gui)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.98.1
+          targets: x86_64-unknown-linux-gnu
+
+      # libasound2-dev: local-stt/local-tts (default features).
+      # The X11/xcb/xkbcommon/Wayland/Vulkan block: gpui's `x11` and `wayland`
+      # features, restored by 8f72a6dc8. Without them the build succeeds and
+      # produces a binary whose window code is the headless client (#2765).
+      # mold + clang: faster link, not a build requirement.
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-xkb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libvulkan-dev \
+            mold \
+            clang
+
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Build
+        run: |
+          cargo build --locked --release \
+            --target x86_64-unknown-linux-gnu \
+            --all-features
+
+      - name: Download RTK
+        shell: bash
+        run: |
+          RTK_VERSION="0.40.0"
+          RTK_ASSET="rtk-x86_64-unknown-linux-musl.tar.gz"
+          curl -sL "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/${RTK_ASSET}" -o "/tmp/${RTK_ASSET}"
+          mkdir -p /tmp/rtk-extract && tar xzf "/tmp/${RTK_ASSET}" -C /tmp/rtk-extract
+          RTK_BIN=$(find /tmp/rtk-extract -name "rtk" | head -1)
+          cp "$RTK_BIN" "target/x86_64-unknown-linux-gnu/release/"
+          chmod +x "target/x86_64-unknown-linux-gnu/release/rtk"
+
+      # The gate that would have caught #2765 before it shipped. A `gui` binary
+      # that only carries the headless platform still builds, still links and
+      # still prints a version; the strings are what separate the two.
+      - name: Assert the gui binary carries an x11/wayland backend
+        shell: bash
+        run: |
+          GUI="target/x86_64-unknown-linux-gnu/release/opencrabs-gui"
+          test -x "$GUI" || { echo "::error::opencrabs-gui was not produced"; exit 1; }
+          for needle in x11rb wayland-client; do
+            count=$(strings -a "$GUI" | grep -c "$needle" || true)
+            echo "$needle: $count"
+            if [ "$count" -eq 0 ]; then
+              echo "::error::$GUI has no '$needle' symbols: gpui compiled the headless platform only (#2765)"
+              exit 1
+            fi
+          done
+
+      - name: Check glibc floor
+        shell: bash
+        env:
+          GLIBC_FLOOR: "2.39"
+        run: |
+          for binary in opencrabs opencrabs-gui; do
+            ./scripts/check-glibc-floor.sh \
+              "target/x86_64-unknown-linux-gnu/release/$binary" "$GLIBC_FLOOR"
+          done
+          ./target/x86_64-unknown-linux-gnu/release/opencrabs --version
+
+      - name: Create archive
+        shell: bash
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          ARCHIVE="opencrabs-v${VERSION}-pre-${SHA}-linux-amd64"
+          cd target/x86_64-unknown-linux-gnu/release
+          tar czf "../../../${ARCHIVE}.tar.gz" opencrabs opencrabs-gui rtk
+          cd ../../..
+          sha256sum "${ARCHIVE}.tar.gz" | tee "${ARCHIVE}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: prerelease-linux-amd64
+          path: |
+            opencrabs-v*-pre-*-linux-amd64.tar.gz
+            opencrabs-v*-pre-*-linux-amd64.tar.gz.sha256
+          if-no-files-found: error
+
+  publish-prerelease:
+    name: Publish Pre-release
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Download artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: artifacts
+
+      - name: Collect and checksum
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -name '*.tar.gz' -exec cp {} release-assets/ \;
+          cd release-assets && sha256sum -- * > SHA256SUMS
+          ls -la
+
+      - name: Generate pre-release notes
+        run: |
+          SHA="${{ github.sha }}"
+          SHORT_SHA=$(echo "$SHA" | cut -c1-7)
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          cat > /tmp/prerelease_notes.md << EOF
+          ## Pre-release build — v${VERSION}-pre-${SHORT_SHA}
+
+          On-demand build from this repo, for testing only. Not a tagged upstream release.
+
+          **Commit:** \`${SHORT_SHA}\` on \`${{ github.ref_name }}\` ([view](https://github.com/${{ github.repository }}/commit/${SHA}))
+
+          Built with \`--all-features\` on ubuntu-24.04 (glibc 2.39 floor), so the \`gui\` feature is included.
+
+          ${{ inputs.note }}
+
+          ### What's included
+          - linux-amd64 archive: \`opencrabs\`, \`opencrabs-gui\`, \`rtk\`
+          - SHA256 checksums
+
+          ### What this build changes
+          gpui is declared per target and the Linux target carries the \`x11\` and \`wayland\` features (commit 8f72a6dc8). Upstream pins gpui to \`default-features = false\` with \`runtime_shaders\` + \`font-kit\` only, which compiles gpui's headless client, so \`open_window\` bails with "neither DISPLAY nor WAYLAND_DISPLAY is set" even when DISPLAY is set. That is opencrabs/opencrabs#2765.
+
+          ### Install
+          Extract the archive and run \`./opencrabs\` (TUI) or \`./opencrabs-gui\` (desktop window). The GUI needs a live X11 or Wayland session; run it from the desktop session, not from a systemd-spawned shell without \`DISPLAY\`.
+
+          ### Auto-update
+          These builds are not reachable via \`/evolve\`.
+          EOF
+
+      - name: Update pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="gui-nightly"
+          if gh release view "$TAG" &>/dev/null; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" \
+            --title "Pre-release (gui-nightly)" \
+            --notes-file /tmp/prerelease_notes.md \
+            --prerelease \
+            release-assets/*
