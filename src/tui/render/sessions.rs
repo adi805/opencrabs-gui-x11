@@ -3,9 +3,11 @@
 //! Session manager view with navigation, renaming, and status indicators.
 //!
 //! The list is full-bleed (#2162): no border, no app title row, one row of
-//! footer at the bottom carrying the keys from the scoped keymap. Every
-//! session is exactly one terminal row, whatever the width, so the scroll
-//! math and the viewport can never disagree about where a session is.
+//! footer at the bottom carrying the keys from the scoped keymap. A session
+//! card is one to three rows (#2701): the name line, the plan bar when the
+//! session has a live plan, and the newest message preview. The scroll math
+//! walks the same heights the drawing does, so the selected card is always
+//! fully in view.
 //!
 //! Rows are laid out from one [`RowPlan`] computed per frame (#2175). Before
 //! that, each row solved its own gap and pushed a badge only when it had a
@@ -73,21 +75,17 @@ pub(super) fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
     ])
     .areas(area);
 
-    // Compute filtered session indices based on search
-    let visible_indices: Vec<usize> = if app.session_search.is_empty() {
-        (0..app.sessions.len()).collect()
-    } else {
-        let search = app.session_search.to_lowercase();
-        app.sessions
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                let name = s.title.as_deref().unwrap_or("New Chat").to_lowercase();
-                name.contains(&search)
-            })
-            .map(|(i, _)| i)
-            .collect()
-    };
+    // The group-topics picker takes the whole screen while it is open: the
+    // list behind it cannot be navigated and a half-covered picker reads as a
+    // broken list (#2701).
+    if let Some(pick) = &app.group_topics {
+        render_group_topics(f, pick, area);
+        return;
+    }
+
+    // One source of truth for the visible rows: the same search + plan chip +
+    // automation rule the input handler navigates and selects through (#2723).
+    let visible_indices = app.visible_session_indices();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -124,6 +122,22 @@ pub(super) fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
+    // Delete confirmation (#2701): the row action asks, and this is the ask.
+    if let Some(confirm) = &app.delete_confirm {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  Delete \"{}\"?", confirm.title),
+                Style::default()
+                    .fg(theme::role(Role::Error))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  y: delete  n: cancel",
+                Style::default().fg(theme::role(Role::TextDim)),
+            ),
+        ]));
+    }
+
     // Search editor, only while the user is typing a filter.
     if app.session_search_active {
         lines.push(Line::from(vec![
@@ -141,7 +155,32 @@ pub(super) fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
-    // Track header line count for viewport scroll calculation
+    // Filter chip header, only while the browsing filter narrows the list and
+    // no search is overriding it (#2723). An explicit search spans every
+    // session (A1), so the chip would mislead there; the default list keeps
+    // its clean look because the chip stays hidden until a key moves it.
+    if app.session_filter.is_active() && app.session_search.is_empty() {
+        let automation = if app.session_filter.show_automation {
+            "automation shown"
+        } else {
+            "automation hidden"
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  ▾ {} ", app.session_filter.plan.label()),
+                Style::default()
+                    .fg(theme::role(Role::AccentTeal))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {automation}  ·  s: plan  a: automation"),
+                Style::default().fg(theme::role(Role::GrayDim)),
+            ),
+        ]));
+    }
+
+    // Banners above the list: the scroll math below is measured from the top
+    // of the paragraph, so the selected card's offset includes these.
     let header_line_count = lines.len();
 
     if visible_indices.is_empty() && !app.session_search.is_empty() {
@@ -159,6 +198,10 @@ pub(super) fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     let plan = row_plan(app, &visible, content_area.width);
 
+    // One entry per visible session, each holding the 1-3 lines its card
+    // draws. The scroll math below walks these heights, so it can never
+    // disagree with the drawing about where a card starts.
+    let mut rows: Vec<Vec<Line<'static>>> = Vec::with_capacity(visible_indices.len());
     for (display_idx, &session_idx) in visible_indices.iter().enumerate() {
         let session = &app.sessions[session_idx];
         let is_selected = display_idx == app.selected_session_index;
@@ -169,26 +212,33 @@ pub(super) fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
             .unwrap_or(false);
 
         if is_selected && app.session_renaming {
-            lines.push(rename_row(app, &plan));
+            rows.push(vec![rename_row(app, &plan)]);
             continue;
         }
         if is_selected && app.topic_naming {
-            lines.push(topic_name_row(app, &plan));
+            rows.push(vec![topic_name_row(app, &plan)]);
             continue;
         }
 
-        lines.push(session_row(app, session, is_selected, is_current, &plan));
+        rows.push(session_card_rows(
+            app,
+            session,
+            is_selected,
+            is_current,
+            &plan,
+        ));
     }
 
-    // Viewport scroll: keep the selected session visible. One row per
-    // session, so the row index is the line index.
+    // Viewport scroll: keep the WHOLE selected card visible, so a selected
+    // card's preview and plan bar are never the part that falls off the top.
     let visible_height = (content_area.height as usize).max(1);
-    let selected_line = header_line_count + app.selected_session_index;
-    let scroll = if selected_line >= visible_height {
-        (selected_line.saturating_sub(visible_height) + 1) as u16
-    } else {
-        0u16
-    };
+    let selected_row = app.selected_session_index.min(rows.len().saturating_sub(1));
+    let selected_start =
+        header_line_count + rows.iter().take(selected_row).map(Vec::len).sum::<usize>();
+    let selected_end = selected_start + rows.get(selected_row).map_or(1, Vec::len);
+    let scroll = selected_end.saturating_sub(visible_height) as u16;
+
+    lines.extend(rows.into_iter().flatten());
 
     f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), content_area);
 
@@ -199,6 +249,125 @@ pub(super) fn render_sessions(f: &mut Frame, app: &App, area: Rect) {
         dialog_keys(DialogScope::Sessions),
         &format!("{} sessions", visible_indices.len()),
     );
+}
+
+/// The group-topics picker, full screen (#2701).
+///
+/// Same shape as the window's multi-select: the target named at the top, one
+/// row per candidate with a mark, Space toggles, Enter attaches. A guard
+/// refusal prints on the header instead of closing the picker, so the user
+/// keeps their marks and can drop the offending row.
+fn render_group_topics(
+    f: &mut Frame,
+    pick: &crate::tui::app::session_cards::GroupTopicsPick,
+    area: Rect,
+) {
+    let [content_area, rule_area, footer_area] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled(
+                "  Group topics under ",
+                Style::default().fg(theme::role(Role::TextDim)),
+            ),
+            Span::styled(
+                pick.parent_title.clone(),
+                Style::default()
+                    .fg(theme::role(Role::Accent))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "  Space marks, Enter attaches, Esc cancels",
+            Style::default().fg(theme::role(Role::GrayDim)),
+        )),
+    ];
+    if let Some(error) = &pick.error {
+        lines.push(Line::from(Span::styled(
+            format!("  {error}"),
+            Style::default().fg(theme::role(Role::Error)),
+        )));
+    }
+
+    // Keep the cursor on screen on a long list, and never scroll past the
+    // end: the window starts at the cursor once it cannot all fit.
+    let room = (content_area.height as usize)
+        .saturating_sub(lines.len())
+        .max(1);
+    let first = pick.index.saturating_add(1).saturating_sub(room);
+
+    for (offset, candidate) in pick.candidates.iter().enumerate().skip(first).take(room) {
+        let is_cursor = offset == pick.index;
+        let mark = if candidate.selected { "[x]" } else { "[ ]" };
+        let style = if is_cursor {
+            Style::default()
+                .fg(theme::role(Role::Accent))
+                .add_modifier(Modifier::BOLD)
+        } else if candidate.selected {
+            Style::default().fg(theme::role(Role::Success))
+        } else {
+            Style::default().fg(theme::role(Role::TextPrimary))
+        };
+        let mut spans = vec![
+            Span::raw(" ".repeat(GUTTER)),
+            Span::styled(format!("{mark} "), style),
+            Span::styled(
+                truncate_to_width(&candidate.title, pick_title_room(content_area.width)),
+                style,
+            ),
+        ];
+        if is_cursor {
+            let bg = theme::role(Role::SelectionBg);
+            let used: usize = spans.iter().map(|s| s.content.width()).sum();
+            if used < content_area.width as usize {
+                spans.push(Span::styled(
+                    " ".repeat(content_area.width as usize - used),
+                    Style::default().bg(bg),
+                ));
+            }
+            spans = spans
+                .into_iter()
+                .map(|s| Span::styled(s.content, s.style.bg(bg)))
+                .collect();
+        }
+        lines.push(Line::from(spans));
+    }
+
+    f.render_widget(Paragraph::new(lines), content_area);
+    hints::render_separator(f, rule_area);
+    hints::render_footer_with_context(
+        f,
+        footer_area,
+        &[
+            crate::tui::app::dialog_keys::DialogKey {
+                events: &[],
+                label: "Space",
+                verb: "mark",
+            },
+            crate::tui::app::dialog_keys::DialogKey {
+                events: &[],
+                label: "Enter",
+                verb: "attach",
+            },
+            crate::tui::app::dialog_keys::DialogKey {
+                events: &[],
+                label: "Esc",
+                verb: "cancel",
+            },
+        ],
+        &format!("{} marked", pick.selected_ids().len()),
+    );
+}
+
+/// Room for a candidate's title on the picker row, after both gutters and the
+/// four-cell mark.
+fn pick_title_room(width: u16) -> usize {
+    (width as usize).saturating_sub(GUTTER * 2 + 5).max(1)
 }
 
 /// A right-hand column of the session list.
@@ -266,13 +435,16 @@ impl Column {
     /// A value longer than the cap is ellipsised, so a deep working directory
     /// or a long branch name cannot shove its neighbours off the row. Two are
     /// wider than the common value needs: the project badge carries a
-    /// `{.name}` wrapper, and status is a composite of up to three indicators
-    /// that can all be on at once.
+    /// `{.name}` wrapper, and status is a composite of up to four indicators
+    /// that can all be on at once (activity, detached commands, the current
+    /// mark, and the pane index).
     fn cap(self, tier: SessionRowTier) -> usize {
         match self {
             Column::Date if tier == SessionRowTier::Narrow => 6,
-            Column::Date => 17,
-            Column::Status => 14,
+            // Timestamp plus ` $12.34`: a card that has run up a bill shows it
+            // without ellipsising the date it belongs to.
+            Column::Date => 26,
+            Column::Status => 18,
             Column::Model => 34,
             Column::Branch => 10,
             Column::Size => 13,
@@ -290,6 +462,7 @@ impl Column {
         session: &Session,
         is_current: bool,
         tier: SessionRowTier,
+        background: Option<&str>,
     ) -> Vec<Span<'static>> {
         let dim = Style::default().fg(theme::role(Role::GrayDim));
         let mid = Style::default().fg(theme::role(Role::GrayMid));
@@ -302,12 +475,26 @@ impl Column {
             // but opened in March rendered "2026-03-26" above one created
             // yesterday.
             Column::Date => {
-                let text = if tier == SessionRowTier::Narrow {
-                    format!(" {}", session.updated_at.format("%H:%M"))
-                } else {
-                    format!(" {}", session.updated_at.format("%Y-%m-%d %H:%M"))
-                };
-                vec![Span::styled(text, dim)]
+                if tier == SessionRowTier::Narrow {
+                    return vec![Span::styled(
+                        format!(" {}", session.updated_at.format("%H:%M")),
+                        dim,
+                    )];
+                }
+                // The card's cost rides on this column (#2701): the row already
+                // answers "when", so "what it cost" belongs beside it rather
+                // than in a column of its own that a narrow terminal drops.
+                let mut spans = vec![Span::styled(
+                    format!(" {}", session.updated_at.format("%Y-%m-%d %H:%M")),
+                    dim,
+                )];
+                if session.total_cost > 0.0 {
+                    spans.push(Span::styled(
+                        format!(" ${:.2}", session.total_cost),
+                        Style::default().fg(theme::role(Role::Warning)),
+                    ));
+                }
+                spans
             }
             Column::Size => {
                 if session.token_count <= 0 {
@@ -417,6 +604,40 @@ impl Column {
                         Style::default().fg(theme::role(Role::AccentTeal)),
                     ));
                 }
+                // Detached commands outlive the turn that spawned them (#762),
+                // so the row keeps saying "work is still going here" when no
+                // spinner can: the elapsed time is the part that answers "is
+                // it stuck", and the count says how many are behind it. The
+                // badge arrives ready-made from the frame's RowPlan, so this
+                // cell never touches the task manager.
+                if let Some(badge) = background {
+                    spans.push(Span::styled(
+                        format!(" {badge}"),
+                        Style::default().fg(theme::role(Role::Warning)),
+                    ));
+                }
+                // Live in-flight activity (#2722): the tool running now, else
+                // thinking/responding, worded like the GUI card's live lead.
+                // It rides inside this column and `fit_cell` truncates it, so
+                // a session stays exactly one row (A3). The spinner above is
+                // still the state marker; this is what the turn is doing.
+                if let Some(activity) = session_activity(app, session.id) {
+                    spans.push(Span::styled(
+                        format!(" {activity}"),
+                        Style::default().fg(theme::role(Role::GrayMid)),
+                    ));
+                }
+                // A plan waiting for a hand (#2701): the rail rings for this,
+                // the row shows the same mark so a waiting plan is visible
+                // from the list itself.
+                if app.session_plan_ready.contains(&session.id) {
+                    spans.push(Span::styled(
+                        " \u{2691}",
+                        Style::default()
+                            .fg(theme::role(Role::Warning))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
                 if is_current {
                     spans.push(Span::styled(
                         " *",
@@ -445,6 +666,70 @@ impl Column {
     }
 }
 
+/// The in-flight activity phrase for a session row (#2722), worded like the
+/// GUI card's live lead: the tool description when one is running, else
+/// `thinking…` while reasoning streams, else `responding…` while text streams.
+/// `None` when there is nothing to say. Pure so the precedence is testable
+/// without an `App`; the Status column truncates whatever this returns.
+fn activity_text(
+    tool_description: Option<&str>,
+    thinking: bool,
+    responding: bool,
+) -> Option<String> {
+    if let Some(desc) = tool_description.map(str::trim).filter(|d| !d.is_empty()) {
+        return Some(desc.to_string());
+    }
+    if thinking {
+        return Some("thinking…".to_string());
+    }
+    if responding {
+        return Some("responding…".to_string());
+    }
+    None
+}
+
+/// Gather one session's live activity from the foreground fields (when it is
+/// the focused session) or its background sidecar, then word it. Only a
+/// processing session has anything to show; a turn that has started but not
+/// yet streamed reads as `thinking…`, the same feedback the GUI card gives
+/// during the first tool calls. One row per session is preserved (A3): the
+/// caller paints this inside the Status column and truncates it.
+fn session_activity(app: &App, session_id: uuid::Uuid) -> Option<String> {
+    if !app.is_session_processing(session_id) {
+        return None;
+    }
+    let (tool_group, reasoning, response) = if app.is_current_session(session_id) {
+        (
+            app.active_tool_group.as_ref(),
+            app.streaming_reasoning.as_deref(),
+            app.streaming_response.as_deref(),
+        )
+    } else if let Some(bg) = app.background_sessions.get(&session_id) {
+        (
+            bg.active_tool_group.as_ref(),
+            bg.streaming_reasoning.as_deref(),
+            bg.streaming_response.as_deref(),
+        )
+    } else {
+        return Some("thinking…".to_string());
+    };
+    // The call running now, else the last one that ran, mirroring the GUI's
+    // `live_activity`. A completed-only group still names what just happened.
+    let tool_description = tool_group.and_then(|g| {
+        g.calls
+            .iter()
+            .rev()
+            .find(|c| !c.completed)
+            .or_else(|| g.calls.last())
+            .map(|c| c.description.as_str())
+    });
+    let thinking = reasoning.is_some_and(|r| !r.trim().is_empty());
+    let responding = response.is_some_and(|r| !r.trim().is_empty());
+    Some(
+        activity_text(tool_description, thinking, responding).unwrap_or_else(|| "thinking…".into()),
+    )
+}
+
 /// One frame's column layout, computed once and shared by every row.
 #[derive(Debug, Clone)]
 struct RowPlan {
@@ -456,6 +741,10 @@ struct RowPlan {
     columns: Vec<(Column, usize)>,
     /// The badge tier this frame resolved to.
     tier: SessionRowTier,
+    /// Detached commands still running per session, resolved ONCE for the
+    /// frame: the status column reads this instead of taking the manager's
+    /// lock again for every row, twice (natural width, then paint).
+    background: std::collections::HashMap<uuid::Uuid, String>,
 }
 
 /// Rank a tier so a column can ask "is this tier high enough?".
@@ -484,6 +773,26 @@ fn row_plan(app: &App, sessions: &[&Session], width: u16) -> RowPlan {
     let tier = responsive::session_row_tier(width as u16);
     let rank = tier_rank(tier);
 
+    // Detached commands, resolved once for the whole visible list: one lock
+    // for the frame instead of two per row inside the status cell.
+    let background: std::collections::HashMap<uuid::Uuid, String> = app
+        .agent_service
+        .background_manager()
+        .map(|mgr| {
+            sessions
+                .iter()
+                .filter_map(|s| {
+                    let tasks: Vec<(String, u64)> = mgr
+                        .running_tasks(s.id)
+                        .into_iter()
+                        .map(|t| (t.label, t.started.elapsed().as_secs()))
+                        .collect();
+                    super::background::row_background_badge(&tasks).map(|badge| (s.id, badge))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Natural width per column, capped so one runaway value cannot claim the
     // frame. Zero means no visible row has a value for that column.
     let mut natural = [0usize; Column::PRIORITY.len()];
@@ -492,11 +801,12 @@ fn row_plan(app: &App, sessions: &[&Session], width: u16) -> RowPlan {
             .current_session
             .as_ref()
             .is_some_and(|s| s.id == session.id);
+        let badge = background.get(&session.id).map(String::as_str);
         for (idx, column) in Column::PRIORITY.iter().enumerate() {
             if column.first_tier() > rank {
                 continue;
             }
-            let cell = column.cell(app, session, is_current, tier);
+            let cell = column.cell(app, session, is_current, tier, badge);
             natural[idx] = natural[idx].max(cell_width(&cell).min(column.cap(tier)));
         }
     }
@@ -533,6 +843,7 @@ fn row_plan(app: &App, sessions: &[&Session], width: u16) -> RowPlan {
         name_width,
         columns,
         tier,
+        background,
     }
 }
 
@@ -559,6 +870,85 @@ fn fit_cell(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
         break;
     }
     out
+}
+
+/// One session's card: the name line, then its plan bar and preview when it
+/// has them (#2701).
+///
+/// The rail card in the window carries the same three facts. The row keeps the
+/// single-column list the owner asked for: the extras hang under the name
+/// instead of widening the row, and a session with neither costs no extra
+/// line at all.
+fn session_card_rows(
+    app: &App,
+    session: &Session,
+    is_selected: bool,
+    is_current: bool,
+    plan: &RowPlan,
+) -> Vec<Line<'static>> {
+    let mut rows = vec![session_row(app, session, is_selected, is_current, plan)];
+
+    // Only a live plan with tasks draws a bar, so a session whose plan is
+    // finished or empty stays a one-line row.
+    if let Some(&(done, total)) = app.session_plan_progress.get(&session.id) {
+        rows.push(plan_row(app, session, done, total, plan, is_selected));
+    }
+
+    if let Some(preview) = app.session_previews.get(&session.id) {
+        rows.push(preview_row(preview, plan, is_selected));
+    }
+
+    rows
+}
+
+/// The plan bar under a session's name: `██████░░░░ 6/10 60%`.
+///
+/// The bar itself comes from `ui_core`, the same function the window's rail
+/// strip draws, so both surfaces show identical progress for the same plan.
+fn plan_row(
+    app: &App,
+    session: &Session,
+    done: usize,
+    total: usize,
+    plan: &RowPlan,
+    is_selected: bool,
+) -> Line<'static> {
+    let (percent, bar) = crate::ui_core::plan_index::progress_bar(done, total);
+    let mut spans = vec![
+        Span::raw(" ".repeat(GUTTER + 2)),
+        Span::styled(bar, Style::default().fg(theme::role(Role::Accent))),
+        Span::styled(
+            format!(" {done}/{total} {percent}%"),
+            Style::default().fg(theme::role(Role::GrayMid)),
+        ),
+    ];
+    if app.session_plan_ready.contains(&session.id) {
+        spans.push(Span::styled(
+            "  plan ready",
+            Style::default()
+                .fg(theme::role(Role::Warning))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    finish_row(spans, plan.width, is_selected)
+}
+
+/// The newest message under a session's name, worded by `ui_core` so the row
+/// and the rail card say the same thing about the same session.
+fn preview_row(
+    preview: &crate::tui::app::session_cards::SessionPreview,
+    plan: &RowPlan,
+    is_selected: bool,
+) -> Line<'static> {
+    let room = plan.width.saturating_sub(GUTTER * 2 + 2).max(1);
+    let spans = vec![
+        Span::raw(" ".repeat(GUTTER + 2)),
+        Span::styled(
+            truncate_to_width(&preview.line(), room),
+            Style::default().fg(theme::role(Role::GrayDim)),
+        ),
+    ];
+    finish_row(spans, plan.width, is_selected)
 }
 
 /// One session, exactly one terminal row.
@@ -627,6 +1017,19 @@ fn session_row(
         format!("{fold_mark}{raw_title}")
     };
     let title = title_owned.as_str();
+    // A deep search hit shows why it matched: the snippet rides after the
+    // title in the same name cell, so a hit never costs an extra row (#2724).
+    // Mirrors the GUI rail, where a content match's snippet stands in for the
+    // preview (#2720).
+    let search_title = if !app.session_search.trim().is_empty() {
+        app.session_content_matches
+            .iter()
+            .find(|r| r.session_id == session.id)
+            .map(|r| format!("{title} · {}", r.snippet))
+    } else {
+        None
+    };
+    let title = search_title.as_deref().unwrap_or(title);
     let name = if app.session_favorites.contains(&session.id) {
         truncate_to_width(&format!("★ {title}"), plan.name_width)
     } else {
@@ -641,8 +1044,9 @@ fn session_row(
         spans.push(Span::raw(" ".repeat(pad)));
     }
     for (column, column_width) in &plan.columns {
+        let badge = plan.background.get(&session.id).map(String::as_str);
         let cell = fit_cell(
-            column.cell(app, session, is_current, plan.tier),
+            column.cell(app, session, is_current, plan.tier, badge),
             *column_width,
         );
         let pad = column_width.saturating_sub(cell_width(&cell));
@@ -715,4 +1119,485 @@ fn finish_row(mut spans: Vec<Span<'static>>, width: usize, is_selected: bool) ->
             .map(|s| Span::styled(s.content, s.style.bg(bg)))
             .collect::<Vec<_>>(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brain::agent::service::AgentService;
+    use crate::db::Database;
+    use crate::services::ServiceContext;
+    use crate::tests::agent_service_mocks::MockProvider;
+    use crate::tui::app::state::{ToolCallEntry, ToolCallGroup};
+    use crate::tui::pane::PaneManager;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use std::sync::Arc;
+
+    // ── Pure precedence ──────────────────────────────────────────────────
+
+    #[test]
+    fn activity_running_tool_wins_over_thinking_and_responding() {
+        assert_eq!(
+            activity_text(Some("Reading src/main.rs"), true, true).as_deref(),
+            Some("Reading src/main.rs")
+        );
+    }
+
+    #[test]
+    fn activity_thinking_before_responding() {
+        assert_eq!(
+            activity_text(None, true, true).as_deref(),
+            Some("thinking…")
+        );
+        assert_eq!(
+            activity_text(None, true, false).as_deref(),
+            Some("thinking…")
+        );
+    }
+
+    #[test]
+    fn activity_responding_when_only_text_streams() {
+        assert_eq!(
+            activity_text(None, false, true).as_deref(),
+            Some("responding…")
+        );
+    }
+
+    #[test]
+    fn activity_blank_description_falls_through() {
+        assert_eq!(
+            activity_text(Some("   "), false, true).as_deref(),
+            Some("responding…")
+        );
+        assert_eq!(activity_text(Some(""), false, false), None);
+    }
+
+    #[test]
+    fn activity_idle_is_none() {
+        assert_eq!(activity_text(None, false, false), None);
+    }
+
+    // ── Rendered Status column (TestBackend) ─────────────────────────────
+
+    async fn app() -> App {
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let context = ServiceContext::new(db.pool().clone());
+        let provider: Arc<dyn crate::brain::provider::Provider> = Arc::new(MockProvider);
+        let service = Arc::new(AgentService::new_for_test(provider, context.clone()).await);
+        #[cfg(feature = "whatsapp")]
+        let mut app = App::new(
+            service,
+            context,
+            Arc::new(crate::channels::whatsapp::WhatsAppState::new()),
+        );
+        #[cfg(not(feature = "whatsapp"))]
+        let mut app = App::new(service, context);
+        app.pane_manager = PaneManager::new();
+        app
+    }
+
+    fn session(title: &str) -> Session {
+        let now = chrono::Utc::now();
+        Session {
+            id: uuid::Uuid::new_v4(),
+            title: Some(title.to_string()),
+            model: None,
+            provider_name: None,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            token_count: 0,
+            total_cost: 0.0,
+            working_directory: None,
+            auto_title_attempted: false,
+            project_id: None,
+            channel_chat_key: None,
+        }
+    }
+
+    fn tool_group(description: &str, completed: bool) -> ToolCallGroup {
+        ToolCallGroup {
+            calls: vec![ToolCallEntry {
+                description: description.to_string(),
+                success: false,
+                details: None,
+                completed,
+                tool_input: serde_json::Value::Null,
+                task_id: None,
+            }],
+            expanded: false,
+        }
+    }
+
+    fn draw(app: &App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| render_sessions(f, app, Rect::new(0, 0, width, height)))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    fn screen_text(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Count the rows a needle appears on, to prove one row per session (A3).
+    fn rows_containing(buffer: &Buffer, needle: &str) -> usize {
+        (0..buffer.area.height)
+            .filter(|&y| row_text(buffer, y).contains(needle))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn status_column_shows_the_running_tool_description() {
+        let mut app = app().await;
+        let s = session("Alpha session");
+        app.current_session = Some(s.clone());
+        app.processing_sessions.insert(s.id);
+        app.active_tool_group = Some(tool_group("Reading src/main.rs", false));
+        app.sessions.push(s);
+
+        let buf = draw(&app, 120, 10);
+        let text = screen_text(&buf);
+        assert!(text.contains("Reading"), "activity text missing: {text}");
+        assert!(text.contains("Alpha session"), "title missing: {text}");
+    }
+
+    #[tokio::test]
+    async fn processing_session_with_no_activity_reads_thinking() {
+        let mut app = app().await;
+        let s = session("Beta session");
+        app.current_session = Some(s.clone());
+        app.processing_sessions.insert(s.id);
+        app.sessions.push(s);
+
+        let text = screen_text(&draw(&app, 120, 10));
+        assert!(
+            text.contains("thinking"),
+            "expected thinking fallback: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_session_has_no_activity_text() {
+        let mut app = app().await;
+        let s = session("Gamma session");
+        app.current_session = Some(s.clone());
+        app.sessions.push(s);
+
+        let text = screen_text(&draw(&app, 120, 10));
+        assert!(text.contains("Gamma session"), "title missing: {text}");
+        assert!(
+            !text.contains("thinking"),
+            "idle row leaked thinking: {text}"
+        );
+        assert!(
+            !text.contains("responding"),
+            "idle row leaked responding: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_session_activity_is_rendered() {
+        let mut app = app().await;
+        let s = session("Delta session");
+        // Not the focused session: its live state lives in the sidecar.
+        app.current_session = None;
+        app.processing_sessions.insert(s.id);
+        let bg = crate::tui::app::background_session::BackgroundSessionState {
+            is_processing: true,
+            active_tool_group: Some(tool_group("Writing tests", false)),
+            ..Default::default()
+        };
+        app.background_sessions.insert(s.id, bg);
+        app.sessions.push(s);
+
+        let text = screen_text(&draw(&app, 120, 10));
+        assert!(
+            text.contains("Writing"),
+            "background activity missing: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_row_per_session_is_preserved_with_activity() {
+        let mut app = app().await;
+        let busy = session("Busy session");
+        let idle = session("Idle session");
+        app.current_session = Some(busy.clone());
+        app.processing_sessions.insert(busy.id);
+        app.active_tool_group = Some(tool_group(
+            "A very long tool description that must truncate",
+            false,
+        ));
+        app.sessions.push(busy);
+        app.sessions.push(idle);
+
+        let buf = draw(&app, 120, 12);
+        assert_eq!(
+            rows_containing(&buf, "Busy session"),
+            1,
+            "busy session wrapped"
+        );
+        assert_eq!(
+            rows_containing(&buf, "Idle session"),
+            1,
+            "idle session wrapped"
+        );
+    }
+
+    // ── Session-list filter (#2723) ──────────────────────────────────────
+
+    use crate::tui::session_filter::{PlanChip, SessionFilter, session_filter_allows};
+    use crate::utils::plan_files::PlanFilterState;
+
+    #[test]
+    fn plan_chip_cycles_through_every_state() {
+        assert_eq!(PlanChip::All.next(), PlanChip::Wip);
+        assert_eq!(PlanChip::Wip.next(), PlanChip::Finished);
+        assert_eq!(PlanChip::Finished.next(), PlanChip::NoPlan);
+        assert_eq!(PlanChip::NoPlan.next(), PlanChip::All);
+    }
+
+    #[test]
+    fn filter_hides_cron_and_rsi_but_keeps_subagents_and_humans() {
+        let f = SessionFilter::default();
+        assert!(!f.show_automation, "automation must default to hidden (A1)");
+        assert!(!session_filter_allows(
+            &f,
+            "Recap [cron-job:x]",
+            PlanFilterState::None
+        ));
+        assert!(!session_filter_allows(
+            &f,
+            "RSI autonomous cycle",
+            PlanFilterState::None
+        ));
+        assert!(session_filter_allows(
+            &f,
+            "subagent: worker",
+            PlanFilterState::None
+        ));
+        assert!(session_filter_allows(
+            &f,
+            "Human chat",
+            PlanFilterState::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn visible_indices_hide_automation_by_default() {
+        let mut app = app().await;
+        let human = session("Planning the roadmap");
+        let cron = session("Nightly recap [cron-job:x]");
+        let rsi = session("RSI autonomous cycle");
+        app.session_plan_states
+            .insert(human.id, PlanFilterState::Wip);
+        app.sessions = vec![human, cron, rsi];
+
+        // Default: automation hidden, chip All -> only the human row.
+        assert_eq!(app.visible_session_indices(), vec![0]);
+
+        // Toggle automation on -> all three.
+        app.session_filter.show_automation = true;
+        assert_eq!(app.visible_session_indices(), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn visible_indices_plan_chip_narrows_by_state() {
+        let mut app = app().await;
+        let wip = session("Wip chat");
+        let done = session("Done chat");
+        let none = session("No plan chat");
+        app.session_plan_states.insert(wip.id, PlanFilterState::Wip);
+        app.session_plan_states
+            .insert(done.id, PlanFilterState::Finished);
+        app.session_plan_states
+            .insert(none.id, PlanFilterState::None);
+        app.sessions = vec![wip, done, none];
+
+        app.session_filter.plan = PlanChip::Wip;
+        assert_eq!(app.visible_session_indices(), vec![0]);
+        app.session_filter.plan = PlanChip::Finished;
+        assert_eq!(app.visible_session_indices(), vec![1]);
+        app.session_filter.plan = PlanChip::NoPlan;
+        assert_eq!(app.visible_session_indices(), vec![2]);
+        app.session_filter.plan = PlanChip::All;
+        assert_eq!(app.visible_session_indices(), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn visible_indices_search_spans_automation() {
+        let mut app = app().await;
+        let human = session("Roadmap");
+        let cron = session("Roadmap recap [cron-job:x]");
+        app.sessions = vec![human, cron];
+
+        // Browsing hides the cron row.
+        assert_eq!(app.visible_session_indices(), vec![0]);
+        // An explicit search spans every session, automation included (A1).
+        app.session_search = "roadmap".to_string();
+        assert_eq!(app.visible_session_indices(), vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn selected_index_resolves_through_the_filtered_view() {
+        let mut app = app().await;
+        let cron = session("Recap [cron-job:x]");
+        let human = session("Real chat");
+        app.sessions = vec![cron, human];
+
+        // Cron hidden by default: the only visible row is the human, which
+        // sits at full-list index 1. The cursor (display position 0) must
+        // resolve to 1, never open the hidden cron at index 0.
+        app.selected_session_index = 0;
+        assert_eq!(app.selected_session_actual_index(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn filter_chip_header_shows_only_when_active() {
+        let mut app = app().await;
+        app.sessions = vec![session("Human chat")];
+
+        // Default filter: no chip header, the list keeps its clean look.
+        let buf = draw(&app, 100, 10);
+        assert_eq!(rows_containing(&buf, "automation hidden"), 0);
+
+        // Move the chip: the header names the chip and the automation state.
+        app.session_filter.plan = PlanChip::Wip;
+        let buf = draw(&app, 100, 10);
+        assert_eq!(rows_containing(&buf, "plan wip"), 1);
+        assert_eq!(rows_containing(&buf, "automation hidden"), 1);
+    }
+
+    // ── Session-list keyword search over message content (#2724) ─────────
+
+    use crate::db::repository::ContentSearchRow;
+    use crate::tui::events::TuiEvent;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    /// A deep-hit row for `sid`, as the shared content search would return it.
+    fn content_row(sid: uuid::Uuid, snippet: &str) -> ContentSearchRow {
+        ContentSearchRow {
+            session_id: sid,
+            title: "Untitled".to_string(),
+            snippet: snippet.to_string(),
+            match_count: 1,
+            last_hit_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_search_content_only_hit_surfaces_and_renders_snippet() {
+        let mut app = app().await;
+        // The title never mentions the query; only a message body does.
+        let s = session("Roadmap");
+        app.sessions = vec![s.clone()];
+        app.session_search = "rust".to_string();
+
+        // No deep hit yet: the title misses, so nothing is visible.
+        assert!(app.visible_session_indices().is_empty());
+
+        // The content search lands a hit: the row surfaces and keeps one row
+        // (A3), with the snippet riding after the title.
+        app.session_content_matches = vec![content_row(s.id, "we use rust here")];
+        assert_eq!(app.visible_session_indices(), vec![0]);
+        let buf = draw(&app, 120, 10);
+        let text = screen_text(&buf);
+        assert!(text.contains("Roadmap"), "title missing: {text}");
+        assert!(text.contains("rust"), "snippet missing: {text}");
+        assert_eq!(rows_containing(&buf, "Roadmap"), 1, "hit wrapped (A3)");
+    }
+
+    #[tokio::test]
+    async fn session_search_title_matches_lead_content_only_hits() {
+        let mut app = app().await;
+        let a = session("Rust notes"); // title match, ledger index 0
+        let b = session("Beta"); // content-only, ledger index 1
+        let c = session("Rust roadmap"); // title match, ledger index 2
+        app.sessions = vec![a.clone(), b.clone(), c.clone()];
+        app.session_search = "rust".to_string();
+        app.session_content_matches = vec![content_row(b.id, "rust in beta")];
+
+        // Title matches keep ledger order and lead; the content-only session
+        // follows, mirroring the GUI rail's merge (#2720).
+        assert_eq!(app.visible_session_indices(), vec![0, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn session_search_stale_generation_result_is_ignored() {
+        let mut app = app().await;
+        let s = session("Roadmap");
+        app.sessions = vec![s.clone()];
+        app.session_search = "rust".to_string();
+        // The current query is generation 5.
+        app.session_search_gen.store(5, SeqCst);
+
+        // An older read (generation 3) finishes last: it must not land.
+        app.handle_event(TuiEvent::SessionContentSearchResult {
+            generation: 3,
+            rows: vec![content_row(s.id, "stale rust hit")],
+        })
+        .await
+        .unwrap();
+        assert!(
+            app.session_content_matches.is_empty(),
+            "stale generation overwrote the hits"
+        );
+
+        // The current read (generation 5) lands.
+        app.handle_event(TuiEvent::SessionContentSearchResult {
+            generation: 5,
+            rows: vec![content_row(s.id, "fresh rust hit")],
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.session_content_matches.len(), 1);
+        assert_eq!(app.session_content_matches[0].snippet, "fresh rust hit");
+    }
+
+    #[tokio::test]
+    async fn session_search_end_to_end_reads_message_content() {
+        use crate::db::models::Message;
+        use crate::db::repository::{MessageRepository, SessionRepository};
+
+        let mut app = app().await;
+        // Persist a session whose title misses the query but whose message
+        // body carries it, then let the real debounced read surface it.
+        let sessions = SessionRepository::new(app.session_service.pool());
+        let messages = MessageRepository::new(app.session_service.pool());
+        let s = session("Roadmap");
+        sessions.create(&s).await.unwrap();
+        let m = Message::new(s.id, "user".to_string(), "we use rust here".to_string(), 1);
+        messages.create(&m).await.unwrap();
+        app.sessions = vec![s.clone()];
+        app.session_search = "rust".to_string();
+
+        app.schedule_session_content_search();
+        // The read debounces 250ms then lands on the event rail; wait for it.
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.event_handler_mut().next(),
+        )
+        .await
+        .expect("content search timed out")
+        .expect("event channel closed");
+        app.handle_event(event).await.unwrap();
+
+        assert_eq!(app.visible_session_indices(), vec![0]);
+        assert_eq!(app.session_content_matches.len(), 1);
+        assert!(app.session_content_matches[0].snippet.contains("rust"));
+    }
 }

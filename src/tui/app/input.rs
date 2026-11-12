@@ -1226,55 +1226,21 @@ impl App {
     }
 
     /// History file path: ~/.opencrabs/history.txt
-    fn history_path() -> Option<std::path::PathBuf> {
-        Some(crate::config::opencrabs_home().join("history.txt"))
+    ///
+    /// The reader, the writer and the path live in `ui_core::composer`, so the
+    /// terminal and the window cannot disagree about the file they share.
+    fn history_path() -> std::path::PathBuf {
+        crate::ui_core::composer::default_history_path()
     }
 
     /// Load input history from disk (one entry per line, most recent last)
     pub(crate) fn load_history() -> Vec<String> {
-        let Some(path) = Self::history_path() else {
-            return Vec::new();
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(content) => content
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        crate::ui_core::composer::load_history(&Self::history_path())
     }
 
-    /// Append a single entry to the history file (and trim to 500 entries)
+    /// Record one submitted entry in the shared history file.
     fn save_history_entry(&self, entry: &str) {
-        let Some(path) = Self::history_path() else {
-            return;
-        };
-        // Ensure directory exists
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // Cap at 500 entries: keep last 499 + new entry
-        let max_entries = 500;
-        if self.input_history.len() > max_entries {
-            // Rewrite the whole file with only the last max_entries
-            let start = self.input_history.len().saturating_sub(max_entries);
-            let trimmed: Vec<&str> = self.input_history[start..]
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let _ = std::fs::write(&path, trimmed.join("\n") + "\n");
-        } else {
-            // Just append
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let _ = writeln!(f, "{}", entry);
-            }
-        }
+        let _ = crate::ui_core::composer::append_history(&Self::history_path(), entry);
     }
 
     pub fn has_pending_approval(&self) -> bool {
@@ -1552,6 +1518,33 @@ impl App {
     ) -> Result<()> {
         use super::events::keys;
         use crossterm::event::{KeyCode, KeyModifiers};
+
+        // Topic bar keys (#2701). Alt is required so no bare arrow can be
+        // stolen from the input line, and the bar only answers while it is up.
+        if event.modifiers.contains(KeyModifiers::ALT) && self.chat_topic_bar.is_some() {
+            match event.code {
+                KeyCode::Left | KeyCode::Right => {
+                    let delta = if event.code == KeyCode::Left { -1 } else { 1 };
+                    let target = self.chat_topic_bar.as_ref().and_then(|b| b.step(delta));
+                    if let Some(target) = target
+                        && target
+                            != self
+                                .current_session
+                                .as_ref()
+                                .map(|s| s.id)
+                                .unwrap_or_default()
+                    {
+                        self.load_session(target).await?;
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    self.chat_topic_bar_hidden = !self.chat_topic_bar_hidden;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
 
         // Intercept keys when /approve menu is pending
         if self.has_pending_approve_menu() {
@@ -2239,13 +2232,16 @@ impl App {
                 self.escape_pending_at = None;
             } else if let Some(pending_at) = self.escape_pending_at {
                 if pending_at.elapsed() < std::time::Duration::from_secs(3) {
-                    // Second Escape within 3 seconds — stash input then clear
-                    // Arrow Up will recover the stashed text
-                    if !self.input_buffer.is_empty() {
-                        self.input_history_stash = self.input_buffer.clone();
-                    }
-                    self.input_buffer.clear();
-                    self.cursor_position = 0;
+                    // Second Escape within 3 seconds — stash input then clear.
+                    // Arrow Up recovers the stashed text. The rule lives in
+                    // `ui_core::composer`: a recalled line is not the draft,
+                    // so clearing it keeps the stash and ends the walk.
+                    crate::ui_core::composer::escape_clears_input(
+                        &mut self.input_buffer,
+                        &mut self.cursor_position,
+                        &mut self.input_history_index,
+                        &mut self.input_history_stash,
+                    );
                     self.attachments.clear();
                     self.focused_attachment = None;
                     self.error_message = None;
@@ -2572,6 +2568,51 @@ impl App {
         use super::events::keys;
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        // Delete confirmation (#2701). `d` used to destroy the selected row on
+        // the keystroke itself, one slipped finger away from a lost
+        // conversation, so the row action asks and only y answers. The id the
+        // banner named is the id deleted: the confirmation, not the cursor,
+        // decides what goes.
+        if let Some(confirm) = self.delete_confirm.clone() {
+            match event.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.delete_confirm = None;
+                    self.delete_session_at(confirm.id).await?;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.delete_confirm = None
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // Group topics picker (#2701): Space marks, Enter attaches, Esc drops
+        // the pick. The list never wraps, so Down at the end stays put.
+        if self.group_topics.is_some() {
+            match event.code {
+                KeyCode::Esc => self.group_topics = None,
+                KeyCode::Up => {
+                    if let Some(pick) = self.group_topics.as_mut() {
+                        pick.move_by(-1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(pick) = self.group_topics.as_mut() {
+                        pick.move_by(1);
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(pick) = self.group_topics.as_mut() {
+                        pick.toggle();
+                    }
+                }
+                KeyCode::Enter => self.submit_group_topics().await?,
+                _ => {}
+            }
+            return Ok(());
+        }
+
         // Rename mode: typing the new name
         if self.session_renaming {
             match event.code {
@@ -2641,6 +2682,7 @@ impl App {
                 KeyCode::Esc => {
                     self.session_search_active = false;
                     self.session_search.clear();
+                    self.schedule_session_content_search();
                     self.selected_session_index = 0;
                 }
                 KeyCode::Backspace => {
@@ -2650,6 +2692,7 @@ impl App {
                         self.session_search.pop();
                         self.selected_session_index = 0;
                     }
+                    self.schedule_session_content_search();
                 }
                 KeyCode::Enter => {
                     let visible = self.visible_session_indices();
@@ -2684,12 +2727,14 @@ impl App {
                             self.load_session(session_id).await?;
                             self.session_search_active = false;
                             self.session_search.clear();
+                            self.schedule_session_content_search();
                             self.switch_mode(AppMode::Chat).await?;
                         }
                     }
                 }
                 KeyCode::Char(c) if !c.is_control() => {
                     self.session_search.push(c);
+                    self.schedule_session_content_search();
                     self.selected_session_index = 0;
                 }
                 KeyCode::Up => {
@@ -2721,10 +2766,14 @@ impl App {
         } else if keys::is_up(&event) {
             self.selected_session_index = self.selected_session_index.saturating_sub(1);
         } else if keys::is_down(&event) {
+            let count = self.visible_session_indices().len();
             self.selected_session_index =
-                (self.selected_session_index + 1).min(self.sessions.len().saturating_sub(1));
+                (self.selected_session_index + 1).min(count.saturating_sub(1));
         } else if keys::is_enter(&event) {
-            if let Some(session) = self.sessions.get(self.selected_session_index) {
+            if let Some(session) = self
+                .selected_session_actual_index()
+                .and_then(|i| self.sessions.get(i))
+            {
                 let session_id = session.id;
 
                 if let Some(project_id) = self.assigning_to_project {
@@ -2769,12 +2818,14 @@ impl App {
                 }
             }
         } else if event.code == KeyCode::Char('t') || event.code == KeyCode::Char('T') {
-            // New topic under the selected session (#2306). The name is asked for
+            // Topics on the selected session (#2306, two-state since #2701):
+            // the first press turns topics on, the next one asks for the name
             // in the prompt above the list.
-            if self.sessions.get(self.selected_session_index).is_some() {
-                self.topic_naming = true;
-                self.topic_name_buffer.clear();
-            }
+            self.add_topic_or_enable().await?;
+        } else if event.code == KeyCode::Char('g') || event.code == KeyCode::Char('G') {
+            // Group existing sessions under the selected one (#2701): the same
+            // multi-select the window's rail menu opens.
+            self.open_group_topics();
         } else if event.code == KeyCode::Char('c') || event.code == KeyCode::Char('C') {
             // Close or reopen the selected topic (#2305).
             self.toggle_closed_selected().await?;
@@ -2784,7 +2835,10 @@ impl App {
             self.toggle_fold_selected().await?;
         } else if event.code == KeyCode::Char('r') || event.code == KeyCode::Char('R') {
             // Start renaming the selected session
-            if let Some(session) = self.sessions.get(self.selected_session_index) {
+            if let Some(session) = self
+                .selected_session_actual_index()
+                .and_then(|i| self.sessions.get(i))
+            {
                 self.session_renaming = true;
                 self.session_rename_buffer = session.title.clone().unwrap_or_default();
             }
@@ -2808,6 +2862,7 @@ impl App {
                 &mut self.input_buffer,
                 &mut self.cursor_position,
                 &mut self.input_history_index,
+                &mut self.input_history_stash,
             );
             self.pane_manager
                 .split(crate::tui::pane::SplitDirection::Horizontal);
@@ -2815,6 +2870,7 @@ impl App {
                 &mut self.input_buffer,
                 &mut self.cursor_position,
                 &mut self.input_history_index,
+                &mut self.input_history_stash,
             );
             self.pane_manager.save_layout();
             // Stay on sessions screen — user picks which session goes in the new pane.
@@ -2831,6 +2887,7 @@ impl App {
                 &mut self.input_buffer,
                 &mut self.cursor_position,
                 &mut self.input_history_index,
+                &mut self.input_history_stash,
             );
             self.pane_manager
                 .split(crate::tui::pane::SplitDirection::Vertical);
@@ -2838,43 +2895,21 @@ impl App {
                 &mut self.input_buffer,
                 &mut self.cursor_position,
                 &mut self.input_history_index,
+                &mut self.input_history_stash,
             );
             self.pane_manager.save_layout();
             // Stay on sessions screen — user picks which session goes in the new pane.
         } else if event.code == KeyCode::Char('d') || event.code == KeyCode::Char('D') {
-            // Delete the selected session
+            // Ask before destroying the row (#2701); y on the banner deletes.
             if let Some(session) = self.sessions.get(self.selected_session_index) {
-                let session_id = session.id;
-                let is_current = self
-                    .current_session
-                    .as_ref()
-                    .map(|s| s.id == session_id)
-                    .unwrap_or(false);
-                self.session_service.delete_session(session_id).await?;
-                // Clean up all cached state for this session
-                self.pane_message_cache.remove(&session_id);
-                // Also drop any background-session sidecar entry —
-                // without this a session that was processing in
-                // background at delete time would leak its
-                // pending_messages and tps_tracker forever. See
-                // background_session.rs doc for the routing model.
-                self.background_sessions.remove(&session_id);
-                if let Ok(mut q) = self.queued_messages.lock() {
-                    q.remove(&session_id);
-                }
-                self.session_cancel_tokens.remove(&session_id);
-                self.processing_sessions.remove(&session_id);
-                if is_current {
-                    self.current_session = None;
-                    self.messages.clear();
-                    self.render_cache.clear();
-                    *self.shared_session_id.lock().await = None;
-                }
-                self.load_sessions().await?;
-                // Adjust index if it's now out of bounds
-                if self.selected_session_index >= self.sessions.len() {
-                    self.selected_session_index = self.sessions.len().saturating_sub(1);
-                }
+                let title = crate::ui_core::rail::rail_title(
+                    session.title.as_deref(),
+                    self.topic_titles.get(&session.id).map(String::as_str),
+                );
+                self.delete_confirm = Some(super::session_cards::DeleteConfirm {
+                    id: session.id,
+                    title,
+                });
             }
         } else if (event.code == KeyCode::Char('p') || event.code == KeyCode::Char('P'))
             && (event.modifiers.contains(KeyModifiers::CONTROL)
@@ -2948,10 +2983,27 @@ impl App {
                     self.notification_shown_at = Some(std::time::Instant::now());
                 }
             }
+        } else if (event.code == KeyCode::Char('s') || event.code == KeyCode::Char('S'))
+            && event.modifiers.is_empty()
+        {
+            // Cycle the plan-state chip: All -> Wip -> Finished -> NoPlan
+            // (#2723). Modifiers are excluded so a chord like Ctrl+S never
+            // lands here. The cursor returns to the top of the new view.
+            self.session_filter.plan = self.session_filter.plan.next();
+            self.selected_session_index = 0;
+        } else if (event.code == KeyCode::Char('a') || event.code == KeyCode::Char('A'))
+            && event.modifiers.is_empty()
+        {
+            // Show or hide the automation sessions (cron + RSI). Hidden by
+            // default per A1; an explicit keyword search still spans every
+            // session (#2723).
+            self.session_filter.show_automation = !self.session_filter.show_automation;
+            self.selected_session_index = 0;
         } else if event.code == KeyCode::Char('/') {
             // Activate session search
             self.session_search_active = true;
             self.session_search.clear();
+            self.schedule_session_content_search();
             self.selected_session_index = 0;
         }
 

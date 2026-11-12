@@ -30,8 +30,8 @@ fn session_rows_paint_edge_to_edge_without_card_chrome() {
     );
     assert!(
         SESSIONS.contains(".when(!selected, |d| d.hover(")
-            && SESSIONS.contains(".when(selected, |d| d.bg("),
-        "hover and selection still paint on the full-width row"
+            && SESSIONS.contains(".bg(rgb(palette::current().panel))"),
+        "hover still paints on the full-width row, and every card paints the same panel (#2792)"
     );
 }
 
@@ -50,16 +50,28 @@ fn the_rail_header_is_compact_opencrabs_branding() {
 #[test]
 fn grouped_topics_are_compact_visible_pins_not_a_dropdown() {
     let ordered = block(SESSIONS, "pub fn ordered(", "/// Whether a row is a topic");
-    // #2670 gave the rail the terminal's fold key, so the order does hide a
-    // folded session's topics. The toggle is a key, not rail chrome: the row
-    // still paints no fold button or dropdown.
+    // #2701 replaced the fold tree with chips that always paint, so the order
+    // keeps every topic directly beneath its parent and hides none of them.
+    // The toggle is a key, not rail chrome: the row still paints no fold
+    // button or dropdown.
     assert!(
-        ordered.contains("is_collapsed(top.id)"),
-        "a folded session keeps its topics out of the order"
+        ordered.contains("self.parents.get(&s.id) == Some(&top.id) && grouped(s)"),
+        "a topic always follows its parent in the order"
+    );
+    assert!(
+        !ordered.contains("is_collapsed"),
+        "the order never hides a topic behind a fold"
     );
 
     let row = block(SESSIONS, "pub fn row(", "pub fn on_click(");
-    assert!(row.contains(".when(indented, |d| d.child(topic_pin_mark()))"));
+    assert!(
+        !row.contains("topic_pin_mark"),
+        "the pre-title branch mark is gone: one pin, in the trailing cluster (#2788)"
+    );
+    assert!(
+        row.contains(".when(indented, |d| d.child(pin_icon(favorited, 0.9)))"),
+        "a grouped topic keeps its single pin in the trailing cluster"
+    );
     assert!(row.contains(".when(indented, |d| d.pl_4().pr_2().py_1())"));
     assert!(row.contains("title_text.text_xs()"));
     assert!(
@@ -71,7 +83,7 @@ fn grouped_topics_are_compact_visible_pins_not_a_dropdown() {
         "no fold button joins the row chrome"
     );
     assert!(
-        GUI_MAIN.contains("sessions::row(s, flags, action, menu)"),
+        GUI_MAIN.contains("sessions::row(s, flags, action, chips)"),
         "topic pins keep their click action, slide actions, and context menu"
     );
 }

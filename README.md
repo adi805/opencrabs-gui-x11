@@ -622,10 +622,10 @@ This solves the core UX problem in mention-only groups: previously, tagging the 
 | Feature | Description |
 |---------|-------------|
 | **Cursor Navigation** | Full cursor movement: Left/Right arrows, Ctrl+Left/Right word jump, Home/End, Delete, Backspace at position |
-| **Input History** | Persistent command history (`~/.opencrabs/history.txt`), loaded on startup, capped at 500 entries |
+| **Input History** | Persistent command history (`~/.opencrabs/history.txt`), loaded on startup, shared live with the window's composers, capped at 500 entries. A typed draft survives Arrow Up then Down, Esc twice, a pane focus change, and a session switch; see [Composer drafts and history](#composer-drafts-and-history) |
 | **Inline Tool Approval** | Claude Code-style `❯ Yes / Always / No` selector with arrow key navigation |
 | **Inline Plan Approval** | Interactive plan review selector (Approve / Reject / Request Changes / View Plan) |
-| **Session Management** | Create, rename, delete sessions with persistent SQLite storage; each session remembers its provider + model, and switching sessions auto-restores the provider (no manual `/models` needed); token counts and context % per session. New sessions auto-generate a meaningful title from the first user message (no more "New Chat"). `Ctrl+Shift+P` in the sessions list pins the selected session to the top with a ★ marker (the window answers `ctrl-shift-p` too); pins survive restarts, unpinning restores the real recency slot, and the order beneath the pins never changes. `Alt+Space` opens **Seeker** on both surfaces, one field that finds a conversation, a slash command, a screen, a skill, the matching docs.opencrabs.com page or the setup for a messaging channel and runs it on Enter; a channel that is not configured yet prints the steps it takes under the field. Typing `create topic` arms the same session list so the pick names a new topic under it, `favorite` pins the picked session through that list, and a query that matches nothing offers to start a session with your words as the request. The window also opens the same card with `cmd-k`, and `ctrl-f` there narrows the rail instead |
+| **Session Management** | Create, rename, delete sessions with persistent SQLite storage; each session remembers its provider + model, and switching sessions auto-restores the provider (no manual `/models` needed); token counts and context % per session. New sessions auto-generate a meaningful title from the first user message (no more "New Chat"). `Ctrl+Shift+P` in the sessions list pins the selected session to the top with a ★ marker in the terminal and a quiet pin icon in the window (the window answers `ctrl-shift-p` too); pins survive restarts, unpinning restores the real recency slot, and the order beneath the pins never changes. The window's rename dialog also picks a session icon: eight built-in marks or your own image (png, jpg, jpeg, webp, gif, bmp, tiff or svg, up to 5 MB), stored under `~/.opencrabs/gui-icons/` and shown on the rail card and the tab; renaming keeps the picked icon. `Alt+Space` opens **Seeker** on both surfaces, one field that finds a conversation, a slash command, a screen, a skill, the matching docs.opencrabs.com page or the setup for a messaging channel and runs it on Enter; a channel that is not configured yet prints the steps it takes under the field. Typing `create topic` arms the same session list so the pick names a new topic under it, `favorite` pins the picked session through that list, and a query that matches nothing offers to start a session with your words as the request. The window also opens the same card with `cmd-k`, and `ctrl-f` there narrows the rail instead. Busy sessions carry a live activity line on both surfaces, naming the running tool, thinking, or responding as it happens. The rail filters: in the terminal `s` cycles the plan-state chip (all, in progress, finished, no plan), `a` shows or hides cron and RSI automation sessions (hidden by default), and `/` searches keywords across titles and stored message content, rendering the matching snippet beside the title; the window tucks the same filters behind a funnel toggle and answers `ctrl-f` with a rail search that reads message content too |
 | **Direct Model Switch** | `/models <provider/model>` switches the current session instantly — no picker — on the TUI and every channel. You can also name it the way you say it: `/models xiaomi mimo v2.5 pro` resolves the same as `/models xiaomi/mimo-v2.5-pro`, with spacing, hyphens, dots and case interchangeable. Matching is programmatic against the provider's own catalogue, so it costs no model call and never invents a model that provider doesn't serve; an ambiguous reference is refused with the candidates listed rather than guessed. Add `all` (`/models minimax/MiniMax-M3 all`) to apply to every non-archived session (Telegram also offers an inline "Apply to all sessions" button). `opencrabs session set-model` does the same from the terminal, and `[providers.<name>] force_default = true` pushes the section's default pair to all sessions on config reload |
 | **Theme Switching** | `/theme` opens an interactive picker — arrow through the roster with **live preview** (the whole UI recolors under the cursor), Enter applies + persists, Esc reverts. 8 hand-built presets (`crab-dark` default, dracula, alucard, monokai, solarized-light, solarized-dark, catppuccin-mocha, catppuccin-latte) plus a 31-theme curated pack converted from the opencode and alacritty-theme catalogs (tokyonight + storm, nord, gruvbox + light, kanagawa, everforest, rosepine + dawn, catppuccin-macchiato/frappe, github, material, palenight, zenburn, aura, ayu, and more — `/theme list` shows the full roster), plus your own presets: drop a TOML in `~/.opencrabs/themes/*.toml` and it hot-loads into the picker, and `cargo run --example theme_pack_gen -- <sources-dir>` (the generator that built the curated pack) converts any alacritty-theme TOML or opencode theme JSON into a ready-to-drop file with a provenance header, including `#RGB`/`#RRGGBBAA` colors, defs refs and dark/light variants; fetch loop and curation notes live in `src/tui/theme_catalog/pack/README.md`. `/theme list`, `/theme set <name>`, `/theme reset` keep the text surface; the active theme persists via the `[tui.theme]` config key and survives restarts. Every widget resolves its colours through the theme engine, with no raw ANSI remaining (a suite-level guard fails on any new raw site), and themes can declare an optional canvas background (#1634). Non-truecolor terminals automatically get an ANSI-mapped fallback tier instead of broken colors |
 | **Split Panes** | Horizontal (`\|` in sessions) and vertical (`_` in sessions) pane splitting — tmux-style. Each pane runs its own session with independent provider, model, and context. Run 10 sessions side by side, all processing in parallel. `Tab` to cycle focus, `Ctrl+X` to close pane |
@@ -722,6 +722,19 @@ A launch opens the conversation you were last in, on both surfaces, because the 
 
 Opening the window claims the profile the way the terminal does: whichever surface is running owns it, GUI, TUI or daemon, one at a time. The window therefore serves the channels and runs the scheduled jobs, so Telegram, Discord, Slack, WhatsApp and Trello answer while only the window is open, a scheduled job fires on time, and a key rotation or an allowlist edit reaches the running bots without a restart. A background instance holding the profile is shut down on start, exactly as the terminal already preempts the daemon, and the transcript names the process it took over.
 
+#### Composer drafts and history
+
+Both surfaces keep what you typed. The rules are the same in the terminal and in the window, and the state that enforces them lives in one place (`src/ui_core/composer.rs`), so the two cannot drift apart:
+
+| Situation | What happens |
+|---|---|
+| **Type, Arrow Up, Arrow Down** | The typed draft is stashed on the first Up and comes back exactly, caret included, when Down walks past the newest entry |
+| **Esc twice** | The field clears and the typed draft goes into the stash, so Arrow Up brings it back. Clearing a line recalled from history leaves that stash alone and ends the recall walk, instead of overwriting the draft with text you never typed |
+| **Switch conversations and come back** | The text is filed under the conversation it was typed in and restored when you return. Nothing carries into the conversation you switch to, and attachments are not carried either: a chip aimed at one conversation must never fly into another |
+| **Switch panes** (TUI split, GUI split) | Each pane keeps its own draft, its own recall position and its own stashed draft. Moving focus moves all three with the pane |
+
+History is one list, shared in real time. The terminal and the window read and write the same `~/.opencrabs/history.txt` (500 entries, consecutive duplicates collapsed), and inside the window the single composer and every split pane walk one in-memory list, so a message sent in a pane is recalled in the window and the other way round. A restart keeps the list.
+
 #### Theme modal
 
 `ctrl+shift+t` or `/theme` opens a centered card over the conversation, not a sidebar: four preview cards in the shape of Telegram's picker. A click on a card applies and saves it immediately, so there is no Keep button, and `esc`, the close line or a click on the scrim closes the card without undoing the choice. The arrows walk the four cards and Enter applies, so the picker works without a mouse.
@@ -734,6 +747,10 @@ Opening the window claims the profile the way the terminal does: whichever surfa
 | **Auto** | Orgn while the system is dark, Light while it is light, and it keeps following later changes |
 
 `Auto` is the default, so a first install matches the system appearance. The choice lands in `[gui] theme = "orgn" | "light" | "custom" | "auto"` and the custom accent in `[gui] custom_accent = "#RRGGBB"`. The window owns this small model now: the old `[gui] dark_theme` and `[gui] light_theme` catalog keys are ignored, because the desktop client no longer converts TUI themes. The terminal is untouched: `[tui.theme]`, the presets, the curated pack and your own `~/.opencrabs/themes/*.toml` all behave as they did.
+
+The same card carries a **Font** row under the four previews. It lists the families the machine actually has installed, read once when the window opens, with `System (default)` at the top, and a pick applies to the whole window and saves to `[gui] font` at once. Nothing is bundled: no font bytes, no licence files. The window draws in the family you name and the operating system supplies the glyphs it does not have, so every script the system font covers still renders.
+
+Code blocks are the exception that needs its own key. They draw in a monospaced family, and a proportional fallback would lose the column alignment, so `[gui] mono_font` walks a candidate list and keeps the first one installed: JetBrains Mono, SF Mono, Menlo, Consolas, Cascadia Code, DejaVu Sans Mono, Noto Sans Mono, Liberation Mono, Courier New, then the generic `monospace`. A saved family that is not installed falls back to that walk instead of silently rendering in a proportional face, which is what used to happen on Windows where the old hard-coded `Menlo` pin fell through to Segoe UI.
 
 #### Every command answers on the window
 
@@ -759,7 +776,9 @@ The window runs the terminal's whole slash-command surface, not a subset. All 33
 
 `Alt+Space` opens Seeker on both surfaces, and the window opens the same card with `cmd+k`. It is one field in the Spotlight style: type a few words, `enter` runs the row. It finds conversations, slash commands, screens, skills, the setup for a messaging channel, and the matching page on docs.opencrabs.com. `trello` surfaces the `/channels` row plus the channels docs page, `terminal voice` surfaces `/whisper`, `daemon trouble` surfaces the Troubleshooting page, `update` surfaces `/evolve`. A docs row opens the official page in your browser, and a channel that is not configured yet prints the steps it takes under the field before you commit.
 
-Matching anchors on word starts and falls back to a full-token run, so `ção` still finds `Configuração` while stray letters never match a row they do not belong to. Three flows ride the same card: `create topic` arms the session list so the pick names a new topic under it, `favorite` pins the picked session through that same list, and a query that matches nothing offers to start a fresh session with your words as the request.
+Matching anchors on word starts and falls back to a full-token run, so `ção` still finds `Configuração` while stray letters never match a row they do not belong to. Three flows ride the same card: `create topic` arms the session list so the pick names a new topic under it, `favorite` pins the picked session through that same list, and a query that matches nothing offers to start a fresh session with your words as the request. While a pick is armed the field says what the pick is for. The window also lists `group topics`, which picks the session that holds the topics and then the sessions to attach under it, and both surfaces list `split | horizontal` and `split _ vertical`: the pick splits the pane the caret is on and leaves you on the sessions list to choose the new pane's session.
+
+Seeker also runs a deep search over stored message content, on the terminal and the window alike. Type a word that only appears inside a conversation and that conversation still surfaces, with the matching snippet in place of its date. The search waits for a pause in typing, only the newest query lands, and a repeated query rebuilds from cache without another read. Your query and caret stay put while the rows refresh.
 
 ### Debug Logging
 
@@ -2262,7 +2281,7 @@ Then just type `opencrabs` to start. The onboarding wizard handles everything on
 > # Arch
 > sudo pacman -S gcc-libs alsa-lib
 > ```
-> `libgomp1` is required for the binary to start at all: it is a hard link-time dependency of the local embedding engine (`llama-cpp-2`), and without it every command fails with `error while loading shared libraries: libgomp.so.1`. `libasound2` only enables local speech-to-text audio I/O and is loaded at runtime, so the binary starts without it. On Ubuntu 24.04 and newer the audio package is `libasound2t64`: `libasound2` is a virtual package there, so `apt-get install libasound2` aborts the whole command and installs nothing, not even `libgomp1`. macOS binaries have no extra prerequisites. The Windows zip carries its four MSVC runtime DLLs beside the exes, so it needs no vc_redist install either, provided you keep the archive layout.
+> `libgomp1` is required for the binary to start at all: it is a hard link-time dependency of the local embedding engine (`llama-cpp-2`), and without it every command fails with `error while loading shared libraries: libgomp.so.1`. `libasound2t64` is a hard dependency as well: the completion chime opens an audio output stream, so `libasound.so.2` is in the binary's NEEDED list and the loader refuses to start without it (`error while loading shared libraries: libasound.so.2`). On Ubuntu 24.04 and newer the audio package is `libasound2t64`: `libasound2` is a virtual package there, so `apt-get install libasound2` aborts the whole command and installs nothing, not even `libgomp1`. macOS binaries have no extra prerequisites. The Windows zip carries its four MSVC runtime DLLs beside the exes, so it needs no vc_redist install either, provided you keep the archive layout.
 >
 > **Local TTS (Piper) additionally requires Python 3 with the `venv` module:**
 > ```bash
@@ -2325,7 +2344,7 @@ cargo install opencrabs --no-default-features --features "telegram,whatsapp,disc
 | `code-graph` | tree-sitter | Symbol/call-graph index for structural code queries (see [Structural code search](#-benchmarks)) |
 | `rtk` | — | Bash output filtering via RTK, cutting tokens on supported commands |
 | `pdfium` | pdfium-render | PDF page rendering, the primary renderer; falls back to `pdftoppm` when the system Pdfium library is absent |
-| `notification-sound` | rodio | Plan chime: plays the embedded notification WAV when a plan task settles and when the plan reaches 100% at turn settle. Opt-in via `[agent] completion_notification_enabled` (default false), TUI and GUI, no desktop toast |
+| `notification-sound` | rodio | Plan chime: plays the embedded notification WAV when a plan task settles and when the plan reaches 100% at turn settle. Opt-in via `[agent] completion_notification_enabled` (default false), TUI and GUI. OS banners are a separate, always-compiled transport (`src/utils/desktop_notify.rs`, #2729) with its own four keys |
 
 ### Option 4: Build from Source (full control)
 
@@ -3041,8 +3060,17 @@ plan_worker_allow_write = false  # default false: isolated plan workers run READ
                                  # or background tasks (their long bash runs attached). true lets them nest.
 completion_notification_enabled = false # default false (#2255): play src/assets/sound/notification.wav when a
                                  # plan task settles and when the plan reaches 100% at turn settle. TUI and
-                                 # GUI (#2691), no desktop toast. Opt-in, because
-                                 # an agent that chirps unasked is noise.
+                                 # GUI (#2691). Opt-in, because an agent that chirps unasked is noise.
+                                 # This switch also ARMS the four desktop-notification keys below; they
+                                 # stay independent of each other, so a banner is possible without the chime.
+notify_on_plan_completed = false # default false (#2729): raise an OS notification when a whole plan finishes.
+notify_on_task_completed = false # default false (#2729): raise one when a single plan task settles.
+notify_on_turn_completed = false # default false (#2729): raise one when a turn finishes and the agent waits.
+notify_on_turn_failed = false    # default false (#2729): raise one when a turn stops on an error.
+                                 # All four require completion_notification_enabled. They are suppressed
+                                 # while the window or terminal holds focus, and a settle never announces
+                                 # twice. Set OPENCRABS_NO_DESKTOP_NOTIFY=1 (or true/yes/on) in the
+                                 # environment to mute banners for one process without editing this file.
 subagent_session_ttl_days = 7    # days a spawned sub-agent's session is kept before pruning. Nothing revisits
                                  # them, so they accumulate with their messages, tool rows and plan files. 0 keeps forever
 
@@ -4179,13 +4207,20 @@ Any message that isn't a recognized command is forwarded to the AI agent as norm
 
 Each session shows its provider/model badge (e.g. `[anthropic/claude-sonnet-4-6]`) and token count. Sessions processing in the background show a spinner; sessions with unread responses show a green dot.
 
+A session is one to three rows. Under the name line, a session with a live plan draws the same progress bar the desktop rail draws (`██████░░░░ 6/10 60%`), and a session with history draws the newest message as `You: …` or `Crabs: …`, cut at 60 characters on a character boundary. A closed topic is flagged `⚑`, and topics fold under their parent with `z`. Scrolling walks the same heights the drawing does, so the selected card is always fully visible.
+
 | Shortcut | Action |
 |----------|--------|
 | `↑` / `↓` | Navigate sessions |
 | `/` | Search sessions by name (filters in real-time) |
 | `Enter` | Load selected session (auto-restores its provider + model) |
-| `R` | Rename session |
-| `D` | Delete session |
+| `n` | New session |
+| `r` | Rename session |
+| `d` | Delete session, after a confirmation banner naming it |
+| `t` | Topics: enable them on the session, then name a new topic |
+| `g` | Group sessions under the selected one (multi-select picker) |
+| `c` | Close or reopen the selected topic |
+| `z` | Fold or unfold the selected session's topic tree |
 | `F` | Browse session file artifacts |
 | `P` | Projects (coming soon) |
 | `Esc` | Back to chat |
@@ -5271,7 +5306,7 @@ cargo clippy -- -D warnings
 | `rtk` | Bash output filtering via RTK (default: enabled) |
 | `code-graph` | tree-sitter symbol/call-graph index behind `memory_search`'s structural lane (default: enabled) |
 | `pdfium` | PDF page rendering via the system Pdfium library, ahead of the `pdftoppm` fallback (default: enabled) |
-| `notification-sound` | Plan-finished chime from the embedded notification WAV, behind `[agent] completion_notification_enabled` (default: enabled feature, sound itself off by default) |
+| `notification-sound` | Plan-finished chime from the embedded notification WAV, behind `[agent] completion_notification_enabled` (default: enabled feature, sound itself off by default). Desktop banners do not need this feature |
 | `profiling` | Enable pprof flamegraph profiling (Unix only) |
 | `eval` | Offline + live evaluation harness. Compiled automatically under `cfg(test)`, and present in release binaries, which are built with `--all-features` |
 

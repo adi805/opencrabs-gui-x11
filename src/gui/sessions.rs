@@ -11,24 +11,30 @@
 //! builds each row's handler in its own loop turn, then hands the finished
 //! rows to `rail`.
 
-use crate::{icon, palette};
+use crate::{icon, palette, platform_icons};
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AnyElement, AnyView, App, ClickEvent, Context, Div, InteractiveElement, Render, ScrollHandle,
-    SharedString, Stateful, Styled, Window, deferred, div, prelude::*, rems, rgb,
+    AnyElement, AnyView, App, ClickEvent, Context, Div, Image, ImageFormat, InteractiveElement,
+    ObjectFit, Render, ScrollHandle, SharedString, Stateful, Styled, Window, div, img,
+    linear_color_stop, linear_gradient, prelude::*, rems, rgb,
 };
+use std::sync::Arc;
 
+use opencrabs::config::gui_theme;
 use opencrabs::db::Database;
 use opencrabs::db::models::Session;
-use opencrabs::db::repository::session::{SessionListOptions, SessionRepository};
+use opencrabs::db::repository::session::{
+    SessionKind, SessionListOptions, SessionRepository, classify_session_title,
+};
 use opencrabs::db::repository::session_favorites::SessionFavoritesRepository;
-use opencrabs::db::repository::{MessageRepository, PREVIEW_CHARS};
+use opencrabs::db::repository::{ContentSearchRow, MessageRepository};
+use opencrabs::ui_core::rail;
 
 // The menu primitives moved to `menu.rs` (#2613) so the transcript can draw
 // its own context menu without depending on the session rail. Re-exported
 // here because every rail call site still says `sessions::menu_*`.
-pub use crate::menu::{MenuEntry, MenuKind, menu_card, menu_item, menu_popover};
+pub use crate::menu::{MenuEntry, MenuKind, menu_item, menu_popover};
 
 /// The rail's live state, owned by the window's view.
 #[derive(Default)]
@@ -79,23 +85,50 @@ pub struct SessionsState {
     pub parents: HashMap<uuid::Uuid, uuid::Uuid>,
     /// Closed sessions (#2305): drawn dimmed and refuse new turns.
     pub closed: HashSet<uuid::Uuid>,
-    /// Sessions whose topic tree is folded (#2670): their topics stay out of
-    /// the list until the row is unfolded. Read from the same
-    /// `topics_collapsed` column the terminal writes, so folding in either
-    /// surface holds in the other.
-    pub collapsed: HashSet<uuid::Uuid>,
     /// One already-formatted preview line per session, for the card's third
     /// line. Filled by one batched read on a rail refresh, never inside a
     /// paint: the rail repaints on a shared clock, so a per-row query would
     /// be a query per card per frame. Formatted once here so the paint only
     /// clones a `SharedString`.
     pub previews: HashMap<uuid::Uuid, SharedString>,
+    /// The rail filter menu (#2719): a plan-state chip plus whether the
+    /// automation sessions (cron + RSI) show. It lives on the state so it
+    /// survives every repaint, and resets to its default when the rail closes.
+    pub rail_filter: RailFilter,
+    /// Whether the filter chip row is open (#2787). The funnel button toggles
+    /// it; the chips themselves are unchanged. Closed by default, and it
+    /// resets with the filter when the rail closes, so a reopened rail never
+    /// shows a stale panel.
+    pub rail_filter_open: bool,
+    /// Plan checklist progress `(done, total)` for every session, snapshotted
+    /// once per paint before `visible()` filters. The plan chip decides each
+    /// row from this map, so the filter never reads a plan file inside the
+    /// row loop and never chases the rows it is about to hide (#2719).
+    pub plan_progress: HashMap<uuid::Uuid, (usize, usize)>,
+    /// ctrl+f's deep hits (#2720): session id to the snippet centered on the
+    /// query, from the debounced content search. A row whose title misses the
+    /// query still shows when its messages match, and the snippet stands in
+    /// for the preview so the reader sees why. Empty whenever the field is
+    /// empty or closed, so an unsearched rail is untouched.
+    pub content_matches: HashMap<uuid::Uuid, String>,
 }
 
 impl SessionsState {
-    /// The rows the rail shows right now, in ledger order.
+    /// The rows the rail shows right now, in ledger order. Three gates: the
+    /// ctrl+f query (`matches` on the title, or a deep content hit), and the
+    /// filter menu (`rail_filter_allows`). The menu reads the per-paint plan
+    /// snapshot, never the index, so a row hidden by the plan chip still had
+    /// its progress resolved before the filter ran (#2719). A content hit
+    /// keeps a row visible even when its title misses the query (#2720).
     pub fn visible(&self) -> impl Iterator<Item = &Session> {
-        self.items.iter().filter(|s| matches(s, &self.filter))
+        self.items.iter().filter(|s| {
+            (matches(s, &self.filter) || self.content_matches.contains_key(&s.id))
+                && rail_filter_allows(
+                    &self.rail_filter,
+                    s.title.as_deref().unwrap_or(""),
+                    self.plan_progress.get(&s.id).copied(),
+                )
+        })
     }
 
     /// Pinned first, then everything else, each group keeping the ledger's
@@ -104,13 +137,12 @@ impl SessionsState {
     /// top without disturbing the order inside either group.
     ///
     /// A topic sits directly under its parent when that parent is in view
-    /// (#2303). A pinned topic is a top-level row, so pins stay above groups.
+    /// (#2303). A pinned topic stays a chip under its parent: the pin orders
+    /// top-level rows only, it never ejects a topic to the top level (#2701).
     pub fn ordered(&self) -> impl Iterator<Item = &Session> {
         let visible: Vec<&Session> = self.visible().collect();
         let in_view = |id: uuid::Uuid| visible.iter().any(|s| s.id == id);
-        let grouped = |s: &Session| {
-            !self.is_favorite(s.id) && self.parents.get(&s.id).is_some_and(|p| in_view(*p))
-        };
+        let grouped = |s: &Session| self.parents.get(&s.id).is_some_and(|p| in_view(*p));
         let (mut pinned, rest): (Vec<&Session>, Vec<&Session>) = visible
             .iter()
             .copied()
@@ -120,12 +152,6 @@ impl SessionsState {
         let mut out: Vec<&Session> = Vec::with_capacity(visible.len());
         for top in pinned {
             out.push(top);
-            // A folded row keeps its topics out of the list (#2670), the same
-            // way the terminal stops listing them (#2427). The arrow keys walk
-            // this exact order, so a hidden row can never be cursored.
-            if self.is_collapsed(top.id) {
-                continue;
-            }
             // Topic pins are always visible beneath their parent. The arrow
             // keys walk this exact order, so no cursor can target a hidden row.
             out.extend(
@@ -141,12 +167,6 @@ impl SessionsState {
     /// Whether a row is a topic shown under its parent, so it is indented.
     pub fn is_closed(&self, id: uuid::Uuid) -> bool {
         self.closed.contains(&id)
-    }
-
-    /// Whether this row's topic tree is folded, so its children stay out of
-    /// the painted list (#2670).
-    pub fn is_collapsed(&self, id: uuid::Uuid) -> bool {
-        self.collapsed.contains(&id)
     }
 
     pub fn is_indented(&self, id: uuid::Uuid) -> bool {
@@ -254,6 +274,115 @@ pub fn matches(s: &Session, query: &str) -> bool {
         return true;
     }
     s.id.to_string().starts_with(&q)
+}
+
+/// One session the ctrl+f field found, and why (#2720). A title-only match
+/// carries no snippet (the row's own preview stands); a content match carries
+/// the snippet centered on the query so the reader sees the hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindMatch {
+    pub session_id: uuid::Uuid,
+    pub snippet: Option<String>,
+}
+
+/// Merge title matches with content-search rows into one deduped list (#2720).
+/// Title matches keep the ledger's order and come first; content rows add the
+/// sessions the title missed, newest-first, each with its snippet. A session
+/// found both ways appears once, and the content snippet wins so a non-obvious
+/// title still shows why it matched. Pure: no database, no window, so the
+/// merge and its dedup are testable on their own.
+pub fn merge_find_results(
+    title_matches: Vec<uuid::Uuid>,
+    content: &[ContentSearchRow],
+) -> Vec<FindMatch> {
+    let snippets: HashMap<uuid::Uuid, &str> = content
+        .iter()
+        .map(|row| (row.session_id, row.snippet.as_str()))
+        .collect();
+    let mut seen: HashSet<uuid::Uuid> = HashSet::new();
+    let mut out: Vec<FindMatch> = Vec::new();
+    for id in title_matches {
+        if seen.insert(id) {
+            out.push(FindMatch {
+                session_id: id,
+                snippet: snippets.get(&id).map(|s| s.to_string()),
+            });
+        }
+    }
+    for row in content {
+        if seen.insert(row.session_id) {
+            out.push(FindMatch {
+                session_id: row.session_id,
+                snippet: Some(row.snippet.clone()),
+            });
+        }
+    }
+    out
+}
+
+/// Which plan-state chip the rail filter menu has selected (#2719). The
+/// progress counts come from the same plan index the card bar reads, so a
+/// row's chip and its bar never disagree about the same plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlanFilter {
+    /// Every session, plan or not.
+    #[default]
+    All,
+    /// An approved checklist with work left: done < total.
+    Active,
+    /// An approved checklist that is complete: done == total, total > 0.
+    Done,
+    /// No approved checklist at all (no plan, or a draft with no tasks).
+    NoPlan,
+}
+
+/// The rail's filter menu state (#2719): a plan-state chip plus whether the
+/// automation sessions (cron + RSI) show. The default hides automation per
+/// A1 and leaves the plan chip on All, so an untouched rail reads the way it
+/// always did minus the background noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RailFilter {
+    pub plan: PlanFilter,
+    pub show_automation: bool,
+}
+
+impl Default for RailFilter {
+    fn default() -> Self {
+        Self {
+            plan: PlanFilter::All,
+            show_automation: false,
+        }
+    }
+}
+
+/// Whether the rail filter deviates from its default (#2787). The funnel
+/// button wears the accent while this is true, so a filter that hides rows
+/// is never invisible behind a closed panel.
+pub fn filter_is_active(filter: &RailFilter) -> bool {
+    filter.plan != PlanFilter::All || filter.show_automation
+}
+
+/// Whether one row passes the rail filter menu (#2719). Pure: the title's
+/// kind comes from the core classifier and the plan progress from the
+/// per-paint snapshot, so the same inputs always give the same answer and
+/// the rule is testable without a window. Automation (cron + RSI) is hidden
+/// unless the toggle is on; the plan chip then narrows what remains. A
+/// subagent is not automation for this toggle: it stays visible.
+pub fn rail_filter_allows(filter: &RailFilter, title: &str, plan: Option<(usize, usize)>) -> bool {
+    if !filter.show_automation
+        && matches!(
+            classify_session_title(title),
+            SessionKind::Cron | SessionKind::Rsi
+        )
+    {
+        return false;
+    }
+    match filter.plan {
+        PlanFilter::All => true,
+        PlanFilter::Active => plan.is_some_and(|(done, total)| done < total),
+        PlanFilter::Done => plan.is_some_and(|(done, total)| total > 0 && done == total),
+        PlanFilter::NoPlan => plan.is_none(),
+    }
 }
 
 /// How far left a rail row must be slid before its action strip opens, in
@@ -449,6 +578,48 @@ pub async fn load_previews(
     }
 }
 
+/// ctrl+f's deep read (#2720): which sessions mention `query` in their
+/// messages, with a snippet, through the same 4 MB no-migration door as
+/// [`load_previews`]. Spans every session (the core search includes archived),
+/// off the paint path, so a rail repaint never waits on the database. The row
+/// count is bounded so a common word cannot flood the rail.
+pub async fn load_content_matches(
+    db_path: std::path::PathBuf,
+    query: String,
+) -> Result<Vec<ContentSearchRow>, String> {
+    let (tx, rx) = futures::channel::oneshot::channel::<Result<Vec<ContentSearchRow>, String>>();
+    let spawned = std::thread::Builder::new()
+        .name("session-content-find".into())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let result = match runtime {
+                Ok(rt) => rt
+                    .block_on(async {
+                        let db = Database::connect(&db_path).await?;
+                        let messages = MessageRepository::new(db.pool().clone());
+                        let sessions = SessionRepository::new(db.pool().clone());
+                        opencrabs::db::repository::search_session_content(
+                            &messages, &sessions, &query, 50,
+                        )
+                        .await
+                    })
+                    .map_err(|e| format!("{e:#}")),
+                Err(e) => Err(format!("tokio runtime failed: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    match spawned {
+        Ok(_) => match rx.await {
+            Ok(result) => result,
+            Err(_) => Err("content find thread dropped its result".into()),
+        },
+        Err(e) => Err(format!("content find thread failed to spawn: {e}")),
+    }
+}
+
 /// What the topic info panel shows (#2304). Read once per open, never edited.
 #[derive(Clone)]
 pub struct TopicInfo {
@@ -604,75 +775,6 @@ pub async fn set_closed(
             Err(_) => Err("closed write thread dropped its result".into()),
         },
         Err(e) => Err(format!("closed write thread failed to spawn: {e}")),
-    }
-}
-
-/// The sessions whose topic tree is folded (#2670). Same column the terminal
-/// writes through `set_topics_collapsed` (#2427), so one surface's fold is the
-/// other's.
-pub async fn load_collapsed(db_path: std::path::PathBuf) -> Result<Vec<uuid::Uuid>, String> {
-    let (tx, rx) = futures::channel::oneshot::channel::<Result<Vec<uuid::Uuid>, String>>();
-    let spawned = std::thread::Builder::new()
-        .name("collapsed-fetch".into())
-        .stack_size(4 * 1024 * 1024)
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            let result = match runtime {
-                Ok(rt) => rt
-                    .block_on(async {
-                        let db = Database::connect(&db_path).await?;
-                        let repo = SessionRepository::new(db.pool().clone());
-                        repo.topics_collapsed_ids().await
-                    })
-                    .map_err(|e| format!("{e:#}")),
-                Err(e) => Err(format!("tokio runtime failed: {e}")),
-            };
-            let _ = tx.send(result);
-        });
-    match spawned {
-        Ok(_) => match rx.await {
-            Ok(result) => result,
-            Err(_) => Err("collapsed fetch thread dropped its result".into()),
-        },
-        Err(e) => Err(format!("collapsed fetch thread failed to spawn: {e}")),
-    }
-}
-
-/// Fold or unfold one session's topic tree. The caller re-reads the folded set
-/// afterwards, so what is drawn follows what was written (#2670).
-pub async fn set_topics_collapsed(
-    db_path: std::path::PathBuf,
-    id: uuid::Uuid,
-    collapsed: bool,
-) -> Result<(), String> {
-    let (tx, rx) = futures::channel::oneshot::channel::<Result<(), String>>();
-    let spawned = std::thread::Builder::new()
-        .name("collapsed-write".into())
-        .stack_size(4 * 1024 * 1024)
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            let result = match runtime {
-                Ok(rt) => rt
-                    .block_on(async {
-                        let db = Database::connect(&db_path).await?;
-                        let repo = SessionRepository::new(db.pool().clone());
-                        repo.set_topics_collapsed(id, collapsed).await
-                    })
-                    .map_err(|e| format!("{e:#}")),
-                Err(e) => Err(format!("tokio runtime failed: {e}")),
-            };
-            let _ = tx.send(result);
-        });
-    match spawned {
-        Ok(_) => match rx.await {
-            Ok(result) => result,
-            Err(_) => Err("collapsed write thread dropped its result".into()),
-        },
-        Err(e) => Err(format!("collapsed write thread failed to spawn: {e}")),
     }
 }
 
@@ -972,6 +1074,17 @@ pub async fn load_telegram_topic_titles(
     }
 }
 
+/// Whether a rename has to write the icon (#2791). The draft is seeded from
+/// the stored value when the dialog opens, so only a real change writes: a
+/// None draft keeps whatever is stored and never overwrites it with the
+/// default, and an equal draft skips the write entirely.
+pub fn icon_write_needed(stored: Option<&str>, draft: Option<&str>) -> bool {
+    match draft {
+        None => false,
+        Some(draft) => stored != Some(draft),
+    }
+}
+
 /// Give one topic an icon, or clear it with None. The caller re-reads afterwards.
 pub async fn set_topic_icon(
     db_path: std::path::PathBuf,
@@ -1102,30 +1215,46 @@ fn fit(s: &str, max_chars: usize) -> String {
 /// way the table stores the role. A role that is neither `user` nor
 /// `assistant` keeps its own name rather than pretending to be one of them.
 pub fn preview_line(role: &str, text: &str) -> SharedString {
-    let who = match role {
-        "user" => "You:",
-        "assistant" => "Crabs:",
-        other => other,
-    };
-    SharedString::from(format!("{who} {}", fit(text, PREVIEW_CHARS)))
+    // The wording lives in `ui_core`: the TUI session row draws the same
+    // line for the same session (#2701).
+    SharedString::from(opencrabs::ui_core::session_preview::preview_line(
+        role, text,
+    ))
 }
 
-/// One session row: title and cost on the left, the caller's action strip on
-/// the right. Pure data plus one slot for behaviour, so the view owns every
-/// listener it puts on screen. A pinned row carries the star the owner asked
-/// for, in the accent colour, so "why is this one on top" is answered by the
-/// row itself.
-/// The pin mark a row carries: the filled star once pinned, an outline
-/// before first use. Without the outline a first-time user saw no star, no
-/// button and no hint, so pinning looked like it did not exist (#2353).
-/// The colour rides along: accent when the pin is on, muted while the
-/// outline is only an invitation.
-pub fn pin_mark(favorited: bool) -> (&'static str, u32) {
+/// The pin mark a row carries (#2788): a quiet Telegram-style pushpin,
+/// filled once pinned, outline before first use. Without the outline a
+/// first-time user saw no mark, no button and no hint, so pinning looked
+/// like it did not exist (#2353). The colour rides along: muted when the
+/// pin is on, faint while the outline is only an invitation. Never the
+/// accent: the pin is a quiet mark, not a highlight.
+pub fn pin_mark(favorited: bool) -> (bool, u32) {
     if favorited {
-        ("\u{2605}", palette::current().accent)
+        (true, palette::current().text_muted)
     } else {
-        ("\u{2606}", palette::current().text_muted)
+        (false, palette::current().text_faint)
     }
+}
+
+const PIN_SVG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/assets/pin.svg"));
+const PIN_OUTLINE_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/assets/pin-outline.svg"
+));
+
+/// The row's pushpin (#2788), drawn from an embedded vector so the tilted
+/// silhouette stays crisp on retina, which a font glyph cannot promise.
+pub fn pin_icon(favorited: bool, size: f32) -> impl IntoElement {
+    let (filled, colour) = pin_mark(favorited);
+    let bytes = if filled { PIN_SVG } else { PIN_OUTLINE_SVG };
+    let svg = String::from_utf8_lossy(bytes)
+        .replace("#8a8a8a", &format!("#{colour:06x}"))
+        .into_bytes();
+    img(Arc::new(Image::from_bytes(ImageFormat::Svg, svg)))
+        .w(rems(size))
+        .h(rems(size))
+        .flex_none()
+        .object_fit(ObjectFit::Contain)
 }
 
 /// The menu's contents, resolved from the row's pin state. Pure, so the
@@ -1184,9 +1313,9 @@ pub fn rail_menu_entries(favorited: bool, topics_enabled: bool) -> Vec<MenuEntry
 /// What a rail row shows about its session right now. Grouped so the row
 /// keeps a short argument list as the rail gains states.
 ///
-/// Clone, not Copy: the preview is a shared string, so the struct owns a
-/// refcount rather than a bag of bits.
-#[derive(Clone, Default)]
+/// Not Clone: the custom icon is a built element, and elements are moved,
+/// not copied. The row takes the flags by value, so nothing needs a clone.
+#[derive(Default)]
 pub struct RowFlags {
     pub selected: bool,
     pub cursored: bool,
@@ -1198,24 +1327,59 @@ pub struct RowFlags {
     /// draws the cell, so it never owns a timer.
     pub badge: Option<&'static str>,
     /// The already-formatted preview line, or `None` when the session has no
-    /// readable message yet. A card shows this INSTEAD of its date and cost
-    /// line, so it never grows a fourth line.
+    /// readable user/assistant message yet. It paints as the card's message
+    /// line: under the title when there are no topics, under the chip strip
+    /// when there are. Timestamp and cost always ride the title line, so a
+    /// card without a plan or a running task is at most three lines.
     pub preview: Option<SharedString>,
+    /// What the turn running in this session is doing right now (#2718): the
+    /// tool call in flight, else the thinking line. It takes the preview's
+    /// place while it lasts, so a card never grows a line for it, and the
+    /// persisted preview comes back untouched once the turn settles.
+    pub activity: Option<SharedString>,
+    /// The session's approved plan progress as `(done, total)`, or `None`
+    /// when there is no checklist to draw. Paints as a slim bar line under
+    /// the preview, reusing the composer strip's own bar so the same plan
+    /// reads identically in both places.
+    pub plan: Option<(usize, usize)>,
+    /// Whether the plan bar is in the lit half of its settle flash, in which
+    /// case it paints orange instead of its resting teal. The caller owns the
+    /// clock; this module only picks the colour.
+    pub flash: bool,
+    /// The detached commands this session is still running, already shaped by
+    /// the terminal's own formatter (`⏳ cargo test 32s`), or `None` when
+    /// nothing runs. Paints as the card's last line, under the plan bar, so a
+    /// row says "work is still going here" without being opened.
+    pub running: Option<SharedString>,
+    /// The session's stored icon, already built by the view (#2790): an
+    /// embedded mark, a custom image or a legacy glyph. When set it wins
+    /// over the platform mark in the leading slot. The module never reads
+    /// files: the view owns the image cache and hands over the finished
+    /// element.
+    pub icon: Option<AnyElement>,
 }
 
 /// One topic chip: a child conversation painted as a compact pill on its
 /// parent's card instead of its own row (Telegram topic style). `live` is the
 /// spinner glyph while the child streams; `ring` paints a dot while it awaits
-/// the user. The caller attaches the open / context-menu handlers and the
-/// deferred popover, so this stays pure data plus paint.
+/// the user. `plan` is the child's approved checklist as `(done, total)`: while
+/// it runs the chip itself fills left-to-right like a progress bar, the done
+/// share tinted teal over the chip's base. The caller attaches the open and
+/// context-menu handlers, so this stays pure data plus paint.
 pub fn topic_chip(
     id: uuid::Uuid,
     title: &str,
     live: Option<&'static str>,
     ring: bool,
     selected: bool,
+    plan: Option<(usize, usize)>,
 ) -> Stateful<Div> {
-    let mut chip = div()
+    let pal = palette::current();
+    // The focused chip sits one visible step away from the panel in both
+    // themes (#2792): track, not the old selection wash, plus an accent ring
+    // below. Hover can never equal this fill.
+    let base = if selected { pal.track } else { pal.panel };
+    let chip = div()
         .id(SharedString::from(format!("topic-chip-{id}")))
         .relative()
         .flex()
@@ -1228,13 +1392,28 @@ pub fn topic_chip(
         .rounded_md()
         .cursor_pointer()
         .text_xs()
-        .text_color(rgb(palette::current().text))
-        .bg(rgb(if selected {
-            palette::current().selection
-        } else {
-            palette::current().panel
-        }))
-        .hover(|d| d.bg(rgb(palette::current().focus)));
+        .text_color(rgb(pal.text));
+    // A running plan turns the chip into its own progress bar: a hard-stop
+    // gradient fills the done share with teal mixed into the base, the rest
+    // stays the base. No plan (or an empty one) keeps the flat chip colour.
+    let chip = match plan {
+        Some((done, total)) if total > 0 => {
+            let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
+            let fill = gui_theme::mix(base, pal.teal, 45, 100);
+            chip.bg(linear_gradient(
+                90.0,
+                linear_color_stop(rgb(fill), frac),
+                linear_color_stop(rgb(base), frac),
+            ))
+        }
+        _ => chip.bg(rgb(base)),
+    };
+    let mut chip = chip.hover(|d| d.bg(rgb(pal.panel_hi)));
+    // The ring is the "you are here" mark on the focused chip (#2792): a
+    // 1px accent outline over the track fill, never a colour field.
+    if selected {
+        chip = chip.border_1().border_color(rgb(pal.accent));
+    }
     if let Some(glyph) = live {
         chip = chip.child(
             div()
@@ -1269,7 +1448,7 @@ pub fn count_chip(id: uuid::Uuid, label: SharedString) -> Stateful<Div> {
         .text_xs()
         .text_color(rgb(palette::current().text_muted))
         .bg(rgb(palette::current().panel))
-        .hover(|d| d.bg(rgb(palette::current().focus)))
+        .hover(|d| d.bg(rgb(palette::current().panel_hi)))
         .child(label)
 }
 
@@ -1291,11 +1470,19 @@ pub fn topic_chips(id: uuid::Uuid, chips: Vec<Stateful<Div>>) -> Stateful<Div> {
     strip
 }
 
+/// Whether a rail row paints the left accent bar. The bar marks the open
+/// conversation, if and only if the row is selected: the keyboard cursor
+/// never draws it and gets no replacement cue. The owner overruled the
+/// two-state design from #2351 (#2717). Both flags come in so the contract
+/// stays testable across all four state combinations.
+fn accent_bar_visible(selected: bool, cursored: bool) -> bool {
+    matches!((selected, cursored), (true, _))
+}
+
 pub fn row(
     s: &Session,
     flags: RowFlags,
     action: Option<Stateful<Div>>,
-    menu: Option<Stateful<Div>>,
     chips: Option<Stateful<Div>>,
 ) -> Stateful<Div> {
     let RowFlags {
@@ -1306,7 +1493,29 @@ pub fn row(
         closed,
         badge,
         preview,
+        activity,
+        plan,
+        flash,
+        running,
+        icon,
     } = flags;
+    // A channel card says the chat once: the platform prints as its mark, not
+    // as a word, and the topic segment belongs to the chip under the card, not
+    // to the card itself (#2766). A row indented under a card is a topic, so it
+    // prints its own topic name and no second mark.
+    let stored = s.title.as_deref();
+    let label = match stored {
+        Some(title) if indented => rail::chip_name(Some(title), None),
+        Some(title) => rail::chat_name(Some(title)),
+        None => "(untitled)".to_string(),
+    };
+    // The stored icon wins over the platform mark (#2790): the owner picked
+    // it for this session, so it leads the row. Without one, a channel card
+    // still prints its platform; a row without a pick has no mark.
+    let mark = icon.or_else(|| {
+        rail::platform_of(stored.filter(|_| !indented))
+            .and_then(|platform| platform_icons::platform_icon(platform, 1.0))
+    });
     let title_text = div()
         // A closed topic reads dimmed: still there, no longer taking work.
         .text_color(rgb(if closed {
@@ -1315,10 +1524,7 @@ pub fn row(
             palette::current().text
         }))
         .truncate()
-        .child(SharedString::from(fit(
-            s.title.as_deref().unwrap_or("(untitled)"),
-            42,
-        )));
+        .child(SharedString::from(fit(&label, 42)));
     let title_text = if indented {
         title_text.text_xs()
     } else {
@@ -1328,31 +1534,66 @@ pub fn row(
         .flex()
         .flex_row()
         .items_center()
-        .gap_1()
+        .gap_2()
         .min_w_0()
-        // The name line fills the body so the badge's `ml_auto` has free space
-        // to push against. Without this it shrinks to its text and the glyph
-        // parks right after the name (#2636 follow-up).
+        // The name line fills the body so the trailing cluster's `ml_auto`
+        // has free space to push against. Without this it shrinks to its text
+        // and the glyph parks right after the name (#2636 follow-up).
         .w_full()
-        .when(indented, |d| d.child(topic_pin_mark()))
-        .child({
-            let (mark, colour) = pin_mark(favorited);
-            div()
-                .flex_none()
-                .text_xs()
-                .text_color(rgb(colour))
-                .child(SharedString::from(mark))
-        })
+        .when_some(mark, |d, mark| d.child(mark))
         .child(title_text)
-        // The activity glyph rides the name's own line out to the right edge
-        // (#2636). It only gets there because `body` fills the row and this
-        // line fills `body`, leaving `ml_auto` free space to consume.
-        // `flex_none` keeps the cell its width when a long title truncates.
-        .when_some(badge, |d, glyph| d.child(badge_cell(glyph)));
+        // Timestamp, cost, the pin and the activity glyph share ONE
+        // right-aligned cluster: a single auto margin carries the whole
+        // group to the edge. Two auto margins (stamp and badge each their
+        // own) would split the free space and park the stamp mid-row on a
+        // streaming session.
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_none()
+                .ml_auto()
+                .when(!indented, |d| {
+                    // Telegram's quiet column (#2788): the date/cost stamp
+                    // above, the pushpin below, both right-aligned. The
+                    // message line below stays pure conversation context.
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_end()
+                            .flex_none()
+                            .pl_1()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(rgb(palette::current().text_muted))
+                                    .child(SharedString::from(format!(
+                                        "{} · ${:.2}",
+                                        s.updated_at
+                                            .with_timezone(&chrono::Local)
+                                            .format("%m-%d %H:%M"),
+                                        s.total_cost
+                                    ))),
+                            )
+                            .child(pin_icon(favorited, 0.9)),
+                    )
+                })
+                // A grouped topic row keeps its compact pin inline, without
+                // the ledger metadata repeated on every child (#2788).
+                .when(indented, |d| d.child(pin_icon(favorited, 0.9)))
+                // The activity glyph closes the cluster at the right edge
+                // (#2636). `flex_none` keeps it its width when a long title
+                // truncates.
+                .when_some(badge, |d, glyph| d.child(badge_cell(glyph))),
+        );
     // A grouped topic is a compact pin beneath its session. Its title stays
     // visible, while the repeated date and cost metadata belongs to full rows.
     // Fill the remaining row width: `justify_between` alone left this
-    // content-sized, so the badge's `ml_auto` had nothing to consume and the
+    // content-sized, so the cluster's `ml_auto` had nothing to consume and the
     // activity glyph never reached the right edge (#2636).
     let body = div()
         .flex()
@@ -1365,26 +1606,52 @@ pub fn row(
         // (Telegram topic style). They never push a child out to its own row.
         .when_some(chips, |d, c| d.child(c))
         .when(!indented, |d| {
-            // The preview REPLACES the date and cost line, it never adds a
-            // fourth line to a card. A session with no readable message yet
-            // still shows the ledger's own stamp, so the slot is never blank.
-            let line = match preview {
-                Some(preview) => preview,
-                None => SharedString::from(format!(
-                    "{} · ${:.2}",
-                    s.updated_at
-                        .with_timezone(&chrono::Local)
-                        .format("%m-%d %H:%M"),
-                    s.total_cost
-                )),
-            };
-            d.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(palette::current().text_muted))
-                    .truncate()
-                    .child(line),
-            )
+            // A turn in flight says what it is doing, in the preview's own
+            // slot (#2718): the card would otherwise sit on the last
+            // persisted message while a new conversation runs its first tool
+            // calls, which reads as nothing happening at all. The line takes
+            // the accent colour while it is live, so the card never claims
+            // the preview is streaming, and it hands the slot back the
+            // moment the turn settles.
+            let live_line = activity.is_some();
+            let preview = activity.or(preview);
+            // The message line is pure conversation context: it paints only
+            // when a readable user/assistant message exists. The ledger
+            // stamp lives on the title line, so a quiet card simply stops
+            // after its title (and chips, when topics are attached).
+            d.when_some(preview, |d, line| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(if live_line {
+                            palette::current().accent
+                        } else {
+                            palette::current().text_muted
+                        }))
+                        .truncate()
+                        .child(line),
+                )
+            })
+            // An approved plan reads as a slim progress bar, never as raw
+            // plan JSON in the message line. Same ten cells as the composer
+            // strip, so one plan has one look wherever it is drawn. A task
+            // that just settled lifts the bar to the accent orange for a few
+            // seconds, then it falls back to its resting teal.
+            .when_some(plan, |d, (done, total)| {
+                d.child(plan_progress_cell(done, total, flash))
+            })
+            // Detached commands close the card (#762): a session whose turn
+            // ended while a build is still running says so here, under the
+            // bar, instead of reading as idle for the whole build.
+            .when_some(running, |d, line| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(palette::current().warn))
+                        .truncate()
+                        .child(line),
+                )
+            })
         });
     let mut row = div()
         .id(SharedString::from(s.id.to_string()))
@@ -1399,24 +1666,22 @@ pub fn row(
         .p_2()
         .when(indented, |d| d.pl_4().pr_2().py_1())
         .cursor_pointer()
-        .when(selected, |d| d.bg(rgb(palette::current().selection)))
-        // The keyboard's row reads as an accent bar on the left edge,
-        // distinct from the filled block that marks the open conversation:
-        // two different states, two different paints (#2351).
-        .when(cursored, |d| {
+        // Every card paints the same soft panel, focused or not (#2792):
+        // state reads from the small marks, never a big colour field. The
+        // accent bar below is the only "you are here" cue, Telegram style.
+        .bg(rgb(palette::current().panel))
+        // The accent bar marks the open conversation, and only it: the
+        // keyboard cursor gets no bar and no replacement cue. Selection
+        // alone decides (#2717, overruling #2351's two-state design).
+        .when(accent_bar_visible(selected, cursored), |d| {
             d.border_l_2().border_color(rgb(palette::current().accent))
         })
-        // The hover tint is for rows that are not selected. On the selected row
-        // it would paint over the selection and hide which conversation is open.
+        // The hover tint is for rows that are not selected: on the open one
+        // it would paint over the state and hide which conversation is open.
         .when(!selected, |d| d.hover(|d| d.bg(rgb(palette::current().bg))))
         .child(body);
     if let Some(action) = action {
         row = row.child(action);
-    }
-    // Deferred, so the menu paints above the rows below it: a plain child is
-    // covered by the later rows' text (#2386).
-    if let Some(menu) = menu {
-        row = row.child(deferred(menu).with_priority(1));
     }
     row
 }
@@ -1435,20 +1700,42 @@ pub fn row(
 fn badge_cell(glyph: &str) -> Div {
     div()
         .flex_none()
-        .ml_auto()
         .pl_1()
         .text_xs()
         .text_color(rgb(palette::current().teal))
         .child(SharedString::from(glyph.to_string()))
 }
 
-/// The quiet branch mark that makes a grouped topic read as a compact pin.
-fn topic_pin_mark() -> Div {
+/// The plan's checklist as one slim line on the card: the same ten-cell bar
+/// the composer strip draws, plus the done/total count. The bar math lives in
+/// `plan_strip`, so a row and the strip can never disagree about one plan.
+fn plan_progress_cell(done: usize, total: usize, flash: bool) -> Div {
+    let (_, bar) = crate::plan_strip::progress_bar(done, total);
+    // The theme's own accent is the orange: it stays legible on both the dark
+    // and the paper palette, where a hardcoded orange would wash out.
+    let bar_colour = if flash {
+        palette::current().accent
+    } else {
+        palette::current().teal
+    };
     div()
-        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
         .text_xs()
-        .text_color(rgb(palette::current().text_muted))
-        .child("\u{2442}")
+        .child(
+            div()
+                .flex_none()
+                .text_color(rgb(bar_colour))
+                .child(SharedString::from(bar)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_color(rgb(palette::current().text_muted))
+                .child(SharedString::from(format!("{done}/{total}"))),
+        )
 }
 
 /// The click behaviour for a row, typed the way `cx.listener` produces it.
@@ -1480,12 +1767,7 @@ impl Render for IconTip {
     }
 }
 
-fn action_icon(
-    id: &'static str,
-    glyph: &'static str,
-    color: u32,
-    label: &'static str,
-) -> Stateful<Div> {
+fn action_icon(id: &'static str, icon: AnyElement, label: &'static str) -> Stateful<Div> {
     div()
         .id(id)
         .tooltip(move |_window, cx| -> AnyView {
@@ -1497,31 +1779,31 @@ fn action_icon(
         .justify_center()
         .size(rems(1.6))
         .rounded_sm()
-        .text_sm()
-        .text_color(rgb(color))
         .cursor_pointer()
-        .hover(|d| d.bg(rgb(palette::current().focus)))
-        .child(SharedString::from(glyph))
+        .hover(|d| d.bg(rgb(palette::current().panel_hi)))
+        .child(icon)
 }
 
-/// The pin icon of a row's slide-out strip. A hollow star pins, a filled one
-/// unpins.
+/// A text glyph shaped for the slide-out strip, so the vector icons and the
+/// glyph icons share one cell style.
+fn glyph_icon(glyph: &'static str, color: u32) -> AnyElement {
+    div()
+        .text_sm()
+        .text_color(rgb(color))
+        .child(SharedString::from(glyph))
+        .into_any_element()
+}
+
+/// The pin icon of a row's slide-out strip (#2788): the same quiet pushpin
+/// the row carries, filled and muted once pinned, outline and faint before.
+/// The tooltip names the action the click performs, matching the rail menu.
 pub fn pin_button(favorited: bool) -> Stateful<Div> {
-    if favorited {
-        action_icon(
-            "session-unpin",
-            "\u{26B2}",
-            palette::current().accent,
-            "Favorite",
-        )
+    let (id, label) = if favorited {
+        ("session-unpin", "Unpin")
     } else {
-        action_icon(
-            "session-pin",
-            "\u{26B2}",
-            palette::current().text_muted,
-            "Favorite",
-        )
-    }
+        ("session-pin", "Pin")
+    };
+    action_icon(id, pin_icon(favorited, 1.0).into_any_element(), label)
 }
 
 /// The topic icon of a row's slide-out strip. With topics off it turns them
@@ -1532,7 +1814,7 @@ pub fn topic_button(topics_on: bool) -> Stateful<Div> {
     } else {
         palette::current().text_muted
     };
-    action_icon("session-topic", "\u{2442}", color, "Topic")
+    action_icon("session-topic", glyph_icon("\u{2442}", color), "Topic")
 }
 
 /// The delete icon of a row's slide-out strip. It never deletes on its own:
@@ -1541,10 +1823,53 @@ pub fn topic_button(topics_on: bool) -> Stateful<Div> {
 pub fn delete_button() -> Stateful<Div> {
     action_icon(
         "session-delete",
-        "\u{2715}",
-        palette::current().red,
+        glyph_icon("\u{2715}", palette::current().red),
         "Delete",
     )
+}
+
+const RAIL_FILTER_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/assets/rail-filter.svg"
+));
+
+/// The rail's funnel button (#2787). An embedded vector stays crisp at any
+/// size and takes the palette colour the same way the orientation icon does.
+pub fn filter_icon(size: f32, colour: u32) -> impl IntoElement {
+    let svg = String::from_utf8_lossy(RAIL_FILTER_SVG)
+        .replace("#8a8a8a", &format!("#{colour:06x}"))
+        .into_bytes();
+    img(Arc::new(Image::from_bytes(ImageFormat::Svg, svg)))
+        .w(rems(size))
+        .h(rems(size))
+        .flex_none()
+        .object_fit(ObjectFit::Contain)
+}
+
+/// One chip of the rail filter menu (#2719). Pure styling: the view attaches
+/// the click that flips the filter. The selected chip wears the accent so the
+/// active rule reads at a glance; the rest stay quiet.
+pub fn filter_chip(id: &'static str, label: &'static str, active: bool) -> Stateful<Div> {
+    let shown = palette::current();
+    let (bg, fg) = if active {
+        (shown.accent, shown.panel)
+    } else {
+        (shown.panel_hi, shown.text_muted)
+    };
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .px_2()
+        .py_0p5()
+        .rounded_sm()
+        .text_xs()
+        .bg(rgb(bg))
+        .text_color(rgb(fg))
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(shown.panel_hi)))
+        .child(SharedString::from(label))
 }
 
 /// The rail column: header and error slot from the state, then the caller's
@@ -1558,6 +1883,9 @@ pub fn rail(
     width_rem: f32,
     scroll: &ScrollHandle,
     footer: Option<AnyElement>,
+    // The filter menu (#2719), built by the view with its click handlers and
+    // pinned to the top-right of the rail. None until the view supplies it.
+    filter_control: Option<AnyElement>,
 ) -> Stateful<Div> {
     // No rail padding or inter-row gap: selection and hover paint edge to edge.
     let mut col = div()
@@ -1572,6 +1900,12 @@ pub fn rail(
         .bg(rgb(palette::current().panel))
         .py_2()
         .child(brand_header());
+
+    // The filter menu rides top-right, just under the brand (#2719). The
+    // element carries its own gaps and clicks; the rail only seats it.
+    if let Some(control) = filter_control {
+        col = col.child(div().px_2().pb_1().flex().justify_end().child(control));
+    }
 
     if state.filter_active {
         col = col.child(div().px_2().pb_1().child(filter_bar(state)));
@@ -1635,16 +1969,19 @@ fn brand_header() -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        Database, MenuKind, PREVIEW_CHARS, SessionsState, fit, load_sessions, palette, pin_mark,
-        preview_line, rail_menu_entries,
+        Database, FindMatch, MenuKind, PlanFilter, RailFilter, SessionsState, accent_bar_visible,
+        filter_is_active, fit, icon_write_needed, load_sessions, merge_find_results, palette,
+        pin_mark, preview_line, rail_filter_allows, rail_menu_entries,
     };
     use opencrabs::db::models::Session;
+    use opencrabs::db::repository::ContentSearchRow;
+    use opencrabs::db::repository::PREVIEW_CHARS;
 
-    /// #2303: a topic sits directly under its parent. A favorited topic stays
-    /// pinned at the top level for ordering, but keeps its indent: the pin
-    /// changes where it sorts, never whether it is a topic of its parent.
+    /// #2701: a topic sits directly under its parent as a chip. Pinning it
+    /// does not eject it to a top-level row: the pin orders top-level rows
+    /// only, and the topic stays grouped (and indented) under its parent.
     #[test]
-    fn topics_group_under_their_parent_and_favorites_stay_pinned() {
+    fn a_pinned_topic_stays_a_chip_under_its_parent() {
         let a = Session::new(Some("A".into()), None, None);
         let b = Session::new(Some("B".into()), None, None);
         let a1 = Session::new(Some("A topic".into()), None, None);
@@ -1672,18 +2009,24 @@ mod tests {
 
         state.favorites.insert(a1_id);
         let order: Vec<_> = state.ordered().map(|s| s.id).collect();
-        assert_eq!(order[0], a1_id, "a pinned topic stays above the groups");
+        assert_eq!(
+            order,
+            vec![a_id, a1_id, b_id, c_id],
+            "a pinned topic stays under its parent instead of ejecting to the top"
+        );
+        assert_eq!(order[0], a_id, "the parent, not the pinned topic, leads");
         assert!(
             state.is_indented(a1_id),
-            "a pinned topic is still a topic of its parent: the pin changes order, not indent"
+            "a pinned topic is still a topic of its parent: the pin never drops the indent"
         );
     }
 
-    /// #2670: folding a session keeps its topics out of the list, the way the
-    /// terminal stops drawing them (#2427), and the keyboard cannot land on a
-    /// row that is no longer painted.
+    /// #2701: topics paint as chips on the parent card, so they always stay in
+    /// the ordered list and the keyboard can reach them. The row-era fold is
+    /// gone from the GUI: a `topics_collapsed` flag the terminal writes must
+    /// never blank the chip strip (the CrabsDev card showed no chips at all).
     #[test]
-    fn a_folded_session_hides_its_topics_from_the_list_and_the_keyboard() {
+    fn topics_always_stay_listed_under_their_parent() {
         let a = Session::new(Some("A".into()), None, None);
         let a1 = Session::new(Some("A topic".into()), None, None);
         let b = Session::new(Some("B".into()), None, None);
@@ -1694,26 +2037,17 @@ mod tests {
         };
         state.parents.insert(a1_id, a_id);
 
-        let expanded: Vec<_> = state.ordered().map(|s| s.id).collect();
-        assert_eq!(expanded, vec![a_id, a1_id, b_id]);
-
-        state.collapsed.insert(a_id);
-        assert!(state.is_collapsed(a_id));
-        let folded: Vec<_> = state.ordered().map(|s| s.id).collect();
+        let ordered: Vec<_> = state.ordered().map(|s| s.id).collect();
         assert_eq!(
-            folded,
-            vec![a_id, b_id],
-            "a folded session draws itself and nothing beneath it"
+            ordered,
+            vec![a_id, a1_id, b_id],
+            "a topic always stays directly under its parent"
         );
         assert_eq!(
             state.cursor_step(Some(a_id), 1),
-            Some(b_id),
-            "the arrow steps over the hidden topics instead of into them"
+            Some(a1_id),
+            "the arrow steps into the topic, never over it"
         );
-
-        state.collapsed.clear();
-        let reopened: Vec<_> = state.ordered().map(|s| s.id).collect();
-        assert_eq!(reopened, expanded, "unfolding puts the topics back");
     }
 
     /// #2271's whole class, seated: truncation walks chars, never bytes. Any
@@ -1981,33 +2315,128 @@ mod tests {
         );
     }
 
+    /// A rename writes the icon only on a real change (#2791): a None draft
+    /// keeps the stored icon, an equal draft skips, a different one writes.
+    #[test]
+    fn icon_write_needed_only_on_a_real_change() {
+        // A None draft never overwrites the stored icon with the default.
+        assert!(!icon_write_needed(Some("topic:ops"), None));
+        assert!(!icon_write_needed(None, None));
+        // The seeded draft equals the stored value: no write.
+        assert!(!icon_write_needed(Some("topic:ops"), Some("topic:ops")));
+        assert!(!icon_write_needed(
+            Some("img:crab.png"),
+            Some("img:crab.png")
+        ));
+        // A change writes, including the first icon on a bare session.
+        assert!(icon_write_needed(Some("topic:ops"), Some("topic:dev")));
+        assert!(icon_write_needed(None, Some("topic:ops")));
+        assert!(icon_write_needed(Some("topic:ops"), Some("img:crab.png")));
+    }
+
     #[test]
     fn pin_mark_is_filled_only_when_favorited() {
-        let (mark, colour) = pin_mark(true);
-        assert_eq!(mark, "\u{2605}", "a pinned row carries the filled star");
+        let (filled, colour) = pin_mark(true);
+        assert!(filled, "a pinned row carries the filled pushpin");
         assert_eq!(
             colour,
+            palette::current().text_muted,
+            "the pin stays a quiet mark at the date text's visual weight"
+        );
+        assert_ne!(
+            colour,
             palette::current().accent,
-            "the pin borrows the accent so the row says why it is on top"
+            "the pin never borrows the accent (#2788)"
         );
         assert_ne!(
             pin_mark(false).0,
-            mark,
+            filled,
             "an unpinned row must never look pinned"
         );
     }
 
     #[test]
     fn hover_mark_is_the_outline() {
-        // Before the first pin there was no star, no button and no hint, so
-        // the row itself has to carry the invitation: the outline star in
-        // the quiet colour, which turns filled the moment it is used.
-        let (mark, colour) = pin_mark(false);
-        assert_eq!(mark, "\u{2606}", "an unpinned row shows the outline star");
+        // Before the first pin there was no mark, no button and no hint, so
+        // the row itself has to carry the invitation: the outline pushpin in
+        // the faint colour, which turns filled the moment it is used (#2353).
+        let (filled, colour) = pin_mark(false);
+        assert!(!filled, "an unpinned row shows the outline pushpin");
         assert_eq!(
             colour,
-            palette::current().text_muted,
+            palette::current().text_faint,
             "the invitation stays quieter than the pin"
+        );
+    }
+
+    /// The pin contract (#2788): one pushpin per row, in the trailing
+    /// cluster and never before the name. A full row stacks the stamp above
+    /// the pin, an indented topic keeps it inline, and the star glyphs are
+    /// gone from the module.
+    #[test]
+    fn the_pin_rides_the_trailing_cluster_not_the_title() {
+        let source = include_str!("sessions.rs");
+        let row_source = source
+            .split("pub fn row(")
+            .nth(1)
+            .expect("session row renderer")
+            .split("pub fn on_click(")
+            .next()
+            .expect("row source before click handler");
+        let title_line = row_source
+            .split(".when_some(chips,")
+            .next()
+            .expect("title line before the chip strip");
+        assert!(
+            !title_line.contains("= pin_mark(favorited)"),
+            "the title line never paints the pin before the name"
+        );
+        let name_line = title_line
+            .split(".ml_auto()")
+            .next()
+            .expect("name line before the trailing cluster");
+        assert!(
+            !name_line.contains("pin_icon") && !name_line.contains("topic_pin_mark"),
+            "no pin of any kind paints before the name, indented rows included"
+        );
+        let cluster = title_line
+            .split(".ml_auto()")
+            .nth(1)
+            .expect("trailing cluster");
+        assert!(
+            cluster.contains("pin_icon(favorited, 0.9)"),
+            "the pin rides the one right-aligned cluster"
+        );
+        let stamp = cluster.find("%m-%d %H:%M").expect("date/cost stamp");
+        let pin = cluster
+            .find("pin_icon(favorited, 0.9)")
+            .expect("pushpin under the stamp");
+        assert!(
+            stamp < pin,
+            "the stamp paints above the pin on a full row, Telegram style"
+        );
+        assert!(
+            cluster.contains(".flex_col()") && cluster.contains(".items_end()"),
+            "a full row stacks the stamp above the pin, Telegram style"
+        );
+        assert!(
+            !source.contains('\u{2605}') && !source.contains('\u{2606}'),
+            "the star glyphs are gone: the pushpin replaces them"
+        );
+        let button = source
+            .split("pub fn pin_button(")
+            .nth(1)
+            .expect("pin button")
+            .split("pub fn topic_button(")
+            .next()
+            .expect("button before the topic button");
+        assert!(
+            button.contains("pin_icon(favorited, 1.0)"),
+            "the strip speaks the same pin language as the row"
+        );
+        assert!(
+            button.contains("\"Unpin\"") && button.contains("\"Pin\""),
+            "the tooltip names the action, matching the rail menu"
         );
     }
 
@@ -2207,6 +2636,47 @@ mod tests {
         assert!(!rail_source.contains(".gap_1()"));
     }
 
+    /// The bar is the open conversation's mark, never the cursor's: all
+    /// four flag combinations, selection alone decides (#2717).
+    #[test]
+    fn the_accent_bar_follows_selection_never_the_cursor() {
+        assert!(
+            accent_bar_visible(true, true),
+            "selected and cursored keeps the bar"
+        );
+        assert!(
+            accent_bar_visible(true, false),
+            "selected alone keeps the bar"
+        );
+        assert!(
+            !accent_bar_visible(false, true),
+            "a cursored row that is not the open session gets no bar"
+        );
+        assert!(!accent_bar_visible(false, false), "a quiet row gets no bar");
+    }
+
+    /// Structural pin: the row paints the bar through the selection-only
+    /// decision, and the old cursor-gated paint is gone (#2717).
+    #[test]
+    fn the_row_bar_is_gated_by_selection_not_the_cursor() {
+        let source = include_str!("sessions.rs");
+        let row_source = source
+            .split("pub fn row(")
+            .nth(1)
+            .expect("session row renderer")
+            .split("pub fn on_click(")
+            .next()
+            .expect("row source before click handler");
+        assert!(
+            row_source.contains(".when(accent_bar_visible(selected, cursored),"),
+            "the bar paints through the selection-only decision"
+        );
+        assert!(
+            !row_source.contains(".when(cursored,"),
+            "the cursor never gates a paint on the row"
+        );
+    }
+
     /// Telegram-style topics: a parent card mounts its children as an inline
     /// wrapping chip strip, and the paint loop skips those children as rows.
     /// Structural, the same source-split style as the #2636 badge pins.
@@ -2250,6 +2720,14 @@ mod tests {
             chip_source.contains("fit(title, 14)"),
             "chip title truncates"
         );
+        assert!(
+            chip_source.contains("linear_gradient("),
+            "a running plan fills the chip like a progress bar (#2701)"
+        );
+        assert!(
+            !row_source.contains(".when(holds_focus,"),
+            "the focus wash is gone: every card paints the same panel (#2792)"
+        );
 
         // The paint loop drops a chip child from the row stream, so it never
         // paints as its own row while its parent is visible.
@@ -2257,6 +2735,184 @@ mod tests {
         assert!(
             main_source.contains("if chip_children.contains(&id)"),
             "the rail skips a child that paints as a chip"
+        );
+
+        // A pinned topic stays a chip: the chip set must never filter out
+        // favorites, or they eject to top-level rows and scatter (#2701).
+        let chip_block = main_source
+            .split("let chip_children:")
+            .nth(1)
+            .expect("chip set resolver")
+            .split("let mut children_by_parent")
+            .next()
+            .expect("chip set before the parent map");
+        assert!(
+            !chip_block.contains("is_favorite"),
+            "the chip set never ejects a favorite: a pinned topic stays a chip"
+        );
+        assert!(
+            !chip_block.contains("is_collapsed"),
+            "the chip set never hides a folded parent's topics: chips always paint"
+        );
+        assert!(
+            !main_source.contains("let holds_focus"),
+            "the parent focus computation is removed, not masked (#2792)"
+        );
+    }
+
+    /// Honest focus states (#2792): three clearly separate levels. Every
+    /// card paints panel; hover is panel_hi on the chips and icons; the
+    /// focused chip is track plus a 1px accent ring. No card background is
+    /// painted from focus or selection.
+    #[test]
+    fn focus_states_are_small_marks_not_colour_fields() {
+        let source = include_str!("sessions.rs");
+        let row_source = source
+            .split("pub fn row(")
+            .nth(1)
+            .expect("session row renderer")
+            .split("pub fn on_click(")
+            .next()
+            .expect("row source before click handler");
+        assert!(
+            row_source.contains(".bg(rgb(palette::current().panel))"),
+            "every card paints the same soft panel"
+        );
+        assert!(
+            !row_source.contains("palette::current().focus")
+                && !row_source.contains("palette::current().selection"),
+            "no card background comes from the focus or selection wash"
+        );
+        let chip_source = source
+            .split("pub fn topic_chip(")
+            .nth(1)
+            .expect("topic chip renderer")
+            .split("pub fn count_chip(")
+            .next()
+            .expect("chip source before the overflow pill");
+        assert!(
+            chip_source.contains("if selected { pal.track } else { pal.panel }"),
+            "the focused chip fills with track, one step off the panel"
+        );
+        assert!(
+            chip_source.contains(".border_1().border_color(rgb(pal.accent))"),
+            "the focused chip carries a 1px accent ring"
+        );
+        assert!(
+            chip_source.contains(".hover(|d| d.bg(rgb(pal.panel_hi)))"),
+            "chip hover is panel_hi, never the focused fill"
+        );
+        let count_source = source
+            .split("pub fn count_chip(")
+            .nth(1)
+            .expect("overflow pill renderer")
+            .split("pub fn topic_chips(")
+            .next()
+            .expect("pill source before the strip");
+        assert!(
+            count_source.contains(".hover(|d| d.bg(rgb(palette::current().panel_hi)))"),
+            "the overflow pill hovers at panel_hi too"
+        );
+        let action_source = source
+            .split("fn action_icon(")
+            .nth(1)
+            .expect("action icon renderer")
+            .split("fn glyph_icon(")
+            .next()
+            .expect("action source before the glyph helper");
+        assert!(
+            action_source.contains(".hover(|d| d.bg(rgb(palette::current().panel_hi)))"),
+            "the slide-out icons hover at panel_hi too"
+        );
+        let filter_source = source
+            .split("fn filter_chip(")
+            .nth(1)
+            .expect("filter chip renderer")
+            .split("pub fn rail(")
+            .next()
+            .expect("filter source before the rail column");
+        assert!(
+            filter_source.contains(".hover(|d| d.bg(rgb(shown.panel_hi)))"),
+            "the filter chips hover at panel_hi too"
+        );
+    }
+
+    /// Card contract: line one is the title with timestamp and cost aligned
+    /// right on the SAME line; the message context is its own line below
+    /// (under the chip strip when topics are attached). No date fallback
+    /// masquerading as a message. An approved plan may add one slim bar line
+    /// after the message; nothing else grows the card.
+    #[test]
+    fn card_meta_rides_title_line_and_preview_is_own_line() {
+        let source = include_str!("sessions.rs");
+        let row_source = source
+            .split("pub fn row(")
+            .nth(1)
+            .expect("session row renderer")
+            .split("pub fn on_click(")
+            .next()
+            .expect("row source before click handler");
+        let title_line = row_source
+            .split(".when_some(chips,")
+            .next()
+            .expect("title line before the chip strip");
+        assert!(
+            title_line.contains("%m-%d %H:%M"),
+            "the timestamp paints on the title line"
+        );
+        assert!(
+            title_line.contains("s.total_cost"),
+            "the cost paints on the title line"
+        );
+        assert!(
+            title_line.contains(".ml_auto()"),
+            "timestamp and cost align right"
+        );
+        assert!(
+            row_source.contains(".when_some(preview,"),
+            "the message line paints only when a preview exists"
+        );
+        assert!(
+            !row_source.contains("None => SharedString::from(format!("),
+            "no date/cost fallback on the message line"
+        );
+    }
+
+    /// An approved plan paints as the strip's own progress bar on a slim line
+    /// of its own, never as plan JSON in the message line. The bar math is
+    /// reused from plan_strip so the card and the composer agree.
+    #[test]
+    fn card_plan_paints_the_shared_progress_bar() {
+        let source = include_str!("sessions.rs");
+        let row_source = source
+            .split("pub fn row(")
+            .nth(1)
+            .expect("session row renderer")
+            .split("pub fn on_click(")
+            .next()
+            .expect("row source before click handler");
+        assert!(
+            row_source.contains(".when_some(plan,"),
+            "the plan bar paints only when an approved checklist exists"
+        );
+        assert!(
+            row_source.contains("plan_progress_cell(done, total, flash)"),
+            "the bar line delegates to the shared cell, flash state and all"
+        );
+        let cell_source = source
+            .split("fn plan_progress_cell(")
+            .nth(1)
+            .expect("plan progress cell")
+            .split("pub fn on_click(")
+            .next()
+            .expect("cell source before the click handler");
+        assert!(
+            cell_source.contains("crate::plan_strip::progress_bar(done, total)"),
+            "the bar reuses the composer strip's math, not a second copy"
+        );
+        assert!(
+            cell_source.contains("{done}/{total}"),
+            "the done/total count rides the bar"
         );
     }
 
@@ -2266,12 +2922,322 @@ mod tests {
     fn preview_line_prefixes_sender_and_truncates() {
         assert_eq!(preview_line("user", "hello").to_string(), "You: hello");
         assert_eq!(preview_line("assistant", "hi").to_string(), "Crabs: hi");
-        assert_eq!(preview_line("tool", "x").to_string(), "tool x");
+        assert_eq!(preview_line("tool", "x").to_string(), "tool: x");
 
         let long = "x".repeat(PREVIEW_CHARS + 10);
         let line = preview_line("user", &long).to_string();
         assert!(line.ends_with('\u{2026}'), "long text gets an ellipsis");
         let body = line.strip_prefix("You: ").expect("sender prefix");
         assert_eq!(body.chars().count(), PREVIEW_CHARS);
+    }
+
+    /// A1: an untouched rail hides the cron and RSI noise but keeps humans
+    /// and subagents. The default chip is All, so the plan gate lets every
+    /// remaining row through (#2719).
+    #[test]
+    fn rail_filter_default_hides_cron_and_rsi() {
+        let f = RailFilter::default();
+        assert!(!f.show_automation, "automation starts hidden per A1");
+        assert_eq!(f.plan, PlanFilter::All);
+        assert!(rail_filter_allows(&f, "Fix the login bug", None));
+        assert!(rail_filter_allows(&f, "subagent: search", None));
+        assert!(!rail_filter_allows(&f, "daily recap [cron-job:7]", None));
+        assert!(!rail_filter_allows(&f, "RSI autonomous cycle", None));
+    }
+
+    /// The toggle is the only thing that brings cron and RSI back; a renamed
+    /// cron title still classifies as cron because the marker survives.
+    #[test]
+    fn rail_filter_toggle_shows_automation() {
+        let f = RailFilter {
+            show_automation: true,
+            ..Default::default()
+        };
+        assert!(rail_filter_allows(&f, "daily recap [cron-job:7]", None));
+        assert!(rail_filter_allows(&f, "RSI autonomous cycle", None));
+        assert!(rail_filter_allows(&f, "renamed recap [cron-job:9]", None));
+        assert!(rail_filter_allows(&f, "Fix the login bug", None));
+    }
+
+    /// The Active chip wants an approved checklist with work left. A finished
+    /// checklist and a session with no plan both fall out.
+    #[test]
+    fn rail_filter_plan_active_needs_unfinished_checklist() {
+        let f = RailFilter {
+            plan: PlanFilter::Active,
+            ..Default::default()
+        };
+        assert!(rail_filter_allows(&f, "chat", Some((2, 8))));
+        assert!(rail_filter_allows(&f, "chat", Some((0, 1))));
+        assert!(!rail_filter_allows(&f, "chat", Some((8, 8))));
+        assert!(!rail_filter_allows(&f, "chat", None));
+    }
+
+    /// The Done chip wants a complete, non-empty checklist. An empty (0, 0)
+    /// snapshot is not a finished plan, and neither is a session with none.
+    #[test]
+    fn rail_filter_plan_done_needs_complete_checklist() {
+        let f = RailFilter {
+            plan: PlanFilter::Done,
+            ..Default::default()
+        };
+        assert!(rail_filter_allows(&f, "chat", Some((8, 8))));
+        assert!(rail_filter_allows(&f, "chat", Some((1, 1))));
+        assert!(!rail_filter_allows(&f, "chat", Some((2, 8))));
+        assert!(!rail_filter_allows(&f, "chat", Some((0, 0))));
+        assert!(!rail_filter_allows(&f, "chat", None));
+    }
+
+    /// The No Plan chip is the complement: only rows with no approved
+    /// checklist show, whatever the counts on the others.
+    #[test]
+    fn rail_filter_plan_no_plan_hides_checklists() {
+        let f = RailFilter {
+            plan: PlanFilter::NoPlan,
+            ..Default::default()
+        };
+        assert!(rail_filter_allows(&f, "chat", None));
+        assert!(!rail_filter_allows(&f, "chat", Some((2, 8))));
+        assert!(!rail_filter_allows(&f, "chat", Some((8, 8))));
+    }
+
+    /// The two gates compose: a cron row stays hidden under a plan chip even
+    /// when its progress would pass, until the automation toggle is on.
+    #[test]
+    fn rail_filter_plan_chip_still_hides_automation() {
+        let mut f = RailFilter {
+            plan: PlanFilter::Active,
+            ..Default::default()
+        };
+        assert!(!rail_filter_allows(&f, "recap [cron-job:1]", Some((1, 4))));
+        f.show_automation = true;
+        assert!(rail_filter_allows(&f, "recap [cron-job:1]", Some((1, 4))));
+    }
+
+    /// `visible()` wires both gates: the ctrl+f query and the filter menu.
+    /// The plan snapshot decides the plan chip without a per-row file read,
+    /// and the menu state lives on the struct so a repaint keeps it.
+    /// The funnel's accent rule (#2787): only a filter that deviates from
+    /// the default lights the button, so a closed panel never hides rows in
+    /// silence.
+    #[test]
+    fn filter_is_active_only_when_the_rule_deviates() {
+        assert!(!filter_is_active(&RailFilter::default()));
+        assert!(filter_is_active(&RailFilter {
+            plan: PlanFilter::Active,
+            ..Default::default()
+        }));
+        assert!(filter_is_active(&RailFilter {
+            plan: PlanFilter::Done,
+            ..Default::default()
+        }));
+        assert!(filter_is_active(&RailFilter {
+            plan: PlanFilter::NoPlan,
+            ..Default::default()
+        }));
+        assert!(filter_is_active(&RailFilter {
+            show_automation: true,
+            ..Default::default()
+        }));
+    }
+
+    /// The funnel contract (#2787): the chip row paints only while the panel
+    /// is open, the funnel click toggles it, the accent follows the filter,
+    /// and both Escape and a rail close shut the panel. The find query is a
+    /// separate surface and stays untouched by the panel's Escape.
+    #[test]
+    fn rail_filter_panel_opens_from_the_funnel_only() {
+        let main_source = include_str!("main.rs");
+        let control = main_source
+            .split("let rail_filter = self.sessions.rail_filter;")
+            .nth(1)
+            .expect("filter control block")
+            .split("let rail = sessions::rail(")
+            .next()
+            .expect("control before the rail call");
+        assert!(
+            control.contains("if self.sessions.rail_filter_open {"),
+            "the chip row paints only while the panel is open"
+        );
+        assert!(
+            control.contains("sessions::filter_is_active(&rail_filter)"),
+            "the funnel wears the accent while a non-default filter hides rows"
+        );
+        assert!(
+            control.contains("this.sessions.rail_filter_open = !this.sessions.rail_filter_open"),
+            "the funnel click toggles the panel"
+        );
+        let state_source = include_str!("sessions.rs");
+        assert!(
+            state_source.contains("pub rail_filter_open: bool"),
+            "the panel state lives on the rail state, so it survives repaints"
+        );
+        let reset = main_source
+            .split("fn set_rail_open_state(")
+            .nth(1)
+            .expect("rail open state")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("reset body");
+        assert!(
+            reset.contains("sessions.rail_filter_open = false;"),
+            "closing the rail shuts the panel"
+        );
+        assert!(
+            main_source.contains(
+                "if self.sessions.rail_filter_open && ev.keystroke.key.as_str() == \"escape\""
+            ),
+            "Escape closes the open panel before the find field sees it"
+        );
+    }
+
+    #[test]
+    fn rail_filter_visible_wires_query_and_menu() {
+        let human = Session::new(Some("Fix login".into()), None, None);
+        let cron = Session::new(Some("recap [cron-job:1]".into()), None, None);
+        let planned = Session::new(Some("Big refactor".into()), None, None);
+        let (hid, pid) = (human.id, planned.id);
+        let mut state = SessionsState {
+            items: vec![human, cron, planned],
+            ..Default::default()
+        };
+        state.plan_progress.insert(pid, (8, 8));
+
+        // Default: cron hidden, the two humans show.
+        let ids: Vec<_> = state.visible().map(|s| s.id).collect();
+        assert_eq!(ids, vec![hid, pid]);
+
+        // The state persists across calls (a repaint does not reset it).
+        assert_eq!(state.visible().count(), 2);
+
+        // Done chip narrows to the finished plan; the query then narrows more.
+        state.rail_filter.plan = PlanFilter::Done;
+        let ids: Vec<_> = state.visible().map(|s| s.id).collect();
+        assert_eq!(ids, vec![pid]);
+        state.filter = "login".into();
+        assert_eq!(state.visible().count(), 0, "query and menu both gate");
+
+        // Clearing the query leaves the menu in place; toggling automation
+        // brings cron back under the All chip.
+        state.filter.clear();
+        state.rail_filter = RailFilter {
+            show_automation: true,
+            ..Default::default()
+        };
+        assert_eq!(state.visible().count(), 3);
+    }
+
+    /// One content-search row, built in memory: the merge rule is about what
+    /// the rail does with hits, never about how they were fetched (#2720).
+    fn content_row(id: u128, snippet: &str) -> ContentSearchRow {
+        ContentSearchRow {
+            session_id: uuid::Uuid::from_u128(id),
+            title: format!("t{id}"),
+            snippet: snippet.to_string(),
+            match_count: 1,
+            last_hit_at: chrono::DateTime::from_timestamp(1_700_000_000 + id as i64, 0)
+                .expect("a fixed stamp is valid"),
+        }
+    }
+
+    /// A session found by both title and content appears once, and the
+    /// content snippet wins so the reader sees why it matched (#2720).
+    #[test]
+    fn rail_find_merge_dedups_a_session_found_both_ways() {
+        let merged = merge_find_results(
+            vec![uuid::Uuid::from_u128(1)],
+            &[content_row(1, "the hit line")],
+        );
+        assert_eq!(
+            merged,
+            vec![FindMatch {
+                session_id: uuid::Uuid::from_u128(1),
+                snippet: Some("the hit line".to_string()),
+            }]
+        );
+    }
+
+    /// Title matches keep the ledger order and lead; content-only sessions
+    /// follow in the order the search returned them (newest first).
+    #[test]
+    fn rail_find_merge_keeps_title_order_then_content() {
+        let merged = merge_find_results(
+            vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)],
+            &[content_row(3, "c"), content_row(4, "d")],
+        );
+        let ids: Vec<_> = merged.iter().map(|m| m.session_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                uuid::Uuid::from_u128(1),
+                uuid::Uuid::from_u128(2),
+                uuid::Uuid::from_u128(3),
+                uuid::Uuid::from_u128(4),
+            ]
+        );
+        assert!(merged[0].snippet.is_none(), "title-only has no snippet");
+        assert_eq!(merged[2].snippet.as_deref(), Some("c"));
+    }
+
+    /// A title match with no content hit keeps its own preview (no snippet);
+    /// a content-only hit carries its snippet.
+    #[test]
+    fn rail_find_merge_snippet_only_on_content_hits() {
+        let merged = merge_find_results(
+            vec![uuid::Uuid::from_u128(1)],
+            &[content_row(2, "deep hit")],
+        );
+        assert_eq!(merged[0].snippet, None);
+        assert_eq!(merged[1].snippet.as_deref(), Some("deep hit"));
+        assert_eq!(merged[1].session_id, uuid::Uuid::from_u128(2));
+    }
+
+    /// Empty inputs merge to nothing, so a cleared field shows no deep hits.
+    #[test]
+    fn rail_find_merge_empty_inputs() {
+        assert!(merge_find_results(Vec::new(), &[]).is_empty());
+    }
+
+    /// A repeated title id is collapsed too: the ledger can hand the same id
+    /// twice and the rail must not draw it twice.
+    #[test]
+    fn rail_find_merge_dedups_repeated_title_ids() {
+        let merged = merge_find_results(
+            vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(1)],
+            &[],
+        );
+        assert_eq!(merged.len(), 1);
+    }
+
+    /// `visible()` keeps a content-only match on screen even when its title
+    /// misses the query, and the snippet map is what holds it there (#2720).
+    #[test]
+    fn rail_find_visible_includes_content_only_matches() {
+        let by_title = Session::new(Some("needle chat".into()), None, None);
+        let by_content = Session::new(Some("unrelated name".into()), None, None);
+        let miss = Session::new(Some("nothing here".into()), None, None);
+        let (tid, cid, mid) = (by_title.id, by_content.id, miss.id);
+        let mut state = SessionsState {
+            items: vec![by_title, by_content, miss],
+            filter: "needle".to_string(),
+            filter_active: true,
+            ..Default::default()
+        };
+        // Title alone finds only the first row.
+        let ids: Vec<_> = state.visible().map(|s| s.id).collect();
+        assert_eq!(ids, vec![tid]);
+
+        // A deep hit on the second row brings it in; the third still misses.
+        state
+            .content_matches
+            .insert(cid, "a needle in the messages".into());
+        let ids: Vec<_> = state.visible().map(|s| s.id).collect();
+        assert_eq!(ids, vec![tid, cid]);
+        assert!(!ids.contains(&mid));
+
+        // Clearing the deep hits drops the content-only row back out.
+        state.content_matches.clear();
+        let ids: Vec<_> = state.visible().map(|s| s.id).collect();
+        assert_eq!(ids, vec![tid]);
     }
 }

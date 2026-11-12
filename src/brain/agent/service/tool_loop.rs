@@ -7,6 +7,7 @@ use crate::brain::agent::error::{AgentError, Result};
 use crate::brain::provider::{ContentBlock, LLMRequest, LLMResponse, Message, Role};
 use crate::brain::tools::ToolExecutionContext;
 use crate::services::{MessageService, SessionService};
+use crate::utils::is_internal_system_message;
 use crate::utils::provider_pair;
 use serde_json::Value;
 use std::sync::Arc;
@@ -207,22 +208,6 @@ pub(crate) fn evaluate_token_report(
     TokenReport::Adopt(reported)
 }
 
-/// Minimum summed active-streaming time (seconds) below which a tok/s
-/// reading is not credible. Burst-delivering providers (e.g. glm-5.1)
-/// can dump an entire short response in a single sub-second SSE chunk,
-/// making the active window ~8ms and the computed rate physically
-/// impossible (37203 tok/s observed 2026-06-06). Below this floor the
-/// timing is too coarse to represent a generation rate.
-const MIN_ACTIVE_SECS_FOR_TOK_S: f64 = 0.3;
-
-/// Upper bound on a believable streaming tok/s. Frontier models stream
-/// to end users at tens to low-hundreds tok/s; the fastest specialized
-/// inference (Groq/Cerebras on small models) tops out around 1-2k. A
-/// computed rate above this is a network-burst measurement artifact,
-/// not a real generation rate, so we show nothing rather than a fantasy
-/// number.
-const MAX_PLAUSIBLE_TOK_S: f64 = 2000.0;
-
 /// Compute the streaming tokens-per-second for a turn, returning `None`
 /// when the measurement isn't credible.
 ///
@@ -232,9 +217,9 @@ const MAX_PLAUSIBLE_TOK_S: f64 = 2000.0;
 ///
 /// Returns `None` when:
 /// - there are no output tokens, OR
-/// - the active window is below `MIN_ACTIVE_SECS_FOR_TOK_S` (burst
+/// - the active window is below `ui_core::rate::MIN_ACTIVE_SECS` (burst
 ///   delivery — timing too coarse to be a rate), OR
-/// - the resulting rate exceeds `MAX_PLAUSIBLE_TOK_S` (multi-burst
+/// - the resulting rate exceeds `ui_core::rate::MAX_PLAUSIBLE_TOK_S` (multi-burst
 ///   artifact that still clears the floor).
 ///
 /// Pure + free-function so the channel-footer rate can be unit-tested
@@ -243,15 +228,11 @@ pub(crate) fn compute_streaming_tok_per_sec(
     total_output_tokens: u32,
     active_secs: f64,
 ) -> Option<f64> {
-    if total_output_tokens == 0 || active_secs < MIN_ACTIVE_SECS_FOR_TOK_S {
-        return None;
-    }
-    let rate = total_output_tokens as f64 / active_secs;
-    if rate.is_finite() && rate <= MAX_PLAUSIBLE_TOK_S {
-        Some(rate)
-    } else {
-        None
-    }
+    // One implementation, shared with both surfaces (#2703): the terminal
+    // footer and the window footer must refuse the same numbers this guard
+    // refuses, so a rate no other surface would print cannot leak out of one
+    // of them.
+    crate::ui_core::rate::credible_rate(total_output_tokens, active_secs)
 }
 
 /// Cross-provider model leak guard. Returns the model the next LLM call
@@ -339,6 +320,45 @@ pub(crate) fn strip_ansi_output(raw: &str) -> String {
 pub(crate) fn is_duplicate_iteration_text(accumulated: &str, candidate: &str) -> bool {
     let trimmed = candidate.trim();
     !trimmed.is_empty() && accumulated.contains(trimmed)
+}
+
+/// Deliver an iteration the persist gate stored inside a hidden
+/// `phantom_blocked` section.
+///
+/// The persist gate decides whether an iteration is *stored hidden*; the kill
+/// gate decides whether it is *delivered*, and it carries two exemptions the
+/// persist gate cannot evaluate: a structured completion report (#1506) and a
+/// sign-off after an option-surface halt (#31). When either applies the answer
+/// is the turn's answer, so it is appended a second time WITHOUT the wrapper.
+/// Only the answer text is written: the blocked copy keeps the reasoning block
+/// for forensics, and `strip_phantom_blocked` removes that copy before the next
+/// turn's LLM context is built, so the model reads the answer once and every
+/// surface renders it once.
+///
+/// Without this the two decisions disagree in the exact way the owner kept
+/// reporting on 2026-11-09: "it just finishes and does not continue or give
+/// any feedback". The turn completed, the verdict delivered a 2 KB report,
+/// and the row carried it inside markers that render as folded thinking (#2754).
+async fn deliver_blocked_iteration(
+    message_service: &MessageService,
+    assistant_db_msg_id: Uuid,
+    accumulated_text: &mut String,
+    iteration_text: &str,
+) {
+    if is_duplicate_iteration_text(accumulated_text, iteration_text) {
+        return;
+    }
+    if !accumulated_text.is_empty() {
+        accumulated_text.push_str("\n\n");
+    }
+    accumulated_text.push_str(iteration_text);
+    let delivered = format!("{iteration_text}\n\n");
+    if let Err(e) = message_service
+        .append_content(assistant_db_msg_id, &delivered)
+        .await
+    {
+        tracing::warn!("failed to persist exempted (delivered) iteration: {e}");
+    }
 }
 
 /// What to do about a non-modification tool call that keeps recurring (#507).
@@ -505,6 +525,21 @@ pub fn is_user_correction(msg: &str) -> bool {
         "fix this",
     ];
     PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Whether OS-level completion banners belong to this session (#2729).
+///
+/// A banner exists for the person sitting at the machine. Sub-agent, cron and
+/// RSI sessions run with nobody watching a window, so they stay silent even
+/// when the per-event config is on. Unknown titles fall through as human: the
+/// classifier only special-cases the three autonomous kinds, and a missing
+/// title must never mute the feature for a real conversation.
+fn notifications_for_human(session: &crate::db::models::Session) -> bool {
+    use crate::db::repository::session::{SessionKind, classify_session_title};
+    matches!(
+        classify_session_title(session.title.as_deref().unwrap_or_default()),
+        SessionKind::Human
+    )
 }
 
 impl AgentService {
@@ -760,6 +795,32 @@ impl AgentService {
             && let Err(e) = pending_repo.delete(request_id).await
         {
             tracing::warn!("Failed to clean up pending request: {}", e);
+        }
+
+        // #2729: a failed turn raises one banner, unless the user stopped it
+        // themselves. A deliberate stop is not news they need a toast for, and
+        // a shutdown cancel is the process leaving, not the work failing.
+        if let Err(err) = &result
+            && !matches!(err, AgentError::Cancelled)
+        {
+            // The session row is already loaded by the inner loop, but it is
+            // not returned, so failures pay one read to keep the same
+            // human-only rule the success path gets for free. Failures are
+            // rare and the whole arm is behind an opt-in default-off flag.
+            let human = match SessionService::new(self.context.clone())
+                .get_session(session_id)
+                .await
+            {
+                Ok(Some(session)) => notifications_for_human(&session),
+                _ => false,
+            };
+            if human {
+                crate::utils::desktop_notify::raise(
+                    crate::utils::desktop_notify::NotificationEvent::TurnFailed {
+                        reason: err.to_string(),
+                    },
+                );
+            }
         }
 
         result
@@ -1272,11 +1333,9 @@ impl AgentService {
         }
 
         // Detect user corrections / negative feedback and record automatically.
-        // Only fires on real user messages (not system continuations).
-        if !user_message.starts_with("[System:")
-            && !user_message.starts_with("[SYSTEM:")
-            && is_user_correction(&user_message)
-        {
+        // Only fires on real user messages (not system continuations), in
+        // either spelling (#2756).
+        if !is_internal_system_message(&user_message) && is_user_correction(&user_message) {
             self.record_provider_feedback(
                 session_id,
                 "user_correction",
@@ -1315,8 +1374,6 @@ impl AgentService {
         context.add_message(user_msg);
 
         // Save user message to database (text only — images are ephemeral).
-        // Skip DB persistence for internal system continuations (restart recovery)
-        // — they go to context for the LLM but never appear in chat history.
         // Redact secrets so Bearer tokens, API keys etc. from cron prompts
         // never persist to DB or appear in TUI chat history.
         //
@@ -1328,9 +1385,20 @@ impl AgentService {
         // `first_attempt` keeps a rotation from re-writing the user row: the
         // retry re-enters with the same message and the history would otherwise
         // show it once per provider tried (#2009).
-        let is_system_continuation = user_message.starts_with("[System:");
-        if !is_system_continuation && first_attempt {
-            let raw_for_db = display_text_override.as_deref().unwrap_or(&user_message);
+        //
+        // A synthetic seed is internal (#2756): the model reads it, the user
+        // does not. Where the surface supplied a display line, that line is
+        // the row, because it is the receipt the user was shown. With no line
+        // the seed writes no row at all, so restart recovery and compaction
+        // triggers stay out of history. Both spellings count: the plan and
+        // compaction seeds are authored `[SYSTEM:` while recovery uses
+        // `[System:`, and a check that knew only one leaked the other.
+        let raw_for_db = if is_internal_system_message(&user_message) {
+            display_text_override.as_deref()
+        } else {
+            Some(display_text_override.as_deref().unwrap_or(&user_message))
+        };
+        if first_attempt && let Some(raw_for_db) = raw_for_db {
             let safe_message = crate::utils::sanitize::redact_secrets(raw_for_db);
             let _user_db_msg = message_service
                 .create_message(session_id, "user".to_string(), safe_message)
@@ -4801,6 +4869,14 @@ impl AgentService {
             // segment. Here we only rebuild accumulated_text from the ordered
             // segments (for the in-memory response) and append the reasoning
             // block, after a Flush barrier so trailing tool markers land first.
+            //
+            // The kill gate below owns the VISIBILITY verdict and carries two
+            // delivery exemptions this persist gate cannot evaluate (#1506
+            // structured reports, #31 option-surface sign-offs): when one
+            // applies the answer is persisted a second time there WITHOUT the
+            // wrapper, so "delivered" can never mean "hidden" (see
+            // `deliver_blocked_iteration`).
+
             if is_cli_provider {
                 // Interleaved text + tool markers from streaming events —
                 // display/accumulation only, the DB copy is already written.
@@ -5428,10 +5504,20 @@ impl AgentService {
                     && phantom_detections_total < MAX_PHANTOM_DETECTIONS_TOTAL
                     && phantom_eligible
                     && !fired_branches.is_empty();
+                // A delivery exemption is a verdict, not a log line (#2754).
+                // The persist gate above already stored this answer inside a
+                // hidden `phantom_blocked` section, and it cannot see either
+                // exemption. The turn was delivered, so the answer must be
+                // visible: `deliver_blocked_iteration` below writes it again
+                // without the wrapper. Owner's report, 2026-11-09: turns
+                // finished with no answer on the GUI while a full report sat
+                // invisible in the row.
+                let mut delivered_by_exemption = false;
                 if kill
                     && option_surface_halt_seen
                     && super::phantom::option_halt_exempts(&fired_branches)
                 {
+                    delivered_by_exemption = true;
                     tracing::warn!(
                         branches = ?fired_branches,
                         text_len = iteration_text.len(),
@@ -5441,6 +5527,7 @@ impl AgentService {
                 } else if kill
                     && super::phantom::structured_report_exempts(structured_report, &fired_branches)
                 {
+                    delivered_by_exemption = true;
                     tracing::warn!(
                         branches = ?fired_branches,
                         text_len = iteration_text.len(),
@@ -5521,6 +5608,21 @@ impl AgentService {
                     };
                     context.add_message(Message::user(nudge));
                     continue;
+                }
+
+                // The exemption arms above only log; this is where the answer
+                // actually reaches the surface (#2754). Re-persist it without
+                // the `phantom_blocked` wrapper so the GUI, the TUI and the
+                // next turn's context all carry the report the verdict chose
+                // to deliver. A no-op when the iteration was never blocked.
+                if delivered_by_exemption {
+                    deliver_blocked_iteration(
+                        &message_service,
+                        assistant_db_msg.id,
+                        &mut accumulated_text,
+                        &iteration_text,
+                    )
+                    .await;
                 }
 
                 // Cap hit and the fast-escalate block above couldn't swap (no
@@ -7957,7 +8059,19 @@ impl AgentService {
 
             // Check for queued user messages to inject between tool iterations.
             // This lets the user provide follow-up feedback mid-execution (like Claude Code).
-            if let Some(ref queue_cb) = self.message_queue_callback
+            //
+            // A round that halted on an option-surface tool has no next round
+            // to answer in: the loop breaks at the top of the next iteration
+            // (`option_surface_halt_seen && option_halt_iteration_has_text`).
+            // Draining the queue here took the message the user typed while
+            // the turn ran, persisted its user row and a fresh empty assistant
+            // placeholder, and ended the turn milliseconds later with no
+            // request made to answer it: the message was silently dropped
+            // (#2709). Leaving it queued is the contract every other surface
+            // already keeps: the surface flushes it as its own turn on `Done`.
+            let turn_halts_now = option_surface_halt_seen && option_halt_iteration_has_text;
+            if !turn_halts_now
+                && let Some(ref queue_cb) = self.message_queue_callback
                 && let Some(queued_msg) = queue_cb(session_id).await
             {
                 tracing::info!("Injecting queued user message between tool iterations");
@@ -8395,6 +8509,10 @@ impl AgentService {
         // in-progress plans are untouched; `load_plan` is a fast no-op when the
         // session has no live plan.
         let mut completed_plan = None;
+        // True when this turn's plan completed and the OS banner went out from
+        // the seam below, so the turn-completion banner further down stays
+        // silent instead of announcing the same finish twice (#2729).
+        let mut plan_announced = false;
         if let Some(mut finished) = crate::utils::plan_files::load_plan(session_id).await {
             // A plan whose only remaining task is the trailing delivery step
             // never reaches is_complete() on its own — delivering the answer is
@@ -8416,15 +8534,29 @@ impl AgentService {
             // reading the service field alone would drop the event for it.
             if let Some(resolved) =
                 crate::utils::completion_sound::announcement_pending(Some(&finished))
-                && let Some(cb) = progress_callback.as_ref()
             {
-                cb(
-                    session_id,
-                    ProgressEvent::PlanCompleted {
-                        title: finished.title.clone(),
-                        tasks: resolved,
-                    },
-                );
+                // #2729: the plan-finished fact reaches the OS from the same
+                // seam that hands it to the surfaces. Config, dedupe and focus
+                // live in the transport; the session-kind guard lives here
+                // because only this scope knows which session finished.
+                if notifications_for_human(&session) {
+                    crate::utils::desktop_notify::raise(
+                        crate::utils::desktop_notify::NotificationEvent::PlanCompleted {
+                            title: finished.title.clone(),
+                            tasks: resolved,
+                        },
+                    );
+                    plan_announced = true;
+                }
+                if let Some(cb) = progress_callback.as_ref() {
+                    cb(
+                        session_id,
+                        ProgressEvent::PlanCompleted {
+                            title: finished.title.clone(),
+                            tasks: resolved,
+                        },
+                    );
+                }
             }
             completed_plan = super::messaging::persist_completed_plan_before_archive(
                 &message_service,
@@ -8467,6 +8599,17 @@ impl AgentService {
             {
                 tracing::warn!("Failed to persist Sources footer to DB: {}", e);
             }
+        }
+
+        // #2729: the turn settled. A turn that already closed its plan raised
+        // PlanCompleted above, so it does not also raise a generic completion
+        // banner for the same finish.
+        if !plan_announced && notifications_for_human(&session) {
+            crate::utils::desktop_notify::raise(
+                crate::utils::desktop_notify::NotificationEvent::TurnCompleted {
+                    summary: crate::utils::desktop_notify::summary_line(&final_text),
+                },
+            );
         }
 
         Ok(AgentResponse {

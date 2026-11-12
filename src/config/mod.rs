@@ -7,6 +7,7 @@ mod current;
 #[cfg(unix)]
 pub(crate) mod flock;
 pub mod guard;
+pub mod gui_font;
 pub mod gui_palette;
 pub mod gui_palettes_builtin;
 pub mod gui_theme;

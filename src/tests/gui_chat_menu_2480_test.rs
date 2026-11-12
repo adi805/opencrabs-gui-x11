@@ -25,8 +25,9 @@ async fn boot_reads_the_icon_rows_instead_of_starting_with_an_empty_map() {
         "boot loads the icons it paints"
     );
 
-    // The query behind that call: a child session with an icon is returned, a
-    // root session and an icon-less topic are not.
+    // The query behind that call: every session with an icon is returned,
+    // root or topic, because the rename dialog sets one on any conversation
+    // (#2790). An icon-less topic is still left out.
     let db = crate::db::database::Database::connect_in_memory()
         .await
         .unwrap();
@@ -47,11 +48,18 @@ async fn boot_reads_the_icon_rows_instead_of_starting_with_an_empty_map() {
         .unwrap();
 
     let rows = sessions.topic_icons().await.unwrap();
+    let by_id: std::collections::HashMap<_, _> = rows.into_iter().collect();
     assert_eq!(
-        rows,
-        vec![(topic, "\u{1f4a1}".to_string())],
-        "only topics carry a tab icon"
+        by_id.get(&topic).map(String::as_str),
+        Some("\u{1f4a1}"),
+        "a topic keeps its icon"
     );
+    assert_eq!(
+        by_id.get(&root.id).map(String::as_str),
+        Some("\u{1f980}"),
+        "a root conversation carries its icon too, so its card paints the pick (#2790)"
+    );
+    assert_eq!(by_id.len(), 2, "the icon-less topic is still left out");
 }
 
 /// A menu that grows the strip is not a menu. Both menus draw the same card,
@@ -64,20 +72,18 @@ fn the_menu_floats_as_a_card_and_the_strip_nothing_grows_from() {
         "one card builder serves the rail menu and the chat menu"
     );
     assert!(
-        MENU.contains("menu_card(\"rail-context-menu\""),
-        "the rail menu keeps its card"
+        MENU.contains("pub fn menu_popover("),
+        "one popover places that card at the pointer that opened it (#2690)"
     );
     // The move is mechanical: the rail still imports the primitives under the
     // same names, so nothing in that module learned a new address (#2613).
     assert!(
-        SESSIONS.contains(
-            "pub use crate::menu::{MenuEntry, MenuKind, menu_card, menu_item, menu_popover};"
-        ),
-        "the rail re-exports the moved primitives unchanged"
+        SESSIONS.contains("pub use crate::menu::{MenuEntry, MenuKind, menu_item, menu_popover};"),
+        "the rail re-exports the primitives it still draws with"
     );
     assert!(
-        GUI_MAIN.contains("sessions::menu_card(\"chat-menu\""),
-        "the chat menu draws the same card"
+        GUI_MAIN.contains("sessions::menu_popover(\"chat-menu\", items, at)"),
+        "the chat menu draws the same card, at the press that asked for it"
     );
     assert!(
         !GUI_MAIN.contains("fn topic_bar("),
@@ -89,8 +95,8 @@ fn the_menu_floats_as_a_card_and_the_strip_nothing_grows_from() {
         "the strip takes a key, the tabs and the edge button, nothing else"
     );
 
-    // Painted last, so the conversation cannot cover the open card: children
-    // paint in order.
+    // Painted last, so the conversation cannot cover the open card. It is
+    // attached at the window root now, deferred, above everything (#2690).
     let footer_arm = GUI_MAIN
         .find("Screen::MissionControl => right.child(footer),")
         .expect("the chat column ends with its footer");
@@ -99,7 +105,7 @@ fn the_menu_floats_as_a_card_and_the_strip_nothing_grows_from() {
         .expect("the card is attached to the chat column");
     assert!(
         menu > footer_arm,
-        "the card is the column's last child, so it paints over the transcript"
+        "the card is attached after the column, so it paints over the transcript"
     );
 }
 
@@ -142,7 +148,7 @@ fn the_chat_screen_draws_no_title_row() {
         "the shortening helper existed only for that row"
     );
     assert!(
-        GUI_MAIN.contains("self.session_title().unwrap_or(\"chat\"),"),
+        GUI_MAIN.contains("self.session_title().unwrap_or_else(|| \"chat\".to_string()),"),
         "the footer still leads with the conversation's name"
     );
 }

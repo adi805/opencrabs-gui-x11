@@ -34,6 +34,41 @@ pub struct SessionListOptions {
 /// Title prefix every spawned sub-agent session carries, set by `spawn_agent`.
 pub const SUBAGENT_TITLE_PREFIX: &str = "subagent:";
 
+/// Title marker every cron job session ends with: `Cron: <job name>
+/// [cron-job:<uuid>]`. The readable part can be renamed; the marker is the
+/// stable lookup key, so classification keys on it too (#2714).
+pub const CRON_TITLE_MARKER: &str = "[cron-job:";
+
+/// The exact title of the autonomous RSI cycle session (#2714).
+pub const RSI_SESSION_TITLE: &str = "RSI autonomous cycle";
+
+/// What kind of session a title belongs to. Title-based only: cron and RSI
+/// encode their identity in the title, and there is no kind column (#2714).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    Human,
+    Cron,
+    Rsi,
+    Subagent,
+}
+
+/// Classify a session by its title. Pub in the library so the GUI binary and
+/// the TUI both call the same decision and one session reads as the same kind
+/// on every surface (#2714). The cron check mirrors the scheduler's suffix
+/// lookup: the marker must sit in a title that ends with the closing bracket,
+/// so a rename of the readable part never changes the kind.
+pub fn classify_session_title(title: &str) -> SessionKind {
+    if title.starts_with(SUBAGENT_TITLE_PREFIX) {
+        SessionKind::Subagent
+    } else if title.ends_with(']') && title.contains(CRON_TITLE_MARKER) {
+        SessionKind::Cron
+    } else if title == RSI_SESSION_TITLE {
+        SessionKind::Rsi
+    } else {
+        SessionKind::Human
+    }
+}
+
 /// Why an existing session could not be attached as a topic. Typed so the
 /// picker can show a plain sentence instead of a raw constraint error; the
 /// migration triggers remain the last line of defence behind these guards.
@@ -85,7 +120,14 @@ impl SessionRepository {
         Ok(())
     }
 
-    /// Create a topic under a session: a new session row with `parent_id` set.
+    /// Create a topic under a session: a new session row with `parent_id` set,
+    /// and topics switched on for the parent.
+    ///
+    /// The flag matters cross-surface: the chat topic bar and the rail menu read
+    /// `topics_enabled` rather than counting children, so a parent left at 0
+    /// hides its own topics everywhere except the tree that reads `parent_id`.
+    /// `attach_topic` has always done both; this path now matches it.
+    ///
     /// The depth trigger (migration 20261101000001) refuses a parent that is
     /// itself a topic, so the refusal comes back as an error here.
     pub async fn create_topic(&self, parent: Uuid, title: &str) -> Result<Uuid> {
@@ -100,6 +142,10 @@ impl SessionRepository {
                 conn.execute(
                     "UPDATE sessions SET parent_id = ?2 WHERE id = ?1",
                     params![topic_id, parent_str],
+                )?;
+                conn.execute(
+                    "UPDATE sessions SET topics_enabled = 1 WHERE id = ?1",
+                    params![parent_str],
                 )
             })
             .await
@@ -177,6 +223,136 @@ impl SessionRepository {
             })
             .await
             .map_err(|e| AttachTopicError::Db(interact_err(e)))?
+    }
+
+    /// The session's parent when it is a topic, `None` for a top-level row.
+    ///
+    /// `parent_id` is deliberately absent from [`Session`] (the struct predates
+    /// topics and every channel path would have to carry it), so the rails and
+    /// the Telegram resolver read it through here instead of hand-rolling SQL.
+    pub async fn find_parent_id(&self, child: Uuid) -> Result<Option<Uuid>> {
+        let child_str = child.to_string();
+        let found: Option<Option<String>> = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get connection")?
+            .interact(move |conn| {
+                conn.query_row(
+                    "SELECT parent_id FROM sessions WHERE id = ?1",
+                    params![child_str],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(interact_err)?
+            .context("Failed to read a session's parent")?;
+        found
+            .flatten()
+            .map(|s| Uuid::parse_str(&s).context("parent_id is not a uuid"))
+            .transpose()
+    }
+
+    /// Live sessions whose title still carries a forum-topic key but that hang
+    /// under nobody. One-shot repair input for the Telegram backfill (#2603);
+    /// a no-op on an install that already groups its topics.
+    pub async fn list_unlinked_topic_sessions(&self) -> Result<Vec<(Uuid, String)>> {
+        let rows: Vec<(String, String)> = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get connection")?
+            .interact(move |conn| {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id, title FROM sessions
+                     WHERE parent_id IS NULL
+                       AND archived_at IS NULL
+                       AND title LIKE '%:topic:%]'
+                     ORDER BY created_at ASC",
+                )?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(interact_err)?
+            .context("Failed to list unlinked topic sessions")?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, title)| Uuid::parse_str(&id).ok().map(|uuid| (uuid, title)))
+            .collect())
+    }
+
+    /// How many live sessions this chat already keeps one-per-topic.
+    ///
+    /// The count answers one question for the desktop client: is this chat a
+    /// forum? A forum is the only channel chat that ever produces a
+    /// `[chat:<id>:topic:<tid>]` row, and the Bot API refuses a topic on
+    /// anything else. Reading it before the API call keeps a plain group or a
+    /// DM from hitting `Bad Request: the chat is not a forum` when the window
+    /// offers a topic action on it.
+    ///
+    /// Counted from titles, not `channel_chat_key`, so it also sees the rows
+    /// created before #1721 stamped keys.
+    pub async fn count_topics_for_chat(&self, chat_id: i64) -> Result<i64> {
+        let pattern = format!("%[chat:{chat_id}:topic:%]");
+        self.pool
+            .get()
+            .await
+            .context("Failed to get connection")?
+            .interact(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sessions
+                     WHERE archived_at IS NULL AND title LIKE ?1",
+                    params![pattern],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .map_err(interact_err)?
+            .context("Failed to count a chat's topic sessions")
+    }
+
+    /// One session plus every topic hanging under it, as `(id, title)` in
+    /// creation order, root first when the caller asked for the parent.
+    ///
+    /// The desktop client reads a chat's whole family through this: a parent
+    /// and its topics are separate session rows, so the `All` view's union is
+    /// a query, not a merge of structs it already loaded (#2762). A topic asked
+    /// for directly has no children and comes back alone.
+    ///
+    /// Archived rows stay out of the union: a closed topic is not part of what
+    /// `All` shows. The title is returned as stored, channel key included; the
+    /// caller strips it for display.
+    pub async fn family_of(&self, root: Uuid) -> Result<Vec<(Uuid, String)>> {
+        let root_str = root.to_string();
+        let rows: Vec<(String, String)> = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get connection")?
+            .interact(move |conn| {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id, COALESCE(title, '') FROM sessions
+                     WHERE (id = ?1 OR parent_id = ?1)
+                       AND archived_at IS NULL
+                     ORDER BY created_at ASC, id ASC",
+                )?;
+                let rows = stmt.query_map(params![root_str], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(interact_err)?
+            .context("Failed to read a session family")?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, title)| Uuid::parse_str(&id).ok().map(|uuid| (uuid, title)))
+            .collect())
     }
 
     /// Release a topic back to a top-level session (`parent_id = NULL`). The
@@ -371,7 +547,8 @@ impl SessionRepository {
             .collect()
     }
 
-    /// Set or clear one topic's icon. None clears it back to the default.
+    /// Set or clear one session's icon, root or topic. None clears it back
+    /// to the default.
     pub async fn set_topic_icon(&self, id: Uuid, icon: Option<&str>) -> Result<()> {
         let (id_str, icon) = (id.to_string(), icon.map(str::to_string));
         self.pool
@@ -390,7 +567,9 @@ impl SessionRepository {
         Ok(())
     }
 
-    /// Every topic that has an icon of its own, with the icon.
+    /// Every session that has an icon of its own, root or topic, with the
+    /// icon. The rename dialog sets one on any conversation, so the read
+    /// cannot filter to children: a root card paints its pick too (#2790).
     pub async fn topic_icons(&self) -> Result<Vec<(Uuid, String)>> {
         self.pool
             .get()
@@ -399,7 +578,7 @@ impl SessionRepository {
             .interact(move |conn| {
                 let mut stmt = conn.prepare_cached(
                     "SELECT id, topic_icon FROM sessions
-                     WHERE parent_id IS NOT NULL AND topic_icon IS NOT NULL",
+                     WHERE topic_icon IS NOT NULL",
                 )?;
                 let rows = stmt
                     .query_map([], |row| {
@@ -1150,9 +1329,78 @@ impl<T> OptionalExt<T> for rusqlite::Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AttachTopicError, OptionalExt, Session, SessionRepository, params};
+    use super::{
+        AttachTopicError, CRON_TITLE_MARKER, OptionalExt, RSI_SESSION_TITLE, SUBAGENT_TITLE_PREFIX,
+        Session, SessionKind, SessionRepository, classify_session_title, params,
+    };
     use crate::db::Database;
     use uuid::Uuid;
+
+    /// #2714: one title, one kind, on every surface. The four identities the
+    /// rail and session-list filters need to tell apart.
+    #[test]
+    fn session_kind_classifies_the_four_identities() {
+        assert_eq!(
+            classify_session_title("Cron: morning recap [cron-job:9b2f]"),
+            SessionKind::Cron
+        );
+        assert_eq!(classify_session_title(RSI_SESSION_TITLE), SessionKind::Rsi);
+        assert_eq!(
+            classify_session_title("subagent: scout"),
+            SessionKind::Subagent
+        );
+        assert_eq!(classify_session_title("CrabsDev"), SessionKind::Human);
+        // Pin the remaining constants to the producer literals too.
+        assert_eq!(RSI_SESSION_TITLE, "RSI autonomous cycle");
+        assert_eq!(SUBAGENT_TITLE_PREFIX, "subagent:");
+    }
+
+    /// The cron marker is the stable key: renaming the readable part of the
+    /// title never changes the kind, same contract as the scheduler lookup.
+    #[test]
+    fn session_kind_cron_marker_survives_a_rename() {
+        assert_eq!(
+            classify_session_title("Renamed by the user [cron-job:9b2f]"),
+            SessionKind::Cron
+        );
+        assert_eq!(classify_session_title("[cron-job:9b2f]"), SessionKind::Cron);
+        // Pin the constants to the literals the producers write (cron
+        // scheduler, rsi.rs, spawn_agent) so a drift fails here first.
+        assert_eq!(CRON_TITLE_MARKER, "[cron-job:");
+        // A mention of the marker mid-title without the closing suffix is
+        // not a cron session.
+        assert_eq!(
+            classify_session_title("notes about [cron-job: syntax"),
+            SessionKind::Human
+        );
+    }
+
+    /// The RSI identity is the exact title, not a prefix or a substring.
+    #[test]
+    fn session_kind_rsi_is_the_exact_title() {
+        assert_eq!(
+            classify_session_title("RSI autonomous cycle follow-up"),
+            SessionKind::Human
+        );
+        assert_eq!(
+            classify_session_title("my RSI autonomous cycle"),
+            SessionKind::Human
+        );
+    }
+
+    /// The subagent rule stays the existing prefix contract: a title that
+    /// merely mentions the prefix mid-string is human.
+    #[test]
+    fn session_kind_subagent_is_a_prefix_not_a_mention() {
+        assert_eq!(
+            classify_session_title(SUBAGENT_TITLE_PREFIX),
+            SessionKind::Subagent
+        );
+        assert_eq!(
+            classify_session_title("talk about subagent: builds"),
+            SessionKind::Human
+        );
+    }
 
     async fn repo() -> (Database, SessionRepository) {
         let db = Database::connect_in_memory().await.expect("in-memory db");

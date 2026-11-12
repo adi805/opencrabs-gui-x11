@@ -21,6 +21,7 @@ use opencrabs::brain::agent::service::MessageEnqueueCallback;
 use opencrabs::brain::agent::{ProgressCallback, ProgressEvent, QueuedUserMessage};
 use opencrabs::brain::prompt_builder::{BrainLoader, RuntimeInfo};
 use opencrabs::brain::tools::ToolRegistry;
+use opencrabs::brain::tools::suggest_options::SuggestionItem;
 use opencrabs::config::Config;
 use opencrabs::db::Database;
 use opencrabs::services::ServiceContext;
@@ -43,7 +44,7 @@ pub enum TurnEvent {
     /// from. The id matters: sub-agents run their own sessions and their
     /// tool rows and token counts must never be painted into the
     /// conversation the user is reading.
-    ProgressFor(Uuid, ProgressEvent),
+    ProgressFor(Uuid, ProgressEvent, std::time::Instant),
     /// The turn finished; carries the final response content and the
     /// context size the provider reported for it (the footer's ctx budget).
     /// The session travels with it: a split pane runs its own turn, and the
@@ -131,7 +132,16 @@ pub enum TurnEvent {
     /// thread: `/plan <query>`, `/execute` seeding the checklist, or `/clear`
     /// asking the agent to acknowledge the cut. The turn belongs to the
     /// session that ran the command, so it carries that id with it (#2672).
-    CommandTurn { session: Uuid, text: String },
+    ///
+    /// `display` is the line the user sees when the text is scaffolding the
+    /// model needs and the user does not (#2756). `/execute` is the case that
+    /// matters: the model reads a full `[SYSTEM: PLAN APPROVED]` prompt, the
+    /// window shows the receipt, and history keeps the receipt.
+    CommandTurn {
+        session: Uuid,
+        text: String,
+        display: Option<String>,
+    },
     /// Personalized brain files were written from the onboarding notes; carries
     /// the line naming how many landed.
     BrainReady(String),
@@ -354,6 +364,88 @@ static SURFACE_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync
 static SURFACE_STACK: std::sync::OnceLock<opencrabs::services::surface::SurfaceServices> =
     std::sync::OnceLock::new();
 
+/// The window must exist before the GUI claims the profile (#2784). Claiming
+/// preempts (SIGTERMs) the running TUI/daemon, so doing it before the window
+/// opened meant a window that failed to open left the user with no surface at
+/// all. Bootstrap and window-open race: whichever finishes last releases the
+/// claim, exactly once.
+static SURFACE_GATE: SurfaceGate<(Config, opencrabs::services::surface::SurfaceDeps)> =
+    SurfaceGate::new();
+
+/// Coordination for the deferred surface claim. Generic over the payload so the
+/// ordering invariant is unit-testable without booting real channels.
+struct SurfaceGate<T> {
+    window_up: std::sync::atomic::AtomicBool,
+    pending: std::sync::Mutex<Option<T>>,
+}
+
+impl<T> SurfaceGate<T> {
+    const fn new() -> Self {
+        Self {
+            window_up: std::sync::atomic::AtomicBool::new(false),
+            pending: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Bootstrap finished: hold the deps until the window is up.
+    fn set_pending(&self, deps: T) {
+        *self.pending.lock().unwrap() = Some(deps);
+    }
+
+    /// The window opened successfully.
+    fn mark_window_up(&self) {
+        self.window_up
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Take the deps only once the window is up. The `.take()` under the lock
+    /// means exactly one caller ever receives them, whichever side wins the race.
+    fn take_if_ready(&self) -> Option<T> {
+        if !self.window_up.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        self.pending.lock().unwrap().take()
+    }
+}
+
+/// Boot the surface (claim the profile, serve channels) once the window is up
+/// AND bootstrap has produced the deps. Called from both sides of the race.
+fn maybe_boot_surface() {
+    // The deps only exist once build() has run on SURFACE_RUNTIME, so if there
+    // is something to take, the runtime is already initialised.
+    let Some(runtime) = SURFACE_RUNTIME.get() else {
+        return;
+    };
+    let Some((config, deps)) = SURFACE_GATE.take_if_ready() else {
+        return;
+    };
+    runtime.spawn(async move {
+        match opencrabs::services::surface::boot_surface(&config, deps).await {
+            Ok(services) => {
+                crate::logging::info(&format!(
+                    "surface services ready: cron={} a2a={} preempted={}",
+                    services.cron_spawned,
+                    services.a2a_ready,
+                    services.preempted.len()
+                ));
+                let _ = SURFACE_STACK.set(services);
+            }
+            Err(e) => {
+                // The window keeps working; only the background half is off.
+                crate::logging::error(&format!("surface services failed: {e:#}"));
+            }
+        }
+    });
+}
+
+/// Called by the window once `cx.open_window` has succeeded (#2784). Releases
+/// the surface claim that bootstrap deferred until the window exists, so a
+/// failed window never takes the running TUI/daemon down with it.
+pub fn window_is_up() {
+    SURFACE_GATE.mark_window_up();
+    maybe_boot_surface();
+}
+
 /// One-shot holder so the service (and its tokio-internal pieces) survive
 /// the bootstrap thread. `OnceLock` semantics, no unsafe.
 struct OnceBridge(std::sync::OnceLock<AgentBridge>);
@@ -470,28 +562,17 @@ async fn build(config: Config, sink: EventSink) -> Result<AgentBridge, String> {
         // now, the same claim the TUI makes.
         headless: false,
     };
-    // Detached on purpose: connecting the channels can take a few seconds and a
-    // slow gateway waits up to 30s, and the window must not sit on a boot
-    // screen for that. Services come up behind an already usable chat.
+    // Claim the profile only once the window exists (#2784). Claiming preempts
+    // the running TUI/daemon, so doing it here, before cx.open_window has run,
+    // meant a window that failed to open killed the user's running surface and
+    // left nothing behind. Stash the deps and let the window-open side release
+    // the claim; whichever of the two finishes last boots the surface, once.
+    // Still detached: connecting channels can take a few seconds and a slow
+    // gateway waits up to 30s, so services come up behind an already usable chat.
     {
         let boot_config = config.clone();
-        tokio::spawn(async move {
-            match opencrabs::services::surface::boot_surface(&boot_config, deps).await {
-                Ok(services) => {
-                    crate::logging::info(&format!(
-                        "surface services ready: cron={} a2a={} preempted={}",
-                        services.cron_spawned,
-                        services.a2a_ready,
-                        services.preempted.len()
-                    ));
-                    let _ = SURFACE_STACK.set(services);
-                }
-                Err(e) => {
-                    // The window keeps working; only the background half is off.
-                    crate::logging::error(&format!("surface services failed: {e:#}"));
-                }
-            }
-        });
+        SURFACE_GATE.set_pending((boot_config, deps));
+        maybe_boot_surface();
     }
 
     let service = AgentService::new(provider, context.clone(), &config)
@@ -933,10 +1014,17 @@ async fn drop_unanswered_duplicate(
 ///
 /// The progress forwarder (`install_progress_forwarder`) already streams
 /// events to `sink`; this thread only delivers the terminal event.
+///
+/// `display` is the row the user should read for this turn: the receipt of a
+/// command, or a channel's clean rendering of a wrapped message. The model
+/// always receives `content`; history gets `display` when one is supplied
+/// (#2756). Callers with nothing to hide pass `None` and history keeps the
+/// text that was sent.
 pub fn spawn_turn(
     service: Arc<AgentService>,
     session_id: Uuid,
     content: String,
+    display: Option<String>,
     sink: EventSink,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -963,13 +1051,22 @@ pub fn spawn_turn(
                 // Before the turn writes its rows: a resend of the text an
                 // unanswered turn left behind must not stack a second copy of
                 // it in history (#2697).
+                // Compare against the row history will actually hold, which is
+                // the display line when a turn hides its prompt (#2756).
+                let persisted = display.as_deref().unwrap_or(&content);
                 let messages = opencrabs::services::MessageService::new(service.context().clone());
-                drop_unanswered_duplicate(&messages, session_id, &content).await;
-                let turn = service.send_message_with_tools_and_mode(
+                drop_unanswered_duplicate(&messages, session_id, persisted).await;
+                let turn = service.send_message_with_tools_and_display(
                     session_id,
                     content,
+                    display,
                     None,
                     Some(cancel.clone()),
+                    None,
+                    None,
+                    "tui",
+                    None,
+                    None,
                 );
                 // A cooperative token only lands where the service looks for
                 // it, and inside one provider stream it never looks (#2657).
@@ -1310,7 +1407,11 @@ async fn boot_resume(service: Arc<AgentService>, pool: opencrabs::db::Pool, sink
 fn install_progress_forwarder(sink: &EventSink) -> ProgressCallback {
     let sink = sink.clone();
     Arc::new(move |session, event| {
-        let _ = sink.send(TurnEvent::ProgressFor(session, event));
+        let _ = sink.send(TurnEvent::ProgressFor(
+            session,
+            event,
+            std::time::Instant::now(),
+        ));
     })
 }
 
@@ -1442,6 +1543,57 @@ pub fn set_composer_session(session_id: Option<Uuid>) {
     if let Ok(mut s) = COMPOSER_SESSION.lock() {
         *s = session_id;
     }
+}
+
+/// The follow-up options `suggest_options` offered, keyed by session (#2708).
+///
+/// In memory only, and that is correct rather than a gap: the tool's labels
+/// never reach the ledger (`suggest_options` answers with "Surfaced N
+/// follow-up suggestion(s)." and nothing else), so there is no stored copy to
+/// restore. The map lives as long as the process, which is the same lifetime
+/// the terminal gives its own follow-up list. Do not add a "restore on reload"
+/// path: there is nothing to restore from.
+static SUGGESTIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<Uuid, Vec<SuggestionItem>>>,
+> = std::sync::OnceLock::new();
+
+fn suggestions()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<Uuid, Vec<SuggestionItem>>> {
+    SUGGESTIONS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Replace what `session_id` is offering. The newest offer wins: the tool runs
+/// at most once per turn, so an older strip is stale by definition. An empty
+/// list is a clear, which keeps one call able to do both.
+pub fn set_options(session_id: Uuid, items: Vec<SuggestionItem>) {
+    let count = items.len();
+    {
+        let mut map = suggestions();
+        if items.is_empty() {
+            map.remove(&session_id);
+        } else {
+            map.insert(session_id, items);
+        }
+    }
+    // The GUI log is the only place a dropped offer can be seen, since the
+    // buttons are never persisted (#2708).
+    crate::logging::info(&format!(
+        "suggest options: session {session_id}, {count} offered"
+    ));
+}
+
+/// What `session_id` is offering, so its strip can draw it.
+pub fn options_snapshot(session_id: Uuid) -> Vec<SuggestionItem> {
+    suggestions().get(&session_id).cloned().unwrap_or_default()
+}
+
+/// Take the offer off `session_id`. A pick, a send, a stop and a session
+/// switch all end it: the buttons belonged to the turn that made them.
+pub fn options_take(session_id: Uuid) -> Vec<SuggestionItem> {
+    suggestions().remove(&session_id).unwrap_or_default()
 }
 
 /// The agent's between-tool-calls hook: everything queued for the session,
@@ -1744,6 +1896,7 @@ async fn run_text_command(
                 out.push(TurnEvent::CommandTurn {
                     session: session_id,
                     text: arg.to_string(),
+                    display: None,
                 });
             }
             out
@@ -1764,10 +1917,11 @@ async fn run_text_command(
                     text,
                 }]
             }
-            opencrabs::utils::plan_mode::ApproveOutcome::SeedTurn { prompt } => {
+            opencrabs::utils::plan_mode::ApproveOutcome::SeedTurn { prompt, display } => {
                 vec![TurnEvent::CommandTurn {
                     session: session_id,
                     text: prompt,
+                    display: Some(display),
                 }]
             }
         },
@@ -1956,6 +2110,45 @@ async fn run_text_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opencrabs::brain::tools::suggest_options::SuggestionStyle;
+
+    /// The surface claim must wait for the window and fire exactly once,
+    /// whichever side of the race finishes first (#2784). A claim before the
+    /// window is up would preempt the running TUI/daemon, and a failed window
+    /// would then leave the user with no surface at all.
+    #[test]
+    fn surface_claim_waits_for_the_window_and_fires_once() {
+        // Bootstrap first: deps ready, window still down -> no claim.
+        let gate: SurfaceGate<u32> = SurfaceGate::new();
+        gate.set_pending(1);
+        assert!(
+            gate.take_if_ready().is_none(),
+            "must not claim the profile before the window is up"
+        );
+        // Window opens -> the claim fires exactly once.
+        gate.mark_window_up();
+        assert_eq!(
+            gate.take_if_ready(),
+            Some(1),
+            "the window releases the claim"
+        );
+        assert!(gate.take_if_ready().is_none(), "must not claim twice");
+
+        // Window first: window up, deps not built yet -> no claim.
+        let gate2: SurfaceGate<u32> = SurfaceGate::new();
+        gate2.mark_window_up();
+        assert!(
+            gate2.take_if_ready().is_none(),
+            "no deps yet, nothing to claim"
+        );
+        gate2.set_pending(2);
+        assert_eq!(
+            gate2.take_if_ready(),
+            Some(2),
+            "bootstrap releases the claim"
+        );
+        assert!(gate2.take_if_ready().is_none(), "must not claim twice");
+    }
 
     /// Up brings the WHOLE queue into the composer in one take, oldest first
     /// (#2696), and the take empties the queue: a recall the user abandons must
@@ -2014,6 +2207,61 @@ mod tests {
         let _ = queue_take(session);
         let _ = queue_take(other);
         set_composer_session(None);
+    }
+
+    /// #2708: the follow-up offer is per session, so a pane or a session
+    /// switch never shows another conversation's buttons, and a take clears
+    /// only the session it names.
+    #[test]
+    fn suggested_options_stay_with_their_session() {
+        let session = Uuid::from_u128(0x2708_0001);
+        let other = Uuid::from_u128(0x2708_0002);
+
+        set_options(
+            session,
+            vec![
+                SuggestionItem::new("run the tests", SuggestionStyle::Primary),
+                SuggestionItem::new("delete the branch", SuggestionStyle::Danger),
+            ],
+        );
+        set_options(other, vec![SuggestionItem::default_styled("elsewhere")]);
+
+        let offers = options_snapshot(session);
+        assert_eq!(offers.len(), 2, "both labels reach their own session");
+        assert_eq!(offers[0].label, "run the tests");
+        assert_eq!(
+            offers[1].style,
+            SuggestionStyle::Danger,
+            "the style travels with the label, so the row keeps its colour"
+        );
+        assert_eq!(
+            options_snapshot(other).len(),
+            1,
+            "one session's offer never lands in another's strip"
+        );
+
+        let taken = options_take(session);
+        assert_eq!(taken.len(), 2, "a pick takes the offer it came from");
+        assert!(
+            options_snapshot(session).is_empty(),
+            "a taken offer is gone, so a second press cannot send a stale label"
+        );
+        assert_eq!(
+            options_snapshot(other).len(),
+            1,
+            "taking this session's offer leaves another session's alone"
+        );
+
+        // An empty set is a clear: that is the shape the stop and send paths
+        // use, so one call covers both.
+        set_options(other, Vec::new());
+        assert!(
+            options_snapshot(other).is_empty(),
+            "an empty set clears the slot"
+        );
+
+        let _ = options_take(session);
+        let _ = options_take(other);
     }
 
     /// Esc flushes the WHOLE queue into one turn (#2695): the drain takes
@@ -2428,7 +2676,7 @@ mod tests {
             .find("drop_unanswered_duplicate(")
             .expect("spawn_turn runs the dedup guard");
         let send = body
-            .find("send_message_with_tools_and_mode(")
+            .find("send_message_with_tools_and_display(")
             .expect("spawn_turn sends the turn");
         assert!(
             guard < send,

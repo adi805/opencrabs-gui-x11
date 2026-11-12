@@ -31,12 +31,19 @@ pub struct Pane {
     pub cursor_position: usize,
     /// Input-history navigation position, stashed alongside the buffer.
     pub input_history_index: Option<usize>,
+    /// The draft a recall stashed, carried with the pane. Without it a recall
+    /// that spans a focus change loses the sentence it was covering (#2494).
+    pub input_history_stash: String,
     /// Plan document cached for this pane's session. Inactive panes keep
     /// theirs, so a split layout can render each pane's own plan without
     /// a disk read per frame (#2494).
     pub plan_document: Option<crate::tui::plan::PlanDocument>,
     /// Resolved plan JSON path for this pane's session, cached with the doc.
     pub plan_file_path: Option<std::path::PathBuf>,
+    /// mtime of `plan_file_path` when `plan_document` was read. The tick
+    /// compares it against the file so a pane the user is NOT looking at
+    /// still notices a task that settled there (#2733).
+    pub plan_mtime: Option<std::time::SystemTime>,
 }
 
 impl Pane {
@@ -49,8 +56,10 @@ impl Pane {
             input_buffer: String::new(),
             cursor_position: 0,
             input_history_index: None,
+            input_history_stash: String::new(),
             plan_document: None,
             plan_file_path: None,
+            plan_mtime: None,
         }
     }
 
@@ -59,7 +68,17 @@ impl Pane {
         self.input_buffer.clear();
         self.cursor_position = 0;
         self.input_history_index = None;
+        self.input_history_stash.clear();
     }
+}
+
+/// The mtime of a plan file, or `None` when it cannot be read.
+///
+/// This is the reload gate for a pane's cached plan: compare it with the
+/// stored stamp and reload only on a real change.
+fn plan_stamp(path: Option<&std::path::Path>) -> Option<std::time::SystemTime> {
+    let path = path?;
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// Serializable snapshot of the pane layout (for persistence across restarts).
@@ -147,12 +166,14 @@ impl PaneManager {
         buffer: &mut String,
         cursor: &mut usize,
         history: &mut Option<usize>,
+        history_stash: &mut String,
     ) {
         if let Some(pane) = self.focused_pane_mut() {
             pane.input_buffer = std::mem::take(buffer);
             pane.cursor_position = *cursor;
             *cursor = 0;
             pane.input_history_index = history.take();
+            pane.input_history_stash = std::mem::take(history_stash);
         }
     }
 
@@ -163,11 +184,13 @@ impl PaneManager {
         buffer: &mut String,
         cursor: &mut usize,
         history: &mut Option<usize>,
+        history_stash: &mut String,
     ) {
         if let Some(pane) = self.focused_pane() {
             *buffer = pane.input_buffer.clone();
             *cursor = pane.cursor_position;
             *history = pane.input_history_index;
+            *history_stash = pane.input_history_stash.clone();
         }
     }
 
@@ -177,10 +200,85 @@ impl PaneManager {
         path: Option<std::path::PathBuf>,
         doc: Option<crate::tui::plan::PlanDocument>,
     ) {
-        if let Some(pane) = self.focused_pane_mut() {
+        let focused = self.focused;
+        self.set_pane_plan(focused, path, doc);
+    }
+
+    /// Replace one pane's cached plan with a freshly loaded pair.
+    ///
+    /// The mtime is stamped here, at the read, because it is the only moment
+    /// that knows which version of the file the document came from.
+    pub fn set_pane_plan(
+        &mut self,
+        id: PaneId,
+        path: Option<std::path::PathBuf>,
+        doc: Option<crate::tui::plan::PlanDocument>,
+    ) {
+        if let Some(pane) = self.get_mut(id) {
+            pane.plan_mtime = plan_stamp(path.as_deref());
             pane.plan_file_path = path;
             pane.plan_document = doc;
         }
+    }
+
+    /// Reload every pane's plan document whose file changed since it was read.
+    ///
+    /// Returns how many documents were replaced. The mtime is the gate and it
+    /// matters: `load_plan_from_path` retires legacy terminal plans from disk
+    /// (archives Completed, deletes Cancelled), so reloading on every tick
+    /// would mutate plan files for no reason. An untouched file costs one
+    /// `stat` per pane.
+    pub fn refresh_plans_changed_on_disk(&mut self) -> usize {
+        let mut reloaded = 0;
+        for pane in &mut self.panes {
+            let Some(path) = pane.plan_file_path.clone() else {
+                continue;
+            };
+            let stamp = plan_stamp(Some(path.as_path()));
+            // A vanished file keeps the last document: there is nothing newer
+            // to draw, and clearing it would erase a finished checklist the
+            // user may still be reading.
+            let Some(stamp) = stamp else { continue };
+            if pane.plan_mtime == Some(stamp) {
+                continue;
+            }
+            pane.plan_document = crate::utils::plan_files::load_plan_from_path(&path);
+            pane.plan_mtime = Some(stamp);
+            reloaded += 1;
+        }
+        reloaded
+    }
+
+    /// Resolve a plan file for every pane that shows a session but has no
+    /// path yet.
+    ///
+    /// A split restored from `layout.json` comes back with session ids and an
+    /// empty plan cache, and only the focused pane resolves a path when its
+    /// session loads. Without this a background pane can never watch its own
+    /// plan, so its settle waits for the click that finally loads it (#2733).
+    pub async fn bind_missing_plan_paths(&mut self) -> usize {
+        let missing: Vec<(PaneId, Uuid)> = self
+            .panes
+            .iter()
+            .filter(|pane| pane.plan_file_path.is_none())
+            .filter_map(|pane| pane.session_id.map(|session| (pane.id, session)))
+            .collect();
+        let mut bound = 0;
+        for (id, session_id) in missing {
+            let path = crate::utils::plan_files::plan_json_read_path(session_id).await;
+            // Stamp before the read: a write that lands mid-read leaves the
+            // doc newer than the stamp, so the next tick reloads instead of
+            // trusting a document it cannot date.
+            let stamp = plan_stamp(Some(path.as_path()));
+            let doc = crate::utils::plan_files::load_plan_from_path(&path);
+            if let Some(pane) = self.get_mut(id) {
+                pane.plan_file_path = Some(path);
+                pane.plan_document = doc;
+                pane.plan_mtime = stamp;
+                bound += 1;
+            }
+        }
+        bound
     }
 
     /// Null the focused pane's cached plan document, keeping the resolved
@@ -409,9 +507,10 @@ mod tests {
         // ROOT was focused, then the split handler stashes BEFORE splitting
         // (split moves focus to the new pane).
         let (mut buf, mut cur, mut hist) = ("alpha".to_string(), 5usize, Some(2usize));
-        mgr.stash_input(&mut buf, &mut cur, &mut hist);
+        let mut stash = "alpha pre-recall".to_string();
+        mgr.stash_input(&mut buf, &mut cur, &mut hist, &mut stash);
         mgr.split(SplitDirection::Horizontal);
-        mgr.adopt_input(&mut buf, &mut cur, &mut hist);
+        mgr.adopt_input(&mut buf, &mut cur, &mut hist, &mut stash);
 
         // The new pane starts empty; ROOT kept what we typed.
         assert_eq!(buf, "");
@@ -420,6 +519,11 @@ mod tests {
         assert_eq!(mgr.get(PaneId::ROOT).unwrap().input_buffer, "alpha");
         assert_eq!(mgr.get(PaneId::ROOT).unwrap().cursor_position, 5);
         assert_eq!(mgr.get(PaneId::ROOT).unwrap().input_history_index, Some(2));
+        assert_eq!(
+            mgr.get(PaneId::ROOT).unwrap().input_history_stash,
+            "alpha pre-recall"
+        );
+        assert!(stash.is_empty(), "the stash moved into the pane");
 
         // Type here, cycle back, and the first pane's buffer comes home.
         // The real Tab handler order: stash the working buffer into the pane
@@ -427,12 +531,14 @@ mod tests {
         buf = "beta".to_string();
         cur = 4;
         hist = Some(1);
-        mgr.stash_input(&mut buf, &mut cur, &mut hist); // pane[1] keeps beta
+        stash = "beta pre-recall".to_string();
+        mgr.stash_input(&mut buf, &mut cur, &mut hist, &mut stash); // pane[1] keeps beta
         mgr.focus_next(); // wraps to the first pane
-        mgr.adopt_input(&mut buf, &mut cur, &mut hist); // buf = alpha
+        mgr.adopt_input(&mut buf, &mut cur, &mut hist, &mut stash); // buf = alpha
         assert_eq!(buf, "alpha");
         assert_eq!(cur, 5);
         assert_eq!(hist, Some(2));
+        assert_eq!(stash, "alpha pre-recall", "the recall draft comes home");
         assert_eq!(mgr.get(mgr.focused).unwrap().input_buffer, "alpha");
         // And the second pane still holds its own text.
         assert_eq!(mgr.get(mgr.panes[1].id).unwrap().input_buffer, "beta");
@@ -500,11 +606,13 @@ mod tests {
     fn single_pane_stash_adopt_round_trip_preserves_input() {
         let mut mgr = PaneManager::new();
         let (mut buf, mut cur, mut hist) = ("solo".to_string(), 4usize, None);
-        mgr.stash_input(&mut buf, &mut cur, &mut hist);
+        let mut stash = "solo pre-recall".to_string();
+        mgr.stash_input(&mut buf, &mut cur, &mut hist, &mut stash);
         assert_eq!(mgr.get(PaneId::ROOT).unwrap().input_buffer, "solo");
-        mgr.adopt_input(&mut buf, &mut cur, &mut hist);
+        mgr.adopt_input(&mut buf, &mut cur, &mut hist, &mut stash);
         assert_eq!(buf, "solo");
         assert_eq!(cur, 4);
         assert_eq!(hist, None);
+        assert_eq!(stash, "solo pre-recall");
     }
 }

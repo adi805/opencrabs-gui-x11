@@ -21,8 +21,8 @@
 //! its own row in the live turn and a `⏳` strip above the input, both drawn
 //! from the same formatter the TUI uses. When it finishes, the row settles by
 //! task id and the conversation resumes with the output (#2322). A completion
-//! for a session other than the open one is logged, not resumed: the window
-//! runs one conversation at a time.
+//! resumes the session that started the task, whether or not its conversation
+//! is the one on screen (#2704).
 
 mod accent;
 mod agent_bridge;
@@ -32,6 +32,7 @@ mod breakdown;
 mod command_palette;
 mod commands;
 mod editor;
+mod fonts;
 mod icon;
 mod layout_store;
 mod logging;
@@ -44,14 +45,17 @@ mod models;
 mod onboard;
 mod palette;
 mod plan_strip;
+mod platform_icons;
 mod preview;
 mod rail_activity;
 mod screen_keys;
 mod sessions;
 mod skills_view;
+mod telegram_topics;
 mod text_commands;
 mod theme;
 mod themes_view;
+mod thumbs;
 mod topic_icons;
 mod topic_tabs;
 mod transcript;
@@ -65,6 +69,7 @@ use crate::theme::{BASE_REM, Size, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, text};
 use opencrabs::db::models::Message;
 use opencrabs::ui_core::actions;
 use opencrabs::ui_core::channel_status;
+use opencrabs::ui_core::composer;
 use opencrabs::ui_core::message_select::{MessageAction, Selection};
 use opencrabs::ui_core::model_layout;
 use opencrabs::ui_core::model_selector::{FetchRequest, ProviderSelectorState};
@@ -91,21 +96,24 @@ use futures::channel::oneshot;
 
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Div,
-    DragMoveEvent, Entity, ExternalPaths, FocusHandle, KeyDownEvent, KeystrokeEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    div, point, prelude::*, px, relative, rems, rgb, rgba, size,
+    DragMoveEvent, Entity, ExternalPaths, FocusHandle, Image, KeyDownEvent, KeystrokeEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point,
+    ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, div, point, prelude::*, px, relative, rems, rgb, rgba, size,
 };
 use opencrabs::brain::agent::ProgressEvent;
+use opencrabs::brain::tools::suggest_options::{SuggestionItem, SuggestionStyle};
 use opencrabs::utils::drop_landing::human_size;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use opencrabs::brain::mission_control::{McActivity, McAnalytics, McInboxItem, McScheduleItem};
 use opencrabs::config::Config;
 use opencrabs::config::GuiTheme;
+use opencrabs::config::gui_font;
 use opencrabs::config::gui_theme;
 use opencrabs::tui::app::mission_control::log_viewer::LogViewerState;
 use opencrabs::ui_core::keys::UiKey;
@@ -383,11 +391,25 @@ fn zoom_step_for(key: &str, rem: f32, chord: bool) -> Option<f32> {
     zoom_step(key, rem)
 }
 
-/// How many times a finished turn's reload is retried while its rows are
-/// still being written. Eight attempts at the poll cadence is ~1.2s, long
-/// enough for the write and short enough to stay invisible; past it the live
-/// turn keeps the answer rather than the pane going blank.
-const SETTLE_ATTEMPTS: u8 = 8;
+/// How long a finished turn's reload keeps retrying while its rows are still
+/// being written.
+///
+/// The first version bounded this with `SETTLE_ATTEMPTS` (eight), which the
+/// poll cadence turned into roughly half a second. A 100 KB assistant row
+/// under WAL can take longer: the 2026-11-08 23:38:29 log shows retries 1 to
+/// 8 ending in "transcript never caught up", after which the live card stayed
+/// pinned beside the persisted turn until the session was reopened. A
+/// deadline bounds the wait without assuming how long one write takes.
+const SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One more read this long after the budget expired, so a write that landed
+/// late still releases the live card instead of leaving it pinned.
+const SETTLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How many late re-reads one turn may spend after the budget expired. The
+/// second covers a write that landed between the first recheck and its own
+/// read; past that, the log line is the honest answer.
+const SETTLE_RECHECKS: u8 = 2;
 
 /// The rail's default width, and the floor it may be dragged to. At the
 /// floor the splitter closes the rail instead of leaving a sliver: a 3-rem
@@ -505,6 +527,19 @@ struct StashedTurn {
     ctx_tokens: Option<u32>,
 }
 
+/// Whether a rail preview refresh can actually change a line.
+///
+/// The first version asked `rail.streaming_count()`, which counts only
+/// sessions streaming with no pane of their own. A turn in the open
+/// conversation never joins that set (its progress is handled inline) and a
+/// parked turn returns from `fold_pane_progress` before the set is touched, so
+/// the count read zero for the whole of a normal turn: the badge spun while
+/// the preview line, the cost and the row order stayed frozen until `Done`.
+/// Ask about the work instead of the set.
+fn previews_can_move(busy: bool, stashed_live: bool, streaming: usize) -> bool {
+    busy || stashed_live || streaming > 0
+}
+
 /// The phase 1 window. Every string on screen is real data or the real error.
 struct Dashboard {
     /// Which pane the right side draws: chat by default, usage on ctrl+u.
@@ -620,6 +655,21 @@ struct Dashboard {
     /// When the rail's live previews were last re-read, so a stream of chunks
     /// costs at most one query a second instead of one per token.
     preview_refreshed_at: Option<std::time::Instant>,
+    /// Monotonic generation of the ctrl+f deep search (#2720). Each keystroke
+    /// bumps it and spawns a debounced content query that carries the value;
+    /// a result only lands when its generation still matches, so a slow query
+    /// for "nee" can never paint over the hits for "needle".
+    rail_find_gen: u64,
+    /// Seeker deep search (#2721): content hits per trimmed query, cached so
+    /// re-opening the same query costs no second read. The card's rows are
+    /// rebuilt from this map when a debounced result lands.
+    seeker_find: HashMap<String, Vec<opencrabs::db::repository::ContentSearchRow>>,
+    /// Monotonic generation of the Seeker deep search, the rail's trick again:
+    /// a result only rebuilds the card when its generation still matches.
+    seeker_find_gen: u64,
+    /// The trimmed query the deep search was last scheduled for, so caret
+    /// moves and arrow navigation never rebuild the catalog (#2721).
+    seeker_scheduled_query: String,
     /// Parents whose topic chips are expanded past the first three. A chip
     /// strip shows three plus a "+N" pill by default; tapping it reveals the
     /// rest, and the collapse pill folds them back (Telegram topic style).
@@ -675,6 +725,10 @@ struct Dashboard {
     /// The row whose message menu is open (#2613). One at a time, like the
     /// rail's: opening another closes the first.
     msg_menu: Option<Uuid>,
+    /// Where that row's right press landed, in window coordinates (#2690).
+    /// The card opens under the pointer instead of pinned to the row's top
+    /// corner, so a long message cannot put it half a screen away.
+    msg_menu_at: Option<gpui::Point<gpui::Pixels>>,
     /// Select mode (#2613). The picks live in the model, keyed by message id,
     /// so a scroll or a refresh never drops one; `is_active` is what the
     /// selection bar answers to.
@@ -689,6 +743,10 @@ struct Dashboard {
     forward_cursor: Option<Uuid>,
     /// The icon picked for the topic being named; None means the default (#2414).
     topic_draft_icon: Option<String>,
+    /// Custom icon images read once from the store, keyed by stored value
+    /// (#2790). The paint clones an Arc, never reads a file; the map
+    /// rebuilds when the topic icons load and after an image is picked.
+    icon_images: HashMap<String, Arc<Image>>,
     /// The Help Center body's scroll position, so the arrows can move it (#2407).
     help_scroll: ScrollHandle,
     /// A splitter drag is in flight. The move events land on the window root,
@@ -706,6 +764,16 @@ struct Dashboard {
     /// The row whose pin/delete strip is showing. One at a time: opening a
     /// row's actions closes the one before it.
     rail_actions: Option<Uuid>,
+    /// Where the right press that opened the rail's context menu landed, in
+    /// window coordinates. The card opens just past the rail at that
+    /// height instead of over the row it belongs to (#2742).
+    rail_menu_at: Option<gpui::Point<gpui::Pixels>>,
+    /// The turn running in a session that has no leaf of its own (#2718), so
+    /// its rail card can say what it is doing instead of showing the last
+    /// message the ledger holds. Kept apart from the panes and the stash on
+    /// purpose: this is the only record of a turn nobody is looking at, and
+    /// the entry is dropped the moment that turn settles.
+    rail_live: HashMap<Uuid, transcript::LiveTurn>,
     /// A leftward slide in flight on a rail row: the session and the pointer
     /// x where the drag began. Past the threshold the row's strip opens.
     rail_swipe: Option<(Uuid, f32)>,
@@ -747,6 +815,10 @@ struct Dashboard {
     /// It carries the id, never a bare flag: a right press on a topic tab
     /// opens the same menu for a session that is not the one on screen.
     topic_menu: Option<uuid::Uuid>,
+    /// Where that right press landed, in window coordinates (#2690). The card
+    /// opens under the pointer instead of at the column's top corner, which in
+    /// a split was not even the pane whose tab was pressed.
+    topic_menu_at: Option<gpui::Point<gpui::Pixels>>,
     /// The topic name being typed, while the name prompt is open (#2303).
     topic_draft: Option<String>,
     /// The pick the window has to explain before it goes on (#2605): the
@@ -780,6 +852,13 @@ struct Dashboard {
     /// The saturation and brightness tracks' boxes, recorded the same way.
     themes_sat_track: std::rc::Rc<std::cell::RefCell<Option<[f32; 4]>>>,
     themes_val_track: std::rc::Rc<std::cell::RefCell<Option<[f32; 4]>>>,
+    /// Whether the font list under the cards is open (#2786). Closed by
+    /// default, because the list is the machine's whole family catalog and the
+    /// modal is small.
+    fonts_open: bool,
+    /// Whether the installed families have been read. The enumeration walks
+    /// CoreText on macOS and keeps no cache, so it runs once per process.
+    fonts_loaded: bool,
     /// The /cd picker's browse state (#2527): the directory on screen, its
     /// subdirectories read at open and on every descend, the row the
     /// keyboard stands on, and whether dotfile directories are listed.
@@ -837,6 +916,14 @@ struct Dashboard {
     /// plan drawn in two places rings once. The terminal keeps the same
     /// single set (`tui::app::state::announced_task_completions`).
     announced_task_completions: std::collections::HashSet<Uuid>,
+    /// Until when each session's rail plan bar stays flashing orange, per
+    /// session, keyed by the plan's own session id (#2701 follow-up).
+    ///
+    /// The deadline is written on the exact event that rings the chime, so the
+    /// sound and the blink are two surfaces of one fact: a task just settled.
+    /// It is memory only, like the rail's streaming set: a window restart has
+    /// nothing to flash about.
+    plan_flash_until: HashMap<Uuid, std::time::Instant>,
     /// The selected session's transcript and its scroll handle, so a fresh
     /// load can open at the bottom where the conversation ends.
     transcript: transcript::TranscriptState,
@@ -859,6 +946,19 @@ struct Dashboard {
     /// The message editor (task 4). Typing goes to it while it holds focus;
     /// its Sent events arrive through the subscription made in `main`.
     editor: Entity<editor::Editor>,
+    /// The submitted history every composer in this window walks. One handle
+    /// cloned into the window's field and every split pane, so a message sent
+    /// in one is recalled in all of them, in real time, and the terminal reads
+    /// the same list off the same file.
+    history: composer::SharedHistory,
+    /// Half-typed text keyed by the conversation it was typed in. Switching
+    /// away and back returns the same draft instead of throwing it away.
+    drafts: composer::DraftStore,
+    /// Poll ticks counted since the last repaint that a live turn asked for.
+    /// The spinner and the clock are the only things moving in that branch, and
+    /// rebuilding every pane's transcript 20 times a second to advance them is
+    /// what made a split screen crawl (#2688).
+    anim_tick: u64,
     /// Agent-side state (task 5). Events from the bridge's bootstrap and
     /// turn threads land in the receiver; the poll tick drains it.
     agent_rx: std::sync::mpsc::Receiver<agent_bridge::TurnEvent>,
@@ -879,8 +979,17 @@ struct Dashboard {
     /// Reload attempts made while waiting for the turn's rows to persist.
     /// Bounded, so a write that never lands cannot spin the fetch loop.
     settle_retries: u8,
-    /// Turns the transcript must hold before the live turn is dropped: the
-    /// count on screen when the send happened, plus the new one.
+    /// When the current settle wait started. `None` between turns: the budget
+    /// is measured from the first reload that found the rows short, not from
+    /// the send, because the write only exists once the turn has ended.
+    settle_deadline: Option<std::time::Instant>,
+    /// Late re-reads already spent on this turn. Two is the whole allowance,
+    /// so a write that truly never lands leaves a log line instead of a loop.
+    settle_rechecks: u8,
+    /// Rows the session must hold before the live turn is dropped: the
+    /// session's row total when the send happened, plus the one the new turn
+    /// appends. Measured on the ledger, not on the windowed transcript, so a
+    /// conversation longer than `transcript::WINDOW` still settles (#2705).
     settle_expect: Option<usize>,
     /// A turn is running: sends queue instead of starting a second one.
     busy: bool,
@@ -947,6 +1056,14 @@ fn set_rail_open_state(
         *rail_focused = false;
         sessions.filter.clear();
         sessions.filter_active = false;
+        // The filter menu clears with the rail (#2719): a reopened rail
+        // starts from the default rule, never a stale chip from last time.
+        sessions.rail_filter = sessions::RailFilter::default();
+        // The open chip panel folds with the rail too (#2787).
+        sessions.rail_filter_open = false;
+        // The deep hits clear with the rail too (#2720): a reopened rail
+        // starts unsearched, never showing snippets from the last query.
+        sessions.content_matches.clear();
     }
 }
 
@@ -959,10 +1076,43 @@ mod sidebar_action_tests {
     /// window, and they read the body so a mention elsewhere cannot satisfy
     /// them (#2665).
     fn fn_body(src: &'static str, name: &str) -> &'static str {
-        src.split(&format!("fn {name}("))
-            .nth(1)
-            .and_then(|rest| rest.split("\n    fn ").next())
-            .unwrap_or_else(|| panic!("{name} not found"))
+        item_body(src, &format!("fn {name}("))
+    }
+
+    /// The Dashboard's window render. Two impls in this file define `render`,
+    /// and only this signature is the one that holds the window (#2741).
+    fn dashboard_render(src: &'static str) -> &'static str {
+        item_body(
+            src,
+            "fn render(&mut self, window: &mut Window, cx: &mut Context<Self>)",
+        )
+    }
+
+    /// The body of one item, from its own definition to its closing brace.
+    ///
+    /// Two things this gets right that a plain `split` does not: only a real
+    /// definition counts, because the scans below quote the names they look
+    /// for inside their own strings, and the body ends at the brace that
+    /// closes it rather than at the next method, so a top level function in
+    /// another module file reads the same as a `Dashboard` method (#2741).
+    fn item_body(src: &'static str, needle: &str) -> &'static str {
+        let at = src
+            .match_indices(needle)
+            .map(|(at, _)| at)
+            .find(|&at| {
+                let line = src[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+                let prefix = src[line..at].trim();
+                prefix.is_empty() || prefix.starts_with("pub")
+            })
+            .unwrap_or_else(|| panic!("{needle} not found"));
+        let line = src[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+        let indent = src[line..at]
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .count();
+        let close = format!("\n{}}}", " ".repeat(indent));
+        let rest = &src[at..];
+        rest.split(&close).next().unwrap_or(rest)
     }
 
     #[test]
@@ -1049,6 +1199,40 @@ mod sidebar_action_tests {
     }
 
     #[test]
+    fn the_caret_receipt_names_who_took_the_keys() {
+        // #2741: the reconciler can ask for the composer and still lose the
+        // caret to the next press, and a silent `window.focus` cannot tell
+        // those apart. The receipt records the state before the call and the
+        // owner after it, so the next build answers it from the daily log.
+        let src = include_str!("main.rs");
+        let render = dashboard_render(src);
+        assert!(
+            render.contains("caret -> composer before={before} now={}"),
+            "the composer branch leaves a receipt"
+        );
+        assert!(
+            render.contains("caret -> root before={before} now={}"),
+            "the root branch leaves the mirror receipt"
+        );
+        assert!(
+            render.contains("keyboard owner -> {owner:?}"),
+            "an owner transition names the owner it moved to"
+        );
+        assert!(
+            render.contains("self.caret_owner_name(window, cx)"),
+            "the receipt names the element that holds the keys after the call"
+        );
+        let helper = fn_body(src, "caret_owner_name");
+        for name in ["\"composer\"", "\"root\"", "\"field\"", "\"none\""] {
+            assert!(helper.contains(name), "the helper names {name}");
+        }
+        assert!(
+            helper.contains("window.focused(cx)"),
+            "the name comes from the window's live focus, not a guess"
+        );
+    }
+
+    #[test]
     fn the_arrow_walk_previews_without_taking_the_keys() {
         // #2665: the walk opens each row it stands on, so handing the composer
         // the caret there would eat the next arrow.
@@ -1106,6 +1290,238 @@ mod sidebar_action_tests {
         assert!(
             render.contains("window.focus(&self.focus_handle)"),
             "the deferred request needs the window, so it lands in render"
+        );
+    }
+
+    /// The rename dialog's icon picks render big enough to recognise
+    /// (#2789): picker cells at 4.0rem, the chosen badge at 3.2rem inside a
+    /// 4.0rem slot. The 512x512 sources stay crisp at 2x.
+    #[test]
+    fn rename_dialog_icons_render_big_and_crisp() {
+        let src = include_str!("main.rs");
+        // Scope to the window render: this test module sits above it in the
+        // file, so a bare split would land in the test's own strings.
+        let render = dashboard_render(src);
+        let picker = render
+            .split("topic-icon-{name}")
+            .nth(1)
+            .expect("picker cell id")
+            .split(".collect()")
+            .next()
+            .expect("picker cell before collect");
+        assert!(
+            picker.contains("topic_icons::picture(bytes, 4.0)"),
+            "a pick renders at 4.0rem, not a speck"
+        );
+        let overlay = fn_body(src, "topic_prompt_overlay");
+        assert!(
+            overlay.contains("topic_icons::picture(bytes, 3.2)"),
+            "the chosen badge picture renders at 3.2rem"
+        );
+        assert!(
+            overlay.contains(".size(rems(4.0))"),
+            "the badge slot grows to 4.0rem around it"
+        );
+    }
+
+    /// A rename keeps the session's icon (#2791): the dialog seeds the draft
+    /// from the stored value, and the submit path writes it back only when
+    /// the helper says the draft changed it.
+    #[test]
+    fn rename_seeds_and_persists_the_icon() {
+        let src = include_str!("main.rs");
+        let start = fn_body(src, "start_rename");
+        assert!(
+            start.contains("self.topic_draft_icon = self.sessions.topic_icons.get(&id).cloned()"),
+            "the rename dialog opens on the session's own icon"
+        );
+        let submit = fn_body(src, "submit_topic");
+        assert!(
+            submit.contains("sessions::icon_write_needed("),
+            "the rename branch asks the helper before writing"
+        );
+        assert!(
+            submit.contains("sessions::set_topic_icon(db_path, target, draft_icon)"),
+            "the rename branch persists the changed icon"
+        );
+    }
+
+    /// The session image is the upload trigger (#2790): the badge in the
+    /// prompt carries a click that opens the file picker, and the add-image
+    /// cell keeps its own. Rename and creation share the overlay, so both
+    /// get the trigger.
+    #[test]
+    fn the_session_image_opens_the_picker() {
+        let src = include_str!("main.rs");
+        let overlay = fn_body(src, "topic_prompt_overlay");
+        assert!(
+            overlay.contains(".id(\"topic-prompt-image\")"),
+            "the badge is a click target, not a static picture"
+        );
+        assert!(
+            overlay.contains(".on_click(pick_image)"),
+            "clicking the session image opens the file picker"
+        );
+        assert!(
+            overlay.contains(".cursor_pointer()"),
+            "the badge shows it can be clicked"
+        );
+        let render = dashboard_render(src);
+        let badge_pick = render
+            .split("let pick_image = cx.listener")
+            .nth(1)
+            .expect("the badge listener")
+            .split("});")
+            .next()
+            .expect("listener body");
+        assert!(
+            badge_pick.contains("this.pick_icon_image(cx)"),
+            "the badge opens the same picker the add-image cell opens"
+        );
+        assert!(
+            render.contains(".id(\"topic-icon-add-image\")"),
+            "the add-image cell stays in the picker row"
+        );
+    }
+
+    /// The rail card draws the stored icon, not just custom images (#2790):
+    /// the same resolver the topic tab uses, so a pick in the rename dialog
+    /// reaches the card. Scoped to the window render: this test module sits
+    /// above it, so a bare split would land in the test's own strings.
+    #[test]
+    fn rail_card_resolves_the_stored_icon() {
+        let src = include_str!("main.rs");
+        let render = dashboard_render(src);
+        let wiring = render
+            .split("icon: self")
+            .nth(1)
+            .expect("rail icon wiring")
+            .split("};")
+            .next()
+            .expect("wiring before the flags close");
+        assert!(
+            wiring.contains("topic_icons::tab_icon(stored, 1.0)"),
+            "an embedded mark renders on the card, same as on the tab"
+        );
+        assert!(
+            wiring.contains("self.custom_icon_picture(stored, 1.0)"),
+            "a custom image renders from the view's cache"
+        );
+        assert!(
+            wiring.contains("topic_icons::tab_glyph(stored, 1.0)"),
+            "a legacy glyph keeps its text slot"
+        );
+    }
+
+    #[test]
+    fn a_topic_switch_hands_the_caret_back() {
+        // #2741: a click on a topic chip took the caret and never asked for it
+        // back, on both of the paths that do not go through `open_session`:
+        // the session already sits in another leaf, or the leaf is renamed.
+        let src = include_str!("main.rs");
+        let body = fn_body(src, "open_topic_in_pane");
+        assert_eq!(
+            body.matches("self.request_composer_caret(cx)").count(),
+            2,
+            "both branches ask the composer for the caret"
+        );
+        assert_eq!(
+            body.matches("self.rail_focused = false").count(),
+            2,
+            "a chip in the rail also lets the rail go, the way a row does"
+        );
+        let caret = fn_body(src, "request_composer_caret");
+        assert!(
+            caret.contains("editor.focus_pending = true"),
+            "the field claims the caret from its own render, after the press"
+        );
+        assert!(
+            caret.contains("self.refocus_screen()"),
+            "the derived owner stays the one decision point"
+        );
+    }
+
+    #[test]
+    fn a_committed_row_leaves_the_keys_in_the_chat_leaf() {
+        // #2741: the chat leaf adopts the row's conversation, so a split that
+        // kept the caret in a neighbouring pane typed into a conversation the
+        // click did not open.
+        let src = include_str!("main.rs");
+        let body = fn_body(src, "open_session_handing_back");
+        let after = body
+            .split_once("self.rail_focused = false")
+            .map(|(_, rest)| rest)
+            .expect("a committed row lets the rail go");
+        assert!(
+            after.contains("self.pane_focus = None"),
+            "the chat leaf is the pane that took the conversation"
+        );
+        assert!(
+            after.contains("self.request_composer_caret(cx)"),
+            "the caret follows the conversation"
+        );
+        assert!(
+            after.contains("self.refocus_screen()"),
+            "the owner is derived again after the hand back"
+        );
+    }
+
+    #[test]
+    fn the_caret_is_repaired_from_the_window_not_the_owner() {
+        // #2741: the owner does not change when a press lands on chrome, so a
+        // reconciler that only acts on transitions never fires. The repair
+        // reads the window instead.
+        let src = include_str!("main.rs");
+        let render = dashboard_render(src);
+        assert!(
+            render.contains("caret -> composer repaired now={}"),
+            "a repaired caret leaves a receipt"
+        );
+        assert!(
+            render.contains("KeyboardOwner::Composer"),
+            "only the composer repairs, an overlay owns the keys on purpose"
+        );
+        assert!(
+            render.contains(".is_none_or(|handle| handle == self.focus)"),
+            "the root holding the keys is the drift this repairs"
+        );
+    }
+
+    #[test]
+    fn an_overlay_never_leaves_the_caret_in_the_composer() {
+        // #2767: the repair ran one way only. With the topic prompt open the
+        // owner was the prompt, the composer kept the caret, so the name typed
+        // into the field also landed in the message field and Enter submitted
+        // the message instead of creating the topic.
+        let src = include_str!("main.rs");
+        let render = dashboard_render(src);
+        assert!(
+            render.contains("caret -> root repaired now={}"),
+            "the other direction leaves a receipt too"
+        );
+        assert!(
+            render.contains("let leaked = composer.read(cx).focus_handle.is_focused(window)"),
+            "the drift is the composer holding keys it no longer owns"
+        );
+        assert!(
+            render.contains("an overlay or a screen took the keys while the composer"),
+            "the repair is a branch with two arms, never one"
+        );
+    }
+
+    #[test]
+    fn a_send_is_refused_while_an_overlay_owns_the_keys() {
+        // #2767: the second half. Even with the caret repaired, a send must
+        // not reach the agent while a prompt is waiting for its own Enter.
+        let src = include_str!("main.rs");
+        let body = fn_body(src, "send_from_pane");
+        assert!(
+            body.contains("send refused"),
+            "a refused send leaves a receipt naming the owner"
+        );
+        assert!(
+            body.contains("self.open_overlays()"),
+            "the refusal asks the one owner decision"
         );
     }
 
@@ -1191,6 +1607,18 @@ fn wheel_dy(delta: &ScrollDelta) -> f32 {
     }
 }
 
+/// Poll ticks between repaints a live turn asks for. The poll runs at 20 Hz;
+/// the only things moving in that branch are a spinner and a clock, and every
+/// one of those repaints walks every pane's transcript (#2688). Five frames a
+/// second keeps the animation alive at a quarter of the rebuilds.
+const BUSY_REPAINT_TICKS: u64 = 4;
+
+/// True on the poll tick that paints a live turn's animation. Pure, so the
+/// cadence stays a rule rather than an accident of where the counter is bumped.
+fn busy_repaint_due(tick: u64) -> bool {
+    tick.is_multiple_of(BUSY_REPAINT_TICKS)
+}
+
 impl Dashboard {
     /// Re-read the channel chip now (#2452): after a Start click succeeds,
     /// the daemon appears within a second or two, so poll instead of
@@ -1251,13 +1679,18 @@ impl Dashboard {
     }
 
     /// Title of the conversation the chat pane is on, if the rail knows it.
-    fn session_title(&self) -> Option<&str> {
+    /// The name of the conversation on screen, as every surface prints it
+    /// (#2766). One parse lives behind this: the platform is the card's mark
+    /// and the channel key is bookkeeping, so neither belongs in a header, a
+    /// pane border or the footer identity.
+    fn session_title(&self) -> Option<String> {
         self.transcript.session.and_then(|id| {
             self.sessions
                 .items
                 .iter()
                 .find(|s| s.id == id)
                 .and_then(|s| s.title.as_deref())
+                .map(|stored| rail::chip_name(Some(stored), None))
         })
     }
 
@@ -1307,14 +1740,27 @@ impl Dashboard {
                 }
             }
             // The draft and its attachments belong to the conversation they
-            // were typed in (#2481).
-            self.editor.update(cx, |ed, cx| ed.begin_conversation(cx));
+            // were typed in (#2481). The text is filed under the conversation
+            // being left and the destination's own draft comes back, so a
+            // switch and a switch back return the same half-typed message.
+            let previous = self.transcript.session;
+            let draft = self.editor.update(cx, |ed, cx| ed.take_draft(cx));
+            if let Some(previous) = previous {
+                self.drafts.store(previous, draft);
+            }
+            let returning = self.drafts.take(id);
+            self.editor.update(cx, move |ed, cx| {
+                ed.begin_conversation(cx);
+                if let Some(draft) = returning {
+                    ed.restore_state(draft, cx);
+                }
+            });
         }
         let previous = self.transcript.session;
         self.transcript.session = Some(id);
         // The chat is a leaf of the pane tree, so switching conversations
         // moves that leaf instead of leaving a stale pane behind (#2472).
-        self.adopt_chat_leaf(previous, id);
+        self.adopt_chat_leaf(previous, id, cx);
         // The next launch opens this conversation. Both surfaces read the same
         // file, so switching here means the terminal comes back to it too, and
         // a restart no longer lands on whatever the rail listed first (#2444).
@@ -1472,7 +1918,9 @@ impl Dashboard {
             // Already on screen: hand it the keyboard instead of showing one
             // conversation in two leaves.
             self.pane_focus = Some(id);
+            self.rail_focused = false;
             self.sync_composer_session();
+            self.request_composer_caret(cx);
             cx.notify();
             return;
         }
@@ -1484,11 +1932,15 @@ impl Dashboard {
             return;
         }
         // The pane's transcript, live turn, plan strip and editor all belong
-        // to the conversation that just left the leaf.
+        // to the conversation that just left the leaf; its draft is filed
+        // under that conversation first.
+        self.stash_pane_draft(pane, cx);
         self.pane_states.remove(&pane);
         self.open_pane_state(id, cx);
         self.pane_focus = Some(id);
+        self.rail_focused = false;
         self.sync_composer_session();
+        self.request_composer_caret(cx);
         self.persist_layout();
         cx.notify();
     }
@@ -1530,12 +1982,16 @@ impl Dashboard {
                 // fetch for an abandoned click paints nothing.
                 if this.transcript.session == Some(id) {
                     match result {
-                        Ok((rows, total)) => {
-                            let (hidden, turns) =
-                                transcript::turns_with_metrics(&rows, total, &this.turn_metrics);
+                        Ok(loaded) => {
+                            let (hidden, turns) = transcript::turns_with_origins(
+                                &loaded.rows,
+                                loaded.total,
+                                &this.turn_metrics,
+                                &loaded.origins,
+                            );
                             this.transcript.hidden = hidden;
                             this.transcript.turns = turns;
-                            this.transcript.rows = rows;
+                            this.transcript.rows = loaded.rows;
                         }
                         Err(e) => this.transcript.error = Some(e.into()),
                     }
@@ -1550,9 +2006,14 @@ impl Dashboard {
         })
         .detach();
         // A committed row takes the keyboard off the rail: the rail holds it
-        // only while the list is being walked (#2665).
+        // only while the list is being walked (#2665). The chat leaf is the
+        // pane that adopted the conversation, so the caret goes there; a stored
+        // split pane would otherwise keep it in a conversation the click did
+        // not open (#2741).
         if hand_back {
             self.rail_focused = false;
+            self.pane_focus = None;
+            self.request_composer_caret(cx);
         }
         self.refocus_screen();
         cx.notify();
@@ -1673,6 +2134,25 @@ impl Dashboard {
         self.refocus_screen();
     }
 
+    /// Ask the composer that is drawn to take the caret, and let the field
+    /// re-assert it from its own render (#2741).
+    ///
+    /// The press that led here is dispatched before the next frame is drawn,
+    /// and it can still hand the window root the keys: any element without
+    /// `track_focus` lets it, and the owner may not even change, so the
+    /// reconciler in `render` never fires. The deferred request is the one
+    /// that sticks, because the editor claims the caret while the tree is
+    /// being built, after that press is done. `refocus_screen` stays the one
+    /// decision point, so the two can never disagree about who owns the keys.
+    fn request_composer_caret(&mut self, cx: &mut Context<Self>) {
+        let composer = self.composer_entity();
+        composer.update(cx, |editor, cx| {
+            editor.focus_pending = true;
+            cx.notify();
+        });
+        self.refocus_screen();
+    }
+
     /// Open the Seeker card (`alt+space`, `cmd-k`): one field over the
     /// window that finds a conversation, a command or a surface with the same
     /// scoring the terminal uses (#2458).
@@ -1769,6 +2249,10 @@ impl Dashboard {
         items.extend(find::channel_items());
         // Standalone actions share one catalog; execution stays in this window.
         items.extend(actions::items());
+        // The window-only rows: grouping sessions into topics is a window
+        // modal, so that row prints here and nowhere else (#2713). The split
+        // rows live in the shared catalog because both surfaces own panes.
+        items.extend(actions::gui_items());
         for skill in opencrabs::brain::skills::load_all_skills() {
             items.push(
                 PaletteItem::new(
@@ -1781,17 +2265,45 @@ impl Dashboard {
                 .with_description(&skill.description),
             );
         }
+        // Deep search (#2721): when the query names message content, the
+        // conversation row carries the matching snippet in place of the date
+        // and the query as a keyword, so a session whose title never mentions
+        // the word still surfaces. With no content hit the row is unchanged.
+        let seeker_query = self
+            .finder
+            .as_ref()
+            .map(|state| state.query().trim().to_string())
+            .unwrap_or_default();
+        let snippets: HashMap<Uuid, String> = self
+            .seeker_find
+            .get(&seeker_query)
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| (row.session_id, row.snippet.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         for session in &self.sessions.items {
             let title = session
                 .title
                 .clone()
                 .unwrap_or_else(|| "Untitled conversation".to_string());
-            items.push(PaletteItem::new(
-                title,
-                session.updated_at.format("%Y-%m-%d %H:%M").to_string(),
-                PaletteKind::Session,
-                PaletteAction::OpenSession(session.id.as_u128()),
-            ));
+            let item = match snippets.get(&session.id) {
+                Some(snippet) if !seeker_query.is_empty() => PaletteItem::new(
+                    title,
+                    snippet.clone(),
+                    PaletteKind::Session,
+                    PaletteAction::OpenSession(session.id.as_u128()),
+                )
+                .with_keywords(&seeker_query),
+                _ => PaletteItem::new(
+                    title,
+                    session.updated_at.format("%Y-%m-%d %H:%M").to_string(),
+                    PaletteKind::Session,
+                    PaletteAction::OpenSession(session.id.as_u128()),
+                ),
+            };
+            items.push(item);
         }
         items
     }
@@ -1844,6 +2356,7 @@ impl Dashboard {
                 }
             }
         }
+        self.seeker_find_if_changed(cx);
         cx.notify();
     }
 
@@ -1906,6 +2419,7 @@ impl Dashboard {
                 }
             }
         }
+        self.seeker_find_if_changed(cx);
     }
 
     /// Translate a window point to the Seeker's character caret through the
@@ -1967,7 +2481,9 @@ impl Dashboard {
         self.refocus_screen();
         match row.item.action {
             PaletteAction::RunSlash(name) => self.send_message(name.to_string(), cx),
-            PaletteAction::OpenSession(id) => self.open_session(Uuid::from_u128(id), cx),
+            // A Seeker row is a pick: while a split waits it fills the pane,
+            // the way a rail row does (#2760).
+            PaletteAction::OpenSession(id) => self.pick_or_open(Uuid::from_u128(id), cx),
             PaletteAction::OpenSurface(surface) => self.open_surface(surface, cx),
             PaletteAction::OpenSidebar => self.set_rail_open(true, cx),
             PaletteAction::CloseSidebar => self.set_rail_open(false, cx),
@@ -2047,6 +2563,27 @@ impl Dashboard {
             PaletteAction::FavoriteToggle(id) => {
                 // The exact path the rail's pin button walks (#2487).
                 self.toggle_favorite(Uuid::from_u128(id), cx);
+            }
+            PaletteAction::GroupTopics => {
+                // Same card, same empty field, different purpose: the pick
+                // names the conversation that holds the topics (#2713).
+                self.finder = Some(PaletteState::picking(
+                    find::PickFor::GroupTopics,
+                    self.finder_items(),
+                ));
+                self.finder_channels = configured_channels();
+                self.refocus_overlay();
+                cx.notify();
+            }
+            PaletteAction::GroupTopicsOn(id) => {
+                // The exact path the rail row's right-click entry walks
+                // (#2713).
+                self.start_group_topics(Uuid::from_u128(id), cx);
+            }
+            PaletteAction::BeginSplit(layout) => {
+                // The same door the chord and the rail row menu walk, from the
+                // pane holding the caret (#2712).
+                self.begin_split(layout, cx);
             }
             PaletteAction::OpenDocs(path) => {
                 let url = docs::url(path);
@@ -2190,12 +2727,13 @@ impl Dashboard {
     /// split is the one the caret is on, so a nested split grows from the
     /// pane being read rather than from the window's first leaf (#2472).
     fn begin_split(&mut self, layout: Layout, cx: &mut Context<Self>) {
-        // The chord door splits the pane holding the caret, resolved through
-        // the same `focused_pane` every other door uses, so the chord, the
-        // row menu and the composer cannot disagree about the leaf (#2625).
-        let target = self.focused_pane();
-        let target = target.filter(|id| self.panes.as_ref().is_some_and(|t| t.contains(*id)));
-        let Some(target) = target else {
+        // Every door splits the pane holding the caret (#2625), and the caret
+        // is resolved the way the render resolves it rather than read
+        // literally: a cached `pane_focus` naming a leaf the tree no longer
+        // holds made all three doors refuse with "Open a session before
+        // splitting it." while the window was plainly drawing a live focused
+        // pane (#2757).
+        let Some(target) = self.split_origin() else {
             self.live
                 .notices
                 .push("Open a session before splitting it.".to_string());
@@ -2237,14 +2775,10 @@ impl Dashboard {
     /// second step is skipped.
     fn split_row(&mut self, id: Uuid, layout: Layout, cx: &mut Context<Self>) {
         let chat = self.transcript.session;
-        if self.panes.is_none()
-            && let Some(chat) = chat
-        {
-            self.panes = Some(PaneTree::leaf(chat));
-        }
-        let target = self.focused_pane();
-        let target = target.filter(|it| self.panes.as_ref().is_some_and(|tree| tree.contains(*it)));
-        let Some(target) = target else {
+        // The pane the split grows from, seeded from the chat's own leaf when
+        // the window holds no tree yet: the same rule the chord door walks, so
+        // the two doors cannot disagree about the originating pane (#2757).
+        let Some(target) = self.split_origin() else {
             self.live
                 .notices
                 .push("Open a session before splitting it.".to_string());
@@ -2276,6 +2810,34 @@ impl Dashboard {
     /// took it (#2474).
     fn focused_pane(&self) -> Option<Uuid> {
         self.pane_focus.or(self.transcript.session)
+    }
+
+    /// The leaf a split door grows from (#2757).
+    ///
+    /// `focused_pane` reads `pane_focus` literally, and that id is a cache: a
+    /// closed pane, a layout pruned at boot, or a session moved into the chat
+    /// leaf all leave it naming a leaf the tree no longer holds. Filtered
+    /// literally, that stale id made every door push "Open a session before
+    /// splitting it." and return before the picker was ever set, while the
+    /// window went on drawing a live focused pane, because the render already
+    /// resolves the same id through `resolve_split_focus` (#2620). The door
+    /// now asks the same question the render asks: the caret leaf, then the
+    /// chat's own leaf, then the first surviving one. A window with no tree
+    /// starts from the chat's leaf, the way the row menu always has.
+    fn split_origin(&mut self) -> Option<Uuid> {
+        let chat = self.transcript.session;
+        if self.panes.is_none()
+            && let Some(chat) = chat
+        {
+            self.panes = Some(PaneTree::leaf(chat));
+        }
+        let leaves = self.panes.as_ref()?.leaves();
+        // `resolve_split_focus` answers `None` for the chat leaf, which is the
+        // caret unless another pane took it.
+        resolve_split_focus(&leaves, self.pane_focus, chat)
+            .or(chat)
+            .filter(|id| leaves.contains(id))
+            .or_else(|| leaves.last().copied())
     }
 
     /// Point recall at the composer that has the caret. A recall keeps the
@@ -2366,6 +2928,23 @@ impl Dashboard {
         }
     }
 
+    /// Name the element the window gives the keys to, for the caret receipt
+    /// (#2741). Three answers: the composer that is drawn, the window root
+    /// that owns overlays and non-chat screens, or a field the dashboard does
+    /// not own (the rail's find box, a rename prompt).
+    fn caret_owner_name(&self, window: &Window, cx: &App) -> &'static str {
+        let Some(handle) = window.focused(cx) else {
+            return "none";
+        };
+        if handle == self.composer_entity().read(cx).focus_handle {
+            "composer"
+        } else if handle == self.focus {
+            "root"
+        } else {
+            "field"
+        }
+    }
+
     /// The leaf that owns the keyboard in the split, `None` meaning the chat
     /// leaf. Resolved through [`resolve_split_focus`] so the rules can be
     /// tested without a window.
@@ -2413,6 +2992,9 @@ impl Dashboard {
         let Some(absorbed) = tree.close(session) else {
             return;
         };
+        // The text typed in this pane is filed under its conversation before
+        // the editor goes, so reopening it returns the draft.
+        self.stash_pane_draft(session, cx);
         self.pane_states.remove(&session);
         self.split_drag = None;
         self.pane_focus = None;
@@ -2501,10 +3083,21 @@ impl Dashboard {
             .unwrap_or_else(|| "(untitled)".to_string());
         // The pane's composer is its own entity (#2530), so a draft belongs to
         // the pane it was typed in and the send carries that pane's session.
-        let pane_editor = cx.new(editor::Editor::new);
+        // It walks the window's shared history, not a private one, so history
+        // is the same whichever pane has the caret.
+        let pane_editor = cx.new({
+            let history = self.history.clone();
+            let history_path = composer::default_history_path();
+            move |cx| editor::Editor::new_with_history(history, history_path, cx)
+        });
+        // A draft filed before this pane was closed, moved, or switched comes
+        // back with it.
+        if let Some(draft) = self.drafts.take(id) {
+            pane_editor.update(cx, |ed, cx| ed.restore_state(draft, cx));
+        }
         cx.subscribe(&pane_editor, move |this, _editor, event, cx| match event {
             editor::EditorEvent::Sent(text) => {
-                this.send_from_pane(id, text.clone(), cx);
+                this.send_from_pane(id, text.clone(), None, SendOrigin::Composer, cx);
             }
             editor::EditorEvent::Preview(path) => this.open_preview(path.clone(), cx),
         })
@@ -2551,12 +3144,16 @@ impl Dashboard {
             this.update(cx, |this, cx| {
                 if let Some(pane) = this.pane_states.get_mut(&id) {
                     match result {
-                        Ok((rows, total)) => {
-                            let (hidden, turns) =
-                                transcript::turns_with_metrics(&rows, total, &this.turn_metrics);
+                        Ok(loaded) => {
+                            let (hidden, turns) = transcript::turns_with_origins(
+                                &loaded.rows,
+                                loaded.total,
+                                &this.turn_metrics,
+                                &loaded.origins,
+                            );
                             pane.transcript.hidden = hidden;
                             pane.transcript.turns = turns;
-                            pane.transcript.rows = rows;
+                            pane.transcript.rows = loaded.rows;
                         }
                         Err(e) => pane.transcript.error = Some(e.into()),
                     }
@@ -2569,6 +3166,23 @@ impl Dashboard {
             .ok();
         })
         .detach();
+    }
+
+    /// A pick from any list: during a split pick it fills the waiting pane,
+    /// otherwise it opens the conversation (#2760).
+    ///
+    /// The rail's full rows and its Enter key asked the picker first, but the
+    /// topic chips, the filter's Enter and the Seeker's session rows opened
+    /// directly. A topic chip also stops propagation, so the parent row never
+    /// got the chance: the topic landed in the chat leaf while the picker
+    /// stayed armed on the pane it started from, and the next click split
+    /// something nobody pointed at.
+    fn pick_or_open(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.split_pick.is_some() {
+            self.choose_split(id, cx);
+        } else {
+            self.open_session(id, cx);
+        }
     }
 
     /// Fill a new pane with `id`, splitting the pane the pick started from,
@@ -2616,12 +3230,31 @@ impl Dashboard {
         self.persist_layout();
     }
 
+    /// File one pane's half-typed text under the conversation it belongs to,
+    /// before the pane's editor is dropped (#2494).
+    fn stash_pane_draft(&mut self, session: Uuid, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_states.get(&session) else {
+            return;
+        };
+        let editor = pane.editor.clone();
+        let draft = editor.update(cx, |ed, cx| ed.take_draft(cx));
+        self.drafts.store(session, draft);
+    }
+
+    /// The same for every pane, for a tree replaced wholesale.
+    fn stash_all_pane_drafts(&mut self, cx: &mut Context<Self>) {
+        let sessions: Vec<Uuid> = self.pane_states.keys().copied().collect();
+        for session in sessions {
+            self.stash_pane_draft(session, cx);
+        }
+    }
+
     /// Keep the chat on a leaf of the tree (#2472). A first open starts the
     /// tree; a plain switch moves the chat's own leaf to the new session;
     /// opening a session another pane already shows moves it into the chat and
     /// closes that pane, so one session never sits in two leaves.
-    fn adopt_chat_leaf(&mut self, previous: Option<Uuid>, id: Uuid) {
-        self.place_chat_leaf(previous, id);
+    fn adopt_chat_leaf(&mut self, previous: Option<Uuid>, id: Uuid, cx: &mut Context<Self>) {
+        self.place_chat_leaf(previous, id, cx);
         // The chat's leaf is part of the saved layout, so every path that
         // moves it writes the tree, the one-pane case included (#2675).
         self.persist_layout();
@@ -2629,19 +3262,22 @@ impl Dashboard {
 
     /// The body of `adopt_chat_leaf`. It writes nothing, so the caller can
     /// save once, whichever path the switch took.
-    fn place_chat_leaf(&mut self, previous: Option<Uuid>, id: Uuid) {
+    fn place_chat_leaf(&mut self, previous: Option<Uuid>, id: Uuid, cx: &mut Context<Self>) {
         let Some(tree) = self.panes.as_mut() else {
             self.panes = Some(PaneTree::leaf(id));
             return;
         };
         if tree.contains(id) {
-            self.pane_states.remove(&id);
+            // The tree work first, so the borrow of `self.panes` ends before
+            // the pane's draft is filed.
             if let Some(was) = previous
                 && was != id
                 && tree.leaves().len() > 1
             {
                 tree.close(was);
             }
+            self.stash_pane_draft(id, cx);
+            self.pane_states.remove(&id);
             return;
         }
         if let Some(was) = previous
@@ -2650,6 +3286,7 @@ impl Dashboard {
             return;
         }
         self.panes = Some(PaneTree::leaf(id));
+        self.stash_all_pane_drafts(cx);
         self.pane_states.clear();
     }
 
@@ -2734,6 +3371,7 @@ impl Dashboard {
                     session,
                     "[SYSTEM: Compact context now. Summarize this conversation for continuity.]"
                         .to_string(),
+                    Some("/compact".to_string()),
                     cx,
                 );
                 self.live
@@ -2744,7 +3382,13 @@ impl Dashboard {
             C::Cowork => {
                 // No screen in either frontend: the agent calls the tool that
                 // builds the deep link, exactly as the terminal asks it to.
-                self.send_command_turn(session, text_commands::cowork_prompt(&arg), cx);
+                let shown = format!("/cowork {arg}");
+                self.send_command_turn(
+                    session,
+                    text_commands::cowork_prompt(&arg),
+                    Some(shown.trim_end().to_string()),
+                    cx,
+                );
             }
             C::Goal => {
                 if opencrabs::brain::goal::is_bare(&arg) {
@@ -2755,9 +3399,11 @@ impl Dashboard {
                         .push(opencrabs::brain::goal::goal_usage_warning());
                     cx.notify();
                 } else {
+                    let shown = format!("/goal {arg}");
                     self.send_command_turn(
                         session,
                         opencrabs::brain::goal::goal_command_prompt(&arg),
+                        Some(shown.trim_end().to_string()),
                         cx,
                     );
                 }
@@ -2839,6 +3485,12 @@ impl Dashboard {
             &mut self.rail_focused,
             &mut self.sessions,
         );
+        // Closing bumps the deep-search generation so a query still in flight
+        // bows out instead of repopulating a rail that is no longer shown
+        // (#2720).
+        if !open {
+            self.rail_find_gen = self.rail_find_gen.wrapping_add(1);
+        }
         // Both directions move the keyboard: opening hands it to the list,
         // closing gives it back to the input (#2665).
         self.refocus_screen();
@@ -2883,6 +3535,14 @@ impl Dashboard {
     /// same wording. The pane stops claiming a turn is running the moment the
     /// user asks, and the service's own failure event lands afterwards.
     fn stop_turn(&mut self, cx: &mut Context<Self>) {
+        // A stop ends the offer too (#2708): the turn that made the buttons is
+        // gone, so they can only send a follow-up nobody asked for.
+        for sid in [self.focused_pane(), self.transcript.session]
+            .into_iter()
+            .flatten()
+        {
+            agent_bridge::options_take(sid);
+        }
         // A split leaf runs its own turn, so `/stop` reaches the pane the
         // keyboard is on before it reports nothing to stop (#2614).
         if self.cancel_focused_pane_turn("/stop", cx) {
@@ -3981,6 +4641,7 @@ impl Dashboard {
     fn close_themes(&mut self, cx: &mut Context<Self>) {
         self.themes_drag = None;
         self.themes_open = false;
+        self.fonts_open = false;
         palette::adopt(palette::saved());
         self.refocus_overlay();
         cx.notify();
@@ -4002,7 +4663,16 @@ impl Dashboard {
         let count = themes_view::cards().len().max(1);
         let here = self.themes_card.min(count - 1);
         match ks.key.as_str() {
-            "escape" => self.close_themes(cx),
+            "escape" => {
+                // The font list is the innermost surface, so Escape closes it
+                // before the modal (#2786).
+                if self.fonts_open {
+                    self.fonts_open = false;
+                    cx.notify();
+                } else {
+                    self.close_themes(cx);
+                }
+            }
             "left" | "up" => {
                 self.themes_card = (here + count - 1) % count;
                 self.preview_card_at(self.themes_card, cx);
@@ -4282,16 +4952,87 @@ impl Dashboard {
                 ))
                 .into_any_element()
         });
+        // The font row (#2786): the family in force, and the machine's
+        // families under it once the row is opened. The rows are built here
+        // because only this `cx` can mint a click listener, and only while the
+        // list is open: the catalog is the whole machine, so a closed row must
+        // not build three hundred elements on every frame.
+        let shown = palette::current();
+        let current_font = fonts::current_ui();
+        let font_picks: Vec<Stateful<Div>> = if self.fonts_open {
+            fonts::picker_rows()
+                .into_iter()
+                .map(|family| {
+                    let selected = family.eq_ignore_ascii_case(&current_font);
+                    // The id and the label are read before the family moves
+                    // into the listener, which is the only thing that needs it
+                    // after the row is built.
+                    let id = SharedString::from(format!("theme-font-{family}"));
+                    let label = SharedString::from(gui_font::row_label(&family));
+                    let pick = cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
+                        this.pick_font(&family, cx);
+                    });
+                    div()
+                        .id(id)
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgb(shown.panel_hi)))
+                        .text_xs()
+                        .text_color(rgb(if selected {
+                            shown.accent
+                        } else {
+                            shown.text_normal
+                        }))
+                        .child(label)
+                        .on_click(pick)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let font_toggle = cx.listener(|this, _ev: &ClickEvent, _window, cx| {
+            this.toggle_fonts(cx);
+        });
+        let font_row =
+            themes_view::font_row(&current_font, self.fonts_open, font_toggle, font_picks);
         let dismiss = cx.listener(|this, _ev: &ClickEvent, _window, cx| {
             this.close_themes(cx);
         });
         themes_view::modal(
             cards,
             accent_row,
+            font_row,
             "A click saves the card at once; the arrows walk them and Enter picks.",
             dismiss,
         )
         .into_any_element()
+    }
+
+    /// Open or close the font list under the theme cards (#2786).
+    fn toggle_fonts(&mut self, cx: &mut Context<Self>) {
+        self.fonts_open = !self.fonts_open;
+        cx.notify();
+    }
+
+    /// Keep a family from the font list (#2786). A pick saves at once, the way
+    /// a theme card does, and closes the list so the modal stays the size it
+    /// was. The whole window repaints in the new family on the next frame.
+    fn pick_font(&mut self, family: &str, cx: &mut Context<Self>) {
+        match fonts::keep_ui(family) {
+            Ok(()) => logging::info(&format!(
+                "fonts: kept '{}' as [gui] font",
+                fonts::current_ui()
+            )),
+            Err(e) => logging::error(&format!("fonts: could not save '{family}': {e}")),
+        }
+        self.fonts_open = false;
+        cx.notify();
     }
 
     /// `/cd` with no argument: the directory picker screen (#2527). The
@@ -4448,6 +5189,11 @@ impl Dashboard {
     fn close_rail_filter(&mut self, cx: &mut Context<Self>) {
         self.sessions.filter.clear();
         self.sessions.filter_active = false;
+        // The deep hits clear with the field, and the generation bumps so a
+        // query still in flight for the old text bows out instead of landing
+        // on an empty rail (#2720).
+        self.sessions.content_matches.clear();
+        self.rail_find_gen = self.rail_find_gen.wrapping_add(1);
         self.refocus_screen();
         cx.notify();
     }
@@ -4544,11 +5290,44 @@ impl Dashboard {
             .is_some_and(|tree| tree.leaves().len() > 1)
     }
 
-    fn send_from_pane(&mut self, session: Uuid, text: String, cx: &mut Context<Self>) {
+    /// A pane's own send. `display` is the row the reader gets when the text is
+    /// scaffolding the model needs and the user does not (#2756).
+    fn send_from_pane(
+        &mut self,
+        session: Uuid,
+        text: String,
+        display: Option<String>,
+        origin: SendOrigin,
+        cx: &mut Context<Self>,
+    ) {
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
         }
+        // A send under an open overlay is the composer answering keys nobody
+        // gave it (#2767). The caret repair keeps the composer out of the
+        // dispatch path, and this refuses the one path that got around it: a
+        // name typed into the topic prompt was submitted here instead, so the
+        // topic was never created and the name reached the agent as a message.
+        // Only a composer's own send is that case. The window mints turns of
+        // its own for a named session (the plan card's Approve and Discard,
+        // a command's reply turn), and chrome is not theirs to refuse: a plan
+        // waiting on approval kept its tap landing nowhere while the overlay
+        // that ate it stayed up.
+        let overlays = self.open_overlays();
+        if origin == SendOrigin::Composer
+            && !overlays.is_empty()
+            && matches!(self.screen, Screen::Chat)
+        {
+            logging::debug(&format!(
+                "send refused: {:?} owns the keyboard",
+                overlays.last()
+            ));
+            return;
+        }
+        // A send ends that pane's offer, the same rule the window's own
+        // composer follows (#2708).
+        agent_bridge::options_take(session);
         // A slash line is a screen command: `/help`, `/models` and `/sessions`
         // read and write the window's own chrome, so they run there and the
         // leaf is left where it is. A prompt is the pane's own turn (#2614).
@@ -4590,19 +5369,20 @@ impl Dashboard {
             return;
         };
         if pane_busy {
-            agent_bridge::queue_push(session, agent_bridge::PendingMessage::plain(text));
+            agent_bridge::queue_push(session, Self::pending_message(text, display.clone()));
             cx.notify();
             return;
         }
         let Some(bridge) = agent_bridge::bridge() else {
-            agent_bridge::queue_push(session, agent_bridge::PendingMessage::plain(text));
+            agent_bridge::queue_push(session, Self::pending_message(text, display.clone()));
             cx.notify();
             return;
         };
         let cancel = tokio_util::sync::CancellationToken::new();
+        let shown = display.clone().unwrap_or_else(|| text.clone());
         if let Some(pane) = self.pane_states.get_mut(&session) {
             pane.live = transcript::LiveTurn::default();
-            pane.live.begin(text.clone());
+            pane.live.begin(shown);
             pane.transcript.live_expanded = false;
             pane.busy = true;
             pane.cancel = Some(cancel.clone());
@@ -4617,6 +5397,7 @@ impl Dashboard {
             bridge.service.clone(),
             session,
             text,
+            display,
             self.sink.clone(),
             cancel,
         );
@@ -4626,6 +5407,34 @@ impl Dashboard {
         cx.notify();
     }
 
+    /// What this session's card should say it is doing right now (#2718), from
+    /// whichever owner holds its turn: a split leaf, a turn parked under a
+    /// conversation the user switched away from, the open turn, or a turn
+    /// running with no leaf at all. `None` when nothing is in flight, so the
+    /// card keeps the message the ledger holds.
+    ///
+    /// The four sources are checked in that order because a session can only
+    /// be in one of them, and the ones that own a card of their own are more
+    /// specific than the rail's own map.
+    fn rail_activity_for(&self, id: Uuid) -> Option<SharedString> {
+        let line = |live: &transcript::LiveTurn| {
+            let text = rail_activity_line(live);
+            (!text.is_empty()).then(|| SharedString::from(text))
+        };
+        if let Some(pane) = self.pane_states.get(&id)
+            && pane.busy
+        {
+            return line(&pane.live);
+        }
+        if let Some(turn) = self.stashed.get(&id) {
+            return line(&turn.live);
+        }
+        if self.busy && self.transcript.session == Some(id) {
+            return line(&self.live);
+        }
+        self.rail_live.get(&id).and_then(line)
+    }
+
     /// The progress of a pane's own turn, folded into that leaf's card
     /// (#2614). The window's live state is untouched: a split shows two turns
     /// streaming at once without either one bleeding into the other.
@@ -4633,10 +5442,11 @@ impl Dashboard {
         &mut self,
         session: Uuid,
         progress: opencrabs::brain::agent::ProgressEvent,
+        at: std::time::Instant,
         cx: &mut Context<Self>,
     ) {
         if let Some(pane) = self.pane_states.get_mut(&session) {
-            fold_live(&mut pane.live, progress);
+            fold_live(&mut pane.live, progress, at);
             // Rows landing under a reader who scrolled up must not drag them
             // back to the bottom (#2685, #2698).
             Self::snap_pane_if_following(pane);
@@ -4648,16 +5458,44 @@ impl Dashboard {
         // the frame the switch left: opening it again shows the tool rows and
         // the counter the turn actually reached, not a stale snapshot.
         if let Some(turn) = self.stashed.get_mut(&session) {
-            fold_live(&mut turn.live, progress);
+            fold_live(&mut turn.live, progress, at);
             cx.notify();
             return;
         }
         // A session with no leaf is what a sub-agent looks like: its
         // progress arrives with its own id and there is no pane to fold it
         // into. The event is the only trace of that turn the window holds,
-        // so the rail records it here instead of dropping it (#2636). A
-        // repeat does not repaint: only the first sighting changes a row.
-        if self.rail.observe_stream(session) {
+        // so the rail records it here instead of dropping it (#2636).
+        //
+        // The card also keeps the event, not just a flag (#2718): with no
+        // message persisted yet, a card that only knows "streaming" shows the
+        // last thing said in a previous turn, or nothing at all, while the
+        // turn is running tool calls. The same fold the panes use gives the
+        // card a line that is true right now.
+        let first = self.rail.observe_stream(session);
+        // Read the line before folding and after it, so the repaint happens
+        // when the sentence the card shows actually changes. The first
+        // sighting always repaints; a repeat that leaves the line alone does
+        // not (#2636), and one that moves the turn from a finished call to the
+        // next one does, or the card would freeze on the first tool it saw.
+        let before = self
+            .rail_live
+            .get(&session)
+            .map(rail_activity_line)
+            .unwrap_or_default();
+        match self.rail_live.get_mut(&session) {
+            Some(live) => fold_live(live, progress, at),
+            None => {
+                let mut live = transcript::LiveTurn::default();
+                fold_live(&mut live, progress, at);
+                self.rail_live.insert(session, live);
+            }
+        }
+        let moved = self
+            .rail_live
+            .get(&session)
+            .is_some_and(|live| rail_activity_line(live) != before);
+        if first || moved {
             cx.notify();
         }
     }
@@ -4768,6 +5606,7 @@ impl Dashboard {
             bridge.service.clone(),
             session,
             joined.context_text,
+            Some(joined.display_text),
             self.sink.clone(),
             cancel,
         );
@@ -4784,9 +5623,13 @@ impl Dashboard {
         cx.spawn(async move |this, cx| {
             let result = transcript::load_recent(db_path, session).await;
             this.update(cx, |this, cx| match result {
-                Ok((rows, total)) => {
-                    let (hidden, turns) =
-                        transcript::turns_with_metrics(&rows, total, &this.turn_metrics);
+                Ok(loaded) => {
+                    let (hidden, turns) = transcript::turns_with_origins(
+                        &loaded.rows,
+                        loaded.total,
+                        &this.turn_metrics,
+                        &loaded.origins,
+                    );
                     // The turn this leaf's card was watching has landed, so it
                     // takes the numbers it showed in flight before the rows are
                     // drawn (#2632).
@@ -4829,11 +5672,19 @@ impl Dashboard {
     /// in pane B approved B's plan and ran the seeded checklist in A. Both
     /// paths already own the queue and busy gates for their leaf, so the turn
     /// keeps the conversation it was asked for.
-    fn send_turn_to(&mut self, session: Uuid, text: String, cx: &mut Context<Self>) {
+    fn send_turn_to(
+        &mut self,
+        session: Uuid,
+        text: String,
+        display: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if Some(session) == self.transcript.session {
-            self.send_message(text, cx);
+            self.send_message_showing(text, display, cx);
         } else {
-            self.send_from_pane(session, text, cx);
+            // The window asked for this turn, not a field: the overlay gate
+            // belongs to composer sends and must not eat it (#2795).
+            self.send_from_pane(session, text, display, SendOrigin::Window, cx);
         }
     }
 
@@ -4841,17 +5692,42 @@ impl Dashboard {
     /// ran it (#2672). With no session open the window's own path keeps the
     /// text: it waits in the queue and a conversation is created, exactly as a
     /// composer send with nothing on screen does.
-    fn send_command_turn(&mut self, session: Option<Uuid>, text: String, cx: &mut Context<Self>) {
+    fn send_command_turn(
+        &mut self,
+        session: Option<Uuid>,
+        text: String,
+        display: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         match session {
-            Some(session) => self.send_turn_to(session, text, cx),
-            None => self.send_message(text, cx),
+            Some(session) => self.send_turn_to(session, text, display, cx),
+            None => self.send_message_showing(text, display, cx),
         }
     }
 
     fn send_message(&mut self, text: String, cx: &mut Context<Self>) {
+        self.send_message_showing(text, None, cx);
+    }
+
+    /// The same send, with the row history should keep when the text is a
+    /// prompt the user must not read (#2756). A command that composes a turn
+    /// passes its receipt here, so the `[SYSTEM: ...]` scaffolding stays in
+    /// the model's context and never becomes a bubble.
+    fn send_message_showing(
+        &mut self,
+        text: String,
+        display: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
+        }
+        // A send ends the offer (#2708): the buttons belonged to the turn that
+        // made them, and leaving them up over a new question would send a
+        // stale follow-up into it.
+        if let Some(sid) = self.transcript.session {
+            agent_bridge::options_take(sid);
         }
         // The composer the text came from: when it sends a recalled message,
         // that message leaves the queue with the text while the rest of its
@@ -4908,9 +5784,11 @@ impl Dashboard {
             // below, after this one, which is the order they were queued in.
             match self.transcript.session {
                 Some(sid) => {
-                    agent_bridge::queue_push(sid, agent_bridge::PendingMessage::plain(text))
+                    agent_bridge::queue_push(sid, Self::pending_message(text, display.clone()))
                 }
-                None => self.unsent.push(agent_bridge::PendingMessage::plain(text)),
+                None => self
+                    .unsent
+                    .push(Self::pending_message(text, display.clone())),
             }
             self.finish_recall(&sent_from, cx);
             // The composer now says a message is waiting on the turn, the
@@ -4922,7 +5800,8 @@ impl Dashboard {
         let Some(bridge) = agent_bridge::bridge() else {
             // Still booting: keep the message, it fires on Ready. The queue
             // strip is where the user sees it.
-            self.unsent.push(agent_bridge::PendingMessage::plain(text));
+            self.unsent
+                .push(Self::pending_message(text, display.clone()));
             self.sync_composer_hint(cx);
             cx.notify();
             return;
@@ -4931,18 +5810,24 @@ impl Dashboard {
         // is nothing to write into, so one is created and the text waits in
         // the queue rather than vanishing into a session nobody is looking at.
         let Some(sid) = self.transcript.session else {
-            self.unsent.push(agent_bridge::PendingMessage::plain(text));
+            self.unsent
+                .push(Self::pending_message(text, display.clone()));
             self.new_session(cx);
             return;
         };
-        self.live.begin(text.clone());
+        self.live
+            .begin(display.clone().unwrap_or_else(|| text.clone()));
         // A send is the reader asking for the end of the conversation (#2698).
         self.rearm_transcript_follow();
         self.transcript.live_expanded = false;
         self.settle_retries = 0;
-        // The finished turn must add one to the persisted count before the
-        // live copy may be dropped (see `reload_transcript`).
-        self.settle_expect = Some(self.transcript.turns.len() + 1);
+        self.settle_deadline = None;
+        self.settle_rechecks = 0;
+        // The finished turn must add one row to the session before the live
+        // copy may be dropped (see `reload_transcript`). Measured on the
+        // session's own row total, which never saturates the way the windowed
+        // turn count does (#2705).
+        self.settle_expect = Some(self.transcript.row_total() + 1);
         // A recalled message is the turn's own text now, so it leaves the
         // queue with it; the messages the walk took before it go back to wait
         // (#2637).
@@ -4955,11 +5840,47 @@ impl Dashboard {
         // does it (`FileService::get_or_create_file`), so the file lands in
         // the session's artifacts, not just in the message text.
         let attached = editor::marker_paths(&text);
-        agent_bridge::spawn_turn(bridge.service.clone(), sid, text, self.sink.clone(), cancel);
+        agent_bridge::spawn_turn(
+            bridge.service.clone(),
+            sid,
+            text,
+            display,
+            self.sink.clone(),
+            cancel,
+        );
         if !attached.is_empty() {
             agent_bridge::spawn_track_files(self.db_path.clone(), sid, attached);
         }
         cx.notify();
+    }
+
+    /// The two taps a plan waiting on approval offers (#2755).
+    ///
+    /// They send the literal commands the terminal and Telegram send, through
+    /// the composer path that parses them, so a tap and a typed `/execute` are
+    /// one code path and never two implementations of an approval.
+    fn plan_actions(&mut self, session: Uuid, cx: &mut Context<Self>) -> plan_strip::PlanActions {
+        let approve = cx.listener(move |this, _ev: &gpui::ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            this.send_turn_to(session, "/execute".to_string(), None, cx);
+        });
+        let discard = cx.listener(move |this, _ev: &gpui::ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            this.send_turn_to(session, "/discard".to_string(), None, cx);
+        });
+        plan_strip::PlanActions {
+            on_approve: std::rc::Rc::new(approve),
+            on_discard: std::rc::Rc::new(discard),
+        }
+    }
+
+    /// The queue entry for a send: a hidden prompt keeps its display line, so
+    /// the queue strip never reads `[SYSTEM: ...]` (#2756).
+    fn pending_message(text: String, display: Option<String>) -> agent_bridge::PendingMessage {
+        match display {
+            Some(shown) => agent_bridge::PendingMessage::system(text, shown),
+            None => agent_bridge::PendingMessage::plain(text),
+        }
     }
 
     /// Drain the bridge channel: fold progress into the live view, finalize
@@ -4976,6 +5897,9 @@ impl Dashboard {
         if models_changed {
             cx.notify();
         }
+        // Pruned even on the busy path: a flash window that closed while a
+        // turn was streaming must not keep the map alive.
+        let flash_active = self.plan_flash_active(std::time::Instant::now());
         let events = agent_bridge::drain(&self.agent_rx);
         if events.is_empty() {
             // A live turn needs a repaint even when no event arrived: that is
@@ -4992,23 +5916,48 @@ impl Dashboard {
                     .rail_activity_map()
                     .values()
                     .any(|row| row.badge.is_some() || row.ring)
+                // A rail flash is an animation of its own: the plan bar has to
+                // keep alternating orange and its resting colour while the
+                // window is open, and stop the moment it closes.
+                || flash_active
             {
-                cx.notify();
+                // Only the spinner, the clock and the flash move in this
+                // branch, so they repaint on a slower cadence than the poll
+                // itself. At 20 Hz this walked every pane's transcript five
+                // times as often as the animation needed (#2688).
+                self.anim_tick = self.anim_tick.wrapping_add(1);
+                if busy_repaint_due(self.anim_tick) {
+                    cx.notify();
+                }
             }
             return;
         }
         let mut reload: Option<Uuid> = None;
         for ev in events {
+            // The tool's follow-up offer is stored here, before the pane
+            // filter below, because it belongs to a session and not to a card
+            // (#2708). Handling it in the match further down would have sent a
+            // split leaf's offer into `fold_pane_progress` with the rest of
+            // that leaf's progress, and the pane would never draw it.
+            if let agent_bridge::TurnEvent::ProgressFor(
+                sid,
+                ProgressEvent::SuggestedOptions(items),
+                _,
+            ) = &ev
+            {
+                agent_bridge::set_options(*sid, items.clone());
+                cx.notify();
+            }
             // A split leaf runs its own turn (#2614), so its progress paints
             // into that leaf's card. A sub-agent's session has no leaf and is
             // dropped here rather than painted into somebody else's pane.
             // This filter is also what keeps one conversation's tool rows off
             // another's card (#2616): only the session on screen reaches the
             // window's live turn below.
-            if let agent_bridge::TurnEvent::ProgressFor(sid, progress) = &ev
+            if let agent_bridge::TurnEvent::ProgressFor(sid, progress, at) = &ev
                 && self.transcript.session != Some(*sid)
             {
-                self.fold_pane_progress(*sid, progress.clone(), cx);
+                self.fold_pane_progress(*sid, progress.clone(), *at, cx);
                 continue;
             }
             match ev {
@@ -5090,8 +6039,12 @@ impl Dashboard {
                 }
                 // A text command that needs one visible turn: `/plan <query>`,
                 // `/execute` seeding the checklist, or `/goal`.
-                agent_bridge::TurnEvent::CommandTurn { session, text } => {
-                    self.send_turn_to(session, text, cx);
+                agent_bridge::TurnEvent::CommandTurn {
+                    session,
+                    text,
+                    display,
+                } => {
+                    self.send_turn_to(session, text, display, cx);
                 }
                 agent_bridge::TurnEvent::SessionDeleted(id) => {
                     logging::info(&format!("session deleted {id}"));
@@ -5225,15 +6178,24 @@ impl Dashboard {
                     }
                     cx.notify();
                 }
-                agent_bridge::TurnEvent::ProgressFor(_, ProgressEvent::Thinking) => {
+                agent_bridge::TurnEvent::ProgressFor(_, ProgressEvent::Thinking, _) => {
                     self.live.thinking = true;
                 }
-                agent_bridge::TurnEvent::ProgressFor(_, ProgressEvent::StreamingChunk { text }) => {
+                agent_bridge::TurnEvent::ProgressFor(
+                    _,
+                    ProgressEvent::StreamingChunk { text },
+                    at,
+                ) => {
                     // Counted, not just appended: the live line's token number
                     // comes from the chunk itself, so it moves as the answer
                     // streams instead of appearing with the final answer.
+                    //
+                    // Stamped with its ARRIVAL (#2703): `drain` hands this loop
+                    // a whole batch, so reading the clock here would stamp every
+                    // chunk in the batch with one instant and collapse the
+                    // window the rate is measured over.
                     self.live.thinking = false;
-                    self.live.note_chunk(&text);
+                    self.live.note_chunk_at(&text, at);
                     // The rail's preview follows the answer as it streams, at
                     // most one batched read a second.
                     self.refresh_previews_if_live(cx);
@@ -5241,6 +6203,7 @@ impl Dashboard {
                 agent_bridge::TurnEvent::ProgressFor(
                     _,
                     ProgressEvent::IntermediateText { text, reasoning },
+                    at,
                 ) => {
                     // Narration between tool calls is part of the answer the
                     // user is reading, so it joins the stream instead of
@@ -5253,7 +6216,7 @@ impl Dashboard {
                     // dedupe against what is already on screen.
                     self.live.thinking = false;
                     if let Some(reasoning) = reasoning {
-                        self.live.push_reasoning(&reasoning);
+                        self.live.push_reasoning_at(&reasoning, at);
                     }
                     self.live.push_narration(&text);
                 }
@@ -5264,6 +6227,7 @@ impl Dashboard {
                         tool_input,
                         ..
                     },
+                    _,
                 ) => {
                     self.live.thinking = false;
                     // The ledger's own wording (`tui::app::messaging`), so a
@@ -5272,12 +6236,19 @@ impl Dashboard {
                         opencrabs::tui::app::App::format_tool_description(&tool_name, &tool_input);
                     self.live
                         .push_tool(transcript::ToolCall::running(tool_name, description));
+                    // A silent tool run still moves the preview's tool line, so
+                    // the same throttled read the chunk path uses is asked for
+                    // here too. Without it a long build leaves the rail frozen
+                    // for exactly the sessions that are working longest (#762's
+                    // lesson, applied to the preview).
+                    self.refresh_previews_if_live(cx);
                 }
                 agent_bridge::TurnEvent::ProgressFor(
                     _,
                     ProgressEvent::ToolCompleted {
                         tool_name, success, ..
                     },
+                    _,
                 ) => {
                     // Close the newest open row this call opened; with no open
                     // row (an event lost across a mode switch) draw it closed
@@ -5314,11 +6285,12 @@ impl Dashboard {
                 agent_bridge::TurnEvent::ProgressFor(
                     sid,
                     ProgressEvent::QueuedUserMessage { text },
+                    _,
                 ) if self.transcript.session == Some(sid) => {
                     self.live.injected.push(text);
                     cx.notify();
                 }
-                agent_bridge::TurnEvent::ProgressFor(_, ProgressEvent::TokenCount(count)) => {
+                agent_bridge::TurnEvent::ProgressFor(_, ProgressEvent::TokenCount(count), _) => {
                     self.ctx_tokens = Some(count.min(u32::MAX as usize) as u32);
                 }
                 // A detached command's row lands synchronously, while the
@@ -5328,6 +6300,7 @@ impl Dashboard {
                 agent_bridge::TurnEvent::ProgressFor(
                     sid,
                     ProgressEvent::DetachedTaskStarted { task_id, label },
+                    _,
                 ) => {
                     if Some(sid) == self.transcript.session {
                         self.live.thinking = false;
@@ -5343,6 +6316,7 @@ impl Dashboard {
                         success,
                         elapsed_secs,
                     },
+                    _,
                 ) => {
                     // A finish with no row is not an error: the turn may have
                     // been settled, or the task outlived a restart. The receipt
@@ -5358,19 +6332,25 @@ impl Dashboard {
                 // that cannot be missed by a file read. The chime is opt-in
                 // and feature-gated, and no toast or desktop notification is
                 // raised, exactly as the terminal's arm.
-                agent_bridge::TurnEvent::ProgressFor(_, ProgressEvent::PlanCompleted { .. }) => {
+                agent_bridge::TurnEvent::ProgressFor(_, ProgressEvent::PlanCompleted { .. }, _) => {
                     Self::play_task_chime();
                 }
                 // Compaction notices and queue echoes: the phase-2 transcript
                 // mirror. They persist to the DB and show on the reload;
-                // nothing to draw live yet.
-                agent_bridge::TurnEvent::ProgressFor(_, _) => {}
+                // nothing to draw live yet. The follow-up offer is already
+                // stored further up this loop (#2708), so it reaches this
+                // catch-all spent.
+                agent_bridge::TurnEvent::ProgressFor(_, _, _) => {}
                 agent_bridge::TurnEvent::Done {
                     session,
                     content,
                     context_tokens,
                     tokens_per_second,
                 } => {
+                    // The card's live line belongs to this turn (#2718), so
+                    // it retires with it: the preview under it is the ledger's
+                    // and stops representing the turn the moment it settles.
+                    self.rail_live.remove(&session);
                     // A settled turn is what moves a row up the rail (#2666).
                     // The ledger bumps `updated_at` beside the message insert
                     // and the rail paints that order, so without a refetch
@@ -5418,6 +6398,11 @@ impl Dashboard {
                     // surface uses: the service's own tokens_per_second when
                     // it reported one, else the local active-streaming
                     // estimate. The footer and the settled card then agree.
+                    // Captured before finalize, which resets the accumulator:
+                    // the window is what turns a token count into a rate, and
+                    // a log that prints the count alone cannot tell a short
+                    // window from an inflated numerator (#2703).
+                    let active_secs = self.live.streaming_active_secs();
                     self.live.finalize(tokens_per_second);
                     // The answer stays on screen: the stream when chunks
                     // arrived, otherwise the response the turn returned. Live
@@ -5432,17 +6417,23 @@ impl Dashboard {
                     // from the log (chunks=0 means the provider never
                     // streamed, not that the window failed to draw).
                     logging::info(&format!(
-                        "turn done ({} chars, {} chunks, {} bytes, first {:?}, {}s, {} tok), reloading transcript",
+                        "turn done ({} chars, {} chunks, {} bytes, first {:?}, {}s elapsed, {:.2}s active, {} tok, rate {:.1} tok/s, service {:?}), reloading transcript",
                         content.len(),
                         self.live.chunks,
                         self.live.chunk_bytes,
                         self.live.first_chunk,
                         self.live.elapsed_secs(),
-                        self.live.tokens
+                        active_secs,
+                        self.live.tokens,
+                        self.live.tokens_per_sec(),
+                        tokens_per_second
                     ));
                     reload = self.transcript.session;
                 }
                 agent_bridge::TurnEvent::Failed { session, text } => {
+                    // Same as Done: the live line was this turn's, so it goes
+                    // with it (#2718).
+                    self.rail_live.remove(&session);
                     // A failure is still activity, so the row moves like a
                     // settled turn does (#2666).
                     self.refresh_rail(cx);
@@ -5465,14 +6456,36 @@ impl Dashboard {
                     if !self.live.is_empty() {
                         self.live.notices.push(text);
                     }
-                    // A failed turn has no ctx or rate to report; a stale
-                    // record would land on whatever turn shows up next.
+                    // A failed turn still ran, so it keeps the numbers it
+                    // actually measured instead of showing a bare clock while
+                    // its neighbours carry ctx and rate (#2705). The record is
+                    // only written when the provider streamed something: a
+                    // failure before the first call has no reading of its own,
+                    // and borrowing the previous turn's budget would be a lie.
                     self.pending_metrics.remove(&session);
+                    self.live.finalize(None);
+                    if self.live.tokens > 0
+                        && let Some(used) = self.ctx_tokens
+                    {
+                        self.pending_metrics.insert(
+                            session,
+                            transcript::TurnMetrics {
+                                ctx_used: used,
+                                ctx_max: self.ctx_max,
+                                tps: Some(f64::from(self.live.tokens_per_sec()))
+                                    .filter(|t| *t > 0.0),
+                                tool_calls: self.live.tools.len(),
+                            },
+                        );
+                    }
                     self.busy = false;
                     self.live.thinking = false;
                     reload = self.transcript.session;
                 }
                 agent_bridge::TurnEvent::Cancelled { session } => {
+                    // A stop ends the turn, so the card's live line does too
+                    // (#2718).
+                    self.rail_live.remove(&session);
                     // A stop dropped the turn where it stood (#2657), so no
                     // Done and no Failed follows. This is the settle, and it
                     // carries no text: whoever asked for the stop already said
@@ -5529,7 +6542,12 @@ impl Dashboard {
                     // was idle would look exactly like the work being lost.
                     if self.transcript.session == Some(session) {
                         self.live = transcript::LiveTurn::default();
-                        self.live.begin(user_message);
+                        // The ledger already holds this question: the process
+                        // that asked it died after writing the row. Resuming is
+                        // not a fresh send, and starting it as one stamped the
+                        // resume time, missed the row in the identity window,
+                        // and painted the question twice (#2740).
+                        self.live.resume(user_message);
                         self.busy = true;
                         self.cancel = Some(cancel);
                         // No reload here on purpose: the turn's rows are
@@ -5540,7 +6558,10 @@ impl Dashboard {
                         // parks under its own session, which is where a switch
                         // brings it back whole (#2616).
                         let mut live = transcript::LiveTurn::default();
-                        live.begin(user_message);
+                        // Same rule as the on-screen branch: the parked copy
+                        // draws a row the ledger already has, so it starts as a
+                        // resumed turn, not a fresh one (#2740).
+                        live.resume(user_message);
                         self.stashed.insert(
                             session,
                             StashedTurn {
@@ -5564,17 +6585,14 @@ impl Dashboard {
                     // the agent is told, so the work is reported instead of the
                     // window going quiet with the turn already finished.
                     //
-                    // The window runs one turn, on the conversation it has
-                    // open (`agent_bridge` module doc). A completion for any
-                    // other session is logged, not silently dropped: resuming a
-                    // session nobody is looking at needs its own queue and turn
-                    // runner, which is #2322's documented gap.
-                    if Some(session_id) != self.transcript.session {
-                        logging::warn(&format!(
-                            "background task finished on session {session_id} while session {:?} is open: not resumed",
-                            self.transcript.session
-                        ));
-                    } else if self.busy {
+                    // The completion belongs to the session that started the
+                    // task, never to whatever conversation happens to be on
+                    // screen. The terminal resumes that session wherever the
+                    // user is looking (`tui/app/state.rs`), and the window now
+                    // does the same (#2704): a session already working takes
+                    // the receipt in its queue, and an idle one starts its turn
+                    // and parks it in the stash when it is not on screen.
+                    if self.running_here(session_id) {
                         // Queue it against the session the task belongs to, in
                         // the store the agent drains, so it goes out between
                         // tool calls instead of waiting for the turn to end
@@ -5584,8 +6602,10 @@ impl Dashboard {
                             session_id,
                             agent_bridge::PendingMessage::system(context_text, display_text),
                         );
-                    } else {
+                    } else if self.transcript.session == Some(session_id) {
                         self.resume_finished_task(session_id, context_text, display_text, cx);
+                    } else {
+                        self.resume_off_screen_task(session_id, context_text, display_text, cx);
                     }
                 }
             }
@@ -5633,7 +6653,12 @@ impl Dashboard {
     /// The context-menu popover for one rail row (or topic chip), built only
     /// when that id's menu is open. Shared by full rows and chips so a chip's
     /// right-click offers the same pin / rename / split / delete picks.
-    fn rail_menu_popover_for(&self, id: Uuid, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    ///
+    /// The card opens at the press that asked for it (#2690). Rows and chips
+    /// both record their press point, so the card lands under the pointer
+    /// rather than beside the rail: a chip sits mid-row, and the row's right
+    /// edge is not where the click happened.
+    fn rail_menu_popover_for(&self, id: Uuid, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.sessions.rail_menu != Some(id) {
             return None;
         }
@@ -5664,7 +6689,23 @@ impl Dashboard {
                 sessions::menu_item(entry.label).on_click(pick)
             })
             .collect::<Vec<_>>();
-        Some(sessions::menu_popover(items))
+        // The press point is the anchor: the card opens under the pointer
+        // that asked for it, whichever row or chip that was (#2690).
+        let at = self
+            .rail_menu_at
+            .unwrap_or(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+        Some(sessions::menu_popover("rail-context-menu", items, at))
+    }
+
+    /// Drop every composer's context menu: a press outside the card is the
+    /// press that closes it (#2749). Every field is checked, because a split
+    /// pane has its own and only one of them opened the card.
+    fn close_composer_menus(&mut self, cx: &mut Context<Self>) {
+        let mut editors = vec![self.editor.clone()];
+        editors.extend(self.pane_states.values().map(|pane| pane.editor.clone()));
+        for editor in editors {
+            editor.update(cx, |editor, cx| editor.close_context_menu(cx));
+        }
     }
 
     /// The rail's badges for every row it is about to draw (#2636).
@@ -5698,6 +6739,75 @@ impl Dashboard {
             let plan = self.rail_index.evidence(id, live, now);
             let seen = plan.is_some_and(|evidence| self.rail_seen.is_seen(id, evidence.stamp));
             map.insert(id, rail_activity::row_state(live, plan, seen));
+        }
+        map
+    }
+
+    /// The rail card's plan progress for every row it is about to draw:
+    /// `(done, total)` for an approved plan with a checklist, nothing else.
+    ///
+    /// A separate pass from the badges because the idle repaint check only
+    /// asks about animation, and this question is static state. The index
+    /// already cached the paths and documents for the badge pass, so each row
+    /// here costs one `stat` at most and a parse only when the file moved.
+    /// Snapshot every session's plan progress before the rail filters (#2719).
+    /// The plan chip in `visible()` reads this map, so it must hold a row's
+    /// counts even when that row is about to be hidden: filling it from the
+    /// filtered `ordered()` would chase its own tail. The index resolves on
+    /// demand, so iterating all items warms it for the badge pass that follows.
+    fn snapshot_rail_plan_progress(&mut self) {
+        let now = std::time::Instant::now();
+        let ids: Vec<Uuid> = self.sessions.items.iter().map(|s| s.id).collect();
+        self.sessions.plan_progress.clear();
+        for id in ids {
+            if let Some(progress) = self.rail_index.progress(id, now) {
+                self.sessions.plan_progress.insert(id, progress);
+            }
+        }
+    }
+
+    fn rail_plan_progress_map(&mut self) -> HashMap<Uuid, (usize, usize)> {
+        let rows: Vec<Uuid> = self.sessions.ordered().map(|s| s.id).collect();
+        let now = std::time::Instant::now();
+        let mut map = HashMap::new();
+        for id in rows {
+            if let Some(progress) = self.rail_index.progress(id, now) {
+                map.insert(id, progress);
+            }
+        }
+        map
+    }
+
+    /// The detached commands every rail row is running, formatted once per
+    /// frame: `⏳ cargo test 32s` per session, `None` when nothing runs.
+    ///
+    /// The rail card answers "is anything still going in that conversation"
+    /// without opening it, which is the one fact a streaming spinner cannot
+    /// carry: a detached command takes the turn idle, so the row would
+    /// otherwise read as finished while a build grinds on (#762).
+    ///
+    /// Shaped by [`opencrabs::tui::render::format_background_tasks`], the same
+    /// formatter the composer strip and the terminal's footer use, so one
+    /// running task cannot read three different ways. One manager lookup for
+    /// the whole pass, never one per row.
+    fn rail_running_map(&self) -> HashMap<Uuid, SharedString> {
+        let Some(manager) = agent_bridge::bridge().and_then(|b| b.service.background_manager())
+        else {
+            return HashMap::new();
+        };
+        let mut map = HashMap::new();
+        for id in self.sessions.ordered().map(|s| s.id) {
+            let tasks: Vec<(String, u64)> = manager
+                .running_tasks(id)
+                .into_iter()
+                .map(|t| (t.label, t.started.elapsed().as_secs()))
+                .collect();
+            if let Some(line) = opencrabs::tui::render::format_background_tasks(
+                &tasks,
+                opencrabs::tui::render::LABEL_CHARS,
+            ) {
+                map.insert(id, SharedString::from(format!("\u{23f3} {line}")));
+            }
         }
         map
     }
@@ -5764,12 +6874,14 @@ impl Dashboard {
             );
             return;
         };
-        self.live.begin(display_text);
+        self.live.begin(display_text.clone());
         // A new turn re-arms the follow, the terminal's own rule (#2698).
         self.rearm_transcript_follow();
         self.transcript.live_expanded = false;
         self.settle_retries = 0;
-        self.settle_expect = Some(self.transcript.turns.len() + 1);
+        self.settle_deadline = None;
+        self.settle_rechecks = 0;
+        self.settle_expect = Some(self.transcript.row_total() + 1);
         self.busy = true;
         self.sync_composer_hint(cx);
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -5779,12 +6891,86 @@ impl Dashboard {
             bridge.service.clone(),
             session_id,
             context_text,
+            Some(display_text.clone()),
             self.sink.clone(),
             cancel,
         );
         if !attached.is_empty() {
             agent_bridge::spawn_track_files(self.db_path.clone(), session_id, attached);
         }
+        cx.notify();
+    }
+
+    /// Whether `session` already has a turn in flight in this window: the
+    /// conversation on screen while it is busy, a split leaf still working, or
+    /// a turn parked in the stash (#2704).
+    ///
+    /// A completion for one of those joins the session's queue instead of
+    /// starting a second turn over it, which is the rule the terminal applies
+    /// to its own per-session state.
+    fn running_here(&self, session: Uuid) -> bool {
+        if self.transcript.session == Some(session) && self.busy {
+            return true;
+        }
+        if self.pane_states.get(&session).is_some_and(|p| p.busy) {
+            return true;
+        }
+        self.stashed.contains_key(&session)
+    }
+
+    /// Start the turn a completion asks for on a conversation nobody is
+    /// looking at, parking its card under that session (#2704).
+    ///
+    /// The terminal resumes the owning session wherever the user is looking,
+    /// so the window does too instead of logging the receipt away. The parked
+    /// turn is the same shape a switch leaves behind (#2616): `swap_visible_turn`
+    /// brings it back whole when that conversation is opened.
+    fn resume_off_screen_task(
+        &mut self,
+        session_id: Uuid,
+        context_text: String,
+        display_text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bridge) = agent_bridge::bridge() else {
+            // Still booting: key it to the session it finished on, so it
+            // resumes when the stack is ready (#2629).
+            agent_bridge::queue_push(
+                session_id,
+                agent_bridge::PendingMessage::system(context_text, display_text),
+            );
+            return;
+        };
+        let mut live = transcript::LiveTurn::default();
+        live.begin(display_text.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.stashed.insert(
+            session_id,
+            StashedTurn {
+                live,
+                cancel: Some(cancel.clone()),
+                // The rows land under a conversation that is not on screen, so
+                // no reload has to be proven here; opening it reads them.
+                settle_expect: None,
+                settle_retries: 0,
+                ctx_tokens: None,
+            },
+        );
+        let attached = editor::marker_paths(&context_text);
+        agent_bridge::spawn_turn(
+            bridge.service.clone(),
+            session_id,
+            context_text,
+            Some(display_text.clone()),
+            self.sink.clone(),
+            cancel,
+        );
+        if !attached.is_empty() {
+            agent_bridge::spawn_track_files(self.db_path.clone(), session_id, attached);
+        }
+        // The rail says the session is working from the first frame, the same
+        // signal a visible turn gives (#2666, #2636).
+        self.refresh_rail(cx);
         cx.notify();
     }
 
@@ -5846,6 +7032,32 @@ impl Dashboard {
         out
     }
 
+    /// The offered labels as drawable rows, each minted with the session it
+    /// belongs to so a pick sends into that conversation and nowhere else
+    /// (#2708). The offer is taken as the click lands: the buttons belong to
+    /// the turn that made them, so a second press must not send a stale one.
+    fn option_rows(
+        &self,
+        session: Uuid,
+        offers: Vec<SuggestionItem>,
+        cx: &mut Context<Self>,
+    ) -> Vec<(SuggestionItem, transcript::ClickHandler)> {
+        offers
+            .into_iter()
+            .map(|item| {
+                let label = item.label.clone();
+                let pick: transcript::ClickHandler = Rc::new(cx.listener(
+                    move |this: &mut Self, _ev: &gpui::ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        agent_bridge::options_take(session);
+                        this.send_turn_to(session, label.clone(), None, cx);
+                    },
+                ));
+                (item, pick)
+            })
+            .collect()
+    }
+
     fn drain_pending(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -5892,7 +7104,9 @@ impl Dashboard {
             self.rearm_transcript_follow();
             self.transcript.live_expanded = false;
             self.settle_retries = 0;
-            self.settle_expect = Some(self.transcript.turns.len() + 1);
+            self.settle_deadline = None;
+            self.settle_rechecks = 0;
+            self.settle_expect = Some(self.transcript.row_total() + 1);
             self.busy = true;
             self.sync_composer_hint(cx);
             let cancel = tokio_util::sync::CancellationToken::new();
@@ -5902,6 +7116,7 @@ impl Dashboard {
                 bridge.service.clone(),
                 sid,
                 joined.context_text,
+                Some(joined.display_text),
                 self.sink.clone(),
                 cancel,
             );
@@ -6125,6 +7340,10 @@ impl Dashboard {
     /// local list was filtered.
     fn delete_session(&mut self, id: Uuid, cx: &mut Context<Self>) {
         agent_bridge::spawn_delete_session(self.db_path.clone(), id, self.sink.clone());
+        // A deleted conversation must not keep a draft waiting for a composer
+        // it can never reach. Its pane's editor leaves with the conversation.
+        self.drafts.remove(id);
+        self.pane_states.remove(&id);
         // The pin is part of the row: it leaves with the row.
         self.sessions.favorites.retain(|f| *f != id);
         if self.rail_actions == Some(id) {
@@ -6149,6 +7368,10 @@ impl Dashboard {
         self.topic_menu = None;
         self.topic_rename = Some(id);
         self.topic_draft = Some(current);
+        // The dialog opens on the session's own icon, so a rename that never
+        // touches the picker keeps it (#2791). No stored icon means None, and
+        // the default the badge shows is never written back over nothing.
+        self.topic_draft_icon = self.sessions.topic_icons.get(&id).cloned();
         cx.notify();
     }
 
@@ -6203,29 +7426,6 @@ impl Dashboard {
         cx.notify();
     }
 
-    /// Fold or unfold one session's topic tree (#2670). The state is re-read
-    /// from the database, so the rows follow what was actually written and a
-    /// fold made in the terminal shows here too.
-    fn toggle_fold_topic(&mut self, id: Uuid, cx: &mut Context<Self>) {
-        let collapsed = self.sessions.is_collapsed(id);
-        let db_path = self.db_path.clone();
-        cx.spawn(async move |this, cx| {
-            if let Err(e) = sessions::set_topics_collapsed(db_path, id, !collapsed).await {
-                logging::error(&format!("fold topic tree {id}: {e}"));
-                this.update(cx, |this, cx| {
-                    this.live.notices.push(format!("fold topics: {e}"));
-                    cx.notify();
-                })
-                .ok();
-                return;
-            }
-            this.update(cx, |this, cx| this.refresh_topic_state(cx))
-                .ok();
-        })
-        .detach();
-        cx.notify();
-    }
-
     /// Whether the open chat is a session with topics turned on.
     fn open_chat_topics_on(&self) -> bool {
         self.transcript
@@ -6239,6 +7439,27 @@ impl Dashboard {
     /// and refused outright when that leaf had topics off.
     fn topic_parent(&self) -> Option<Uuid> {
         self.split_focus().or(self.transcript.session)
+    }
+
+    /// The conversation a new topic would hang under, or `None` when nothing
+    /// on screen can hold one (#2605).
+    ///
+    /// [`Self::topic_parent`] answers "which pane asked". This answers "can
+    /// that pane hold a topic", and the two used to disagree: the menu offered
+    /// New topic because the chat leaf had topics on, the draft then bailed
+    /// because the focused pane did not, the menu closed, and the typed name
+    /// went to the composer and got sent as a message. A prompt that cannot
+    /// create anything must never open, so both the row and the prompt resolve
+    /// through here.
+    fn topic_draft_parent(&self) -> Option<Uuid> {
+        if let Some(id) = self.topic_parent()
+            && self.sessions.is_topic_enabled(id)
+        {
+            return Some(id);
+        }
+        self.transcript
+            .session
+            .filter(|id| self.sessions.is_topic_enabled(*id))
     }
 
     /// The chat's menu (#2480): what can be done to the conversation it
@@ -6257,7 +7478,7 @@ impl Dashboard {
         let target = self.topic_menu?;
         let is_topic = self.sessions.parents.contains_key(&target);
         let mut items: Vec<Stateful<Div>> = Vec::new();
-        if self.open_chat_topics_on() {
+        if self.topic_draft_parent().is_some() {
             let new_topic = cx.listener(|this, _ev: &ClickEvent, _window, cx| {
                 this.start_topic_draft(cx);
             });
@@ -6295,17 +7516,14 @@ impl Dashboard {
             this.request_delete(target, cx);
         });
         items.push(sessions::menu_item(delete_label).on_click(delete));
-        Some(
-            // Anchored to the column, not the transcript: the column is the
-            // positioning context that paints last. px_6 puts the card's right
-            // edge one 1.5rem in, and top_3 lines it up with the first line of
-            // the conversation now that no header sits above it (#2596).
-            sessions::menu_card("chat-menu", items)
-                .absolute()
-                .right_6()
-                .top_3()
-                .into_any_element(),
-        )
+        // Under the press that opened it (#2690), through the same popover the
+        // rail uses. The card used to sit at the column's top corner, which is
+        // where the header used to be: not where the user clicked, and in a
+        // split not even the pane whose tab was pressed.
+        let at = self
+            .topic_menu_at
+            .unwrap_or(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+        Some(sessions::menu_popover("chat-menu", items, at))
     }
 
     /// The tab strip for the open chat's topic family (#2400, #2480): `All`
@@ -6329,15 +7547,17 @@ impl Dashboard {
             return Vec::new();
         }
         // The topic store outranks the stored session name (#2490): a rename
-        // in Telegram reaches this label on the next refresh pass.
-        let title = |id: Uuid| {
+        // in Telegram reaches this label on the next refresh pass. With no live
+        // name yet, the chip strips the row's platform prefix and channel key
+        // instead of printing them (#2762).
+        let name = |id: Uuid| {
             let stored = self
                 .sessions
                 .items
                 .iter()
                 .find(|s| s.id == id)
                 .and_then(|s| s.title.as_deref());
-            rail::rail_title(
+            rail::chip_name(
                 stored,
                 self.sessions.topic_titles.get(&id).map(String::as_str),
             )
@@ -6354,63 +7574,100 @@ impl Dashboard {
         // rail the way it did before.
         let shape = topic_bar::chip_shape(self.topic_edge.is_vertical());
         let icon_rems = topic_tabs::style(self.topic_edge.is_vertical()).topic_icon_rems;
-        topic_bar::bar_entries(root, &topics)
-            .into_iter()
-            .map(|entry| {
-                let id = entry.session(root);
-                let current = entry.is_open(root, open);
-                let click = cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    match pane {
-                        Some(leaf) => this.open_topic_in_pane(leaf, id, cx),
-                        None => this.open_session(id, cx),
-                    }
-                });
-                // A right press on a tab opens the same menu the `...` draws,
-                // for the session that tab stands for (#2480). Before this it
-                // opened nothing at all, and the only way to edit a topic was
-                // to open it first and hunt the menu.
-                let open_menu = cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                    this.topic_menu = Some(id);
-                    cx.notify();
-                });
-                // `All` has the same icon slot and cell geometry as a topic.
-                let (label, picture) = match entry {
-                    topic_bar::BarEntry::All => (
-                        "All".to_string(),
-                        topic_icons::tab_icon(
-                            topic_icons::store_name("general").as_str(),
-                            icon_rems,
-                        ),
-                    ),
-                    topic_bar::BarEntry::Topic(id) => {
-                        // The icon sits before the name and is not a word, so the
-                        // two-word shortening (#2477) is applied to the name alone.
-                        // A stored picture is drawn; a stored emoji stays text (#2478).
-                        let stored = self.sessions.topic_icons.get(&id).cloned();
-                        let picture = stored
-                            .as_deref()
-                            .and_then(|stored| topic_icons::tab_icon(stored, icon_rems));
-                        let glyph = match (&picture, stored.as_deref()) {
-                            (None, Some(icon)) => Some(topic_icons::tab_glyph(icon, icon_rems)),
-                            _ => None,
-                        };
-                        (topic_label(&title(id)), picture.or(glyph))
-                    }
-                };
+        // A wide family folds its tail into one pill, and the open topic keeps
+        // its chip either way (#2762).
+        let chips: Vec<topic_bar::TopicChip> = topics
+            .iter()
+            .map(|id| topic_bar::TopicChip {
+                id: *id,
+                activity: self.topic_is_busy(*id),
+            })
+            .collect();
+        let plan = topic_bar::bar_plan(root, open, &chips, topic_bar::BAR_TOPICS_SHOWN);
+        let mut cells: Vec<AnyElement> = Vec::with_capacity(plan.entries.len() + 1);
+        for entry in plan.entries {
+            let id = entry.session(root);
+            let current = entry.is_open(root, open);
+            let click = cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                match pane {
+                    Some(leaf) => this.open_topic_in_pane(leaf, id, cx),
+                    None => this.open_session(id, cx),
+                }
+            });
+            // A right press on a tab opens the same menu the `...` draws,
+            // for the session that tab stands for (#2480). Before this it
+            // opened nothing at all, and the only way to edit a topic was
+            // to open it first and hunt the menu.
+            let open_menu = cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+                this.topic_menu = Some(id);
+                // The press point, so the card opens under the click rather
+                // than at the column's top corner (#2690).
+                this.topic_menu_at = Some(ev.position);
+                cx.notify();
+            });
+            // A busy topic is marked with a dot, the same signal the rail uses
+            // for work in flight.
+            let activity = chips.iter().any(|chip| chip.id == id && chip.activity);
+            // `All` has the same icon slot and cell geometry as a topic.
+            let (label, picture) = match entry {
+                topic_bar::BarEntry::All => (
+                    "All".to_string(),
+                    topic_icons::tab_icon(topic_icons::store_name("general").as_str(), icon_rems),
+                ),
+                topic_bar::BarEntry::Topic(id) => {
+                    // The icon sits before the name and is not a word, so the
+                    // two-word shortening (#2477) is applied to the name alone.
+                    // A stored picture is drawn; a stored emoji stays text (#2478).
+                    // A custom image resolves from the view's cache before the
+                    // text fallback, so an img: reference never prints as a
+                    // label (#2790).
+                    let stored = self.sessions.topic_icons.get(&id).cloned();
+                    let picture = stored.as_deref().and_then(|stored| {
+                        topic_icons::tab_icon(stored, icon_rems)
+                            .or_else(|| self.custom_icon_picture(stored, icon_rems))
+                    });
+                    let glyph = match (&picture, stored.as_deref()) {
+                        (None, Some(icon)) if !icon.starts_with(topic_icons::IMG_PREFIX) => {
+                            Some(topic_icons::tab_glyph(icon, icon_rems))
+                        }
+                        _ => None,
+                    };
+                    (topic_label(&name(id)), picture.or(glyph))
+                }
+            };
+            cells.push(
                 topic_tab(
                     id,
                     label,
                     picture,
                     shape,
                     current,
+                    activity,
                     move |ev, window, app| click(ev, window, app),
                     move |ev, window, app| open_menu(ev, window, app),
                 )
-                .into_any_element()
-            })
-            .collect()
+                .into_any_element(),
+            );
+        }
+        if let Some(overflow) = plan.overflow {
+            cells.push(overflow_chip(topic_bar::overflow_label(&overflow), shape));
+        }
+        cells
+    }
+
+    /// Whether a turn is in flight in one topic (#2762).
+    ///
+    /// A leaf drawing that session knows outright. The window's own chat knows
+    /// for the conversation it has open. For a topic nobody is drawing there is
+    /// no signal: the store keeps no per-topic unread count, so the chip stays
+    /// quiet rather than inventing one.
+    fn topic_is_busy(&self, id: Uuid) -> bool {
+        match self.pane_states.get(&id) {
+            Some(pane) => pane.busy,
+            None => self.busy && self.transcript.session == Some(id),
+        }
     }
 
     /// Open the name prompt for a new topic under the open session (#2303).
@@ -6424,13 +7681,19 @@ impl Dashboard {
     }
 
     fn start_topic_draft(&mut self, cx: &mut Context<Self>) {
-        let topics_on = self
-            .topic_parent()
-            .is_some_and(|id| self.sessions.is_topic_enabled(id));
-        if !topics_on {
-            // Loud on purpose: this guard swallowed the seeker's pick with no
-            // trace, which made a working row look like a dead click (#2604).
-            logging::debug("topic draft: the open conversation has topics off");
+        if self.topic_draft_parent().is_none() {
+            // Nothing on screen can hold a topic. Say so and drop the menu in
+            // the same breath: the old guard returned with the menu already
+            // gone and no overlay owning the keys, so the typed name and its
+            // Enter fell through to the composer and were sent as a message
+            // (#2605). A prompt that cannot create anything never opens.
+            logging::debug("topic draft: no conversation here can hold topics");
+            self.topic_menu = None;
+            self.live
+                .notices
+                .push("topics are off for this conversation".to_string());
+            self.refocus_screen();
+            cx.notify();
             return;
         }
         self.topic_draft_icon = None;
@@ -6457,13 +7720,36 @@ impl Dashboard {
         // A rename prompt renames the topic in place and changes nothing else.
         if let Some(target) = self.topic_rename {
             let db_path = self.db_path.clone();
+            // The icon rides along with the rename (#2791): the draft was
+            // seeded from the stored value, so only a real change writes.
+            let stored_icon = self.sessions.topic_icons.get(&target).cloned();
+            let draft_icon = self.topic_draft_icon.clone();
             cx.spawn(async move |this, cx| {
-                match sessions::rename_session(db_path, target, name).await {
+                match sessions::rename_session(db_path.clone(), target, name).await {
                     Ok(()) => {
+                        let icon_err = if sessions::icon_write_needed(
+                            stored_icon.as_deref(),
+                            draft_icon.as_deref(),
+                        ) {
+                            sessions::set_topic_icon(db_path, target, draft_icon)
+                                .await
+                                .err()
+                        } else {
+                            None
+                        };
                         this.update(cx, |this, cx| {
+                            if let Some(e) = icon_err {
+                                logging::error(&format!("rename icon {target}: {e}"));
+                                this.live.notices.push(format!("rename icon: {e}"));
+                            }
                             this.topic_draft = None;
                             this.topic_rename = None;
+                            this.topic_draft_icon = None;
                             this.refresh_rail(cx);
+                            // The stored icon may have changed, so the tabs
+                            // and the rail read it back with the rest of the
+                            // topic state, images included (#2791).
+                            this.refresh_topic_state(cx);
                             // The prompt closed, so the caret goes back to the
                             // input the rename was asked from (#2665).
                             this.rail_focused = false;
@@ -6486,7 +7772,7 @@ impl Dashboard {
             cx.notify();
             return;
         }
-        let Some(parent) = self.topic_parent() else {
+        let Some(parent) = self.topic_draft_parent() else {
             return;
         };
         let db_path = self.db_path.clone();
@@ -6495,7 +7781,24 @@ impl Dashboard {
             .clone()
             .unwrap_or_else(|| DEFAULT_TOPIC_ICON.to_string());
         cx.spawn(async move |this, cx| {
-            match sessions::create_topic(db_path.clone(), parent, name).await {
+            // A Telegram forum gets a real forum thread before anything local
+            // happens (#2762). Only the Bot API can make a topic, and the
+            // thread id it returns is the key the bridge looks the session up
+            // by, so a row written without it is a topic the chat never sees.
+            // `Ok(None)` keeps the ordinary local path; `Err` is reported,
+            // never papered over with a local-only row.
+            let created = match telegram_topics::create_forum_topic_if_forum(
+                db_path.clone(),
+                parent,
+                name.clone(),
+            )
+            .await
+            {
+                Ok(Some(topic)) => Ok(topic),
+                Ok(None) => sessions::create_topic(db_path.clone(), parent, name).await,
+                Err(e) => Err(e),
+            };
+            match created {
                 Ok(topic) => {
                     if let Err(e) = sessions::set_topic_icon(db_path, topic, Some(icon)).await {
                         logging::error(&format!("topic icon {topic}: {e}"));
@@ -6637,17 +7940,12 @@ impl Dashboard {
         cx.spawn(async move |this, cx| {
             let parents = sessions::load_topic_parents(db_path.clone()).await;
             let closed = sessions::load_closed(db_path.clone()).await;
-            let collapsed = sessions::load_collapsed(db_path.clone()).await;
             let icons = sessions::load_topic_icons(db_path.clone()).await;
             let topics = sessions::load_topics(db_path).await;
             this.update(cx, |this, cx| {
                 match closed {
                     Ok(ids) => this.sessions.closed = ids.into_iter().collect(),
                     Err(e) => logging::error(&format!("closed refresh: {e}")),
-                }
-                match collapsed {
-                    Ok(ids) => this.sessions.collapsed = ids.into_iter().collect(),
-                    Err(e) => logging::error(&format!("collapsed refresh: {e}")),
                 }
                 match parents {
                     Ok(pairs) => this.sessions.parents = pairs.into_iter().collect(),
@@ -6661,11 +7959,121 @@ impl Dashboard {
                     Ok(pairs) => this.sessions.topic_icons = pairs.into_iter().collect(),
                     Err(e) => logging::error(&format!("topic icons refresh: {e}")),
                 }
+                // The custom images follow the stored values, so a rename
+                // that writes one reaches the rail without a restart (#2790).
+                this.refresh_icon_images();
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Re-read the custom icon images the rail and tabs draw (#2790). One
+    /// file read per icon, at refresh time; the paint only clones an Arc.
+    /// A missing or undecodable file logs and drops out, so the row falls
+    /// back to its platform mark instead of drawing a blank box.
+    fn refresh_icon_images(&mut self) {
+        let mut images = HashMap::new();
+        for stored in self.sessions.topic_icons.values() {
+            let Some(path) = topic_icons::stored_image_path(stored) else {
+                continue;
+            };
+            let Some(format) = topic_icons::image_format(stored) else {
+                continue;
+            };
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    images.insert(stored.clone(), Arc::new(Image::from_bytes(format, bytes)));
+                }
+                Err(e) => logging::error(&format!("icon image {stored}: {e}")),
+            }
+        }
+        self.icon_images = images;
+    }
+
+    /// The cached picture for a stored `img:` value, or None for anything
+    /// else (#2790). Never reads a file: the cache is filled at refresh
+    /// time and when an image is picked.
+    fn custom_icon_picture(&self, stored: &str, size: f32) -> Option<AnyElement> {
+        let image = self.icon_images.get(stored)?;
+        Some(topic_icons::cached_picture(image.clone(), size))
+    }
+
+    /// The icon picker's "add image" cell: the platform's own file picker,
+    /// then a validated copy into the icon store (#2790). A cancelled
+    /// prompt changes nothing.
+    fn pick_icon_image(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose an icon image".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.first().cloned() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.attach_icon_image(path, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Validate one picked file and store it as the draft's icon (#2790).
+    /// The copy gets a fresh uuid name, so two picks of the same file never
+    /// fight over one slot and an old icon stays untouched until the rename
+    /// is submitted. Failures land in the notices, never silent.
+    fn attach_icon_image(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                self.live.notices.push(format!("icon image: {e}"));
+                cx.notify();
+                return;
+            }
+        };
+        if !topic_icons::image_pick_allowed(&path, meta.len()) {
+            self.live.notices.push(
+                "icon image: pick a png, jpg, webp, gif, bmp, tiff or svg under 5MB".to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.live.notices.push(format!("icon image: {e}"));
+                cx.notify();
+                return;
+            }
+        };
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png")
+            .to_ascii_lowercase();
+        let filename = format!("{}.{ext}", uuid::Uuid::new_v4());
+        let dir = topic_icons::image_store_dir();
+        if let Err(e) =
+            std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join(&filename), &bytes))
+        {
+            self.live.notices.push(format!("icon image: {e}"));
+            cx.notify();
+            return;
+        }
+        let stored = topic_icons::img_store_name(&filename);
+        if let Some(format) = topic_icons::image_format(&filename) {
+            self.icon_images
+                .insert(stored.clone(), Arc::new(Image::from_bytes(format, bytes)));
+        }
+        self.topic_draft_icon = Some(stored);
+        cx.notify();
     }
 
     /// Refetch the rail from the ledger. The pinned set rides along: pins come
@@ -6738,10 +8146,17 @@ impl Dashboard {
     }
 
     /// Keep a running conversation's preview warm without hammering the DB:
-    /// at most one read a second, and only while something is streaming. The
-    /// chunk event is the trigger, so no timer is added for this.
+    /// at most one read a second, and only while a turn can still move the
+    /// line. The chunk and tool events are the triggers, so no timer is added
+    /// for this.
     fn refresh_previews_if_live(&mut self, cx: &mut Context<Self>) {
-        if self.rail.streaming_count() == 0 {
+        // A parked turn is still working even though its progress is not
+        // reaching the rail set.
+        let stashed_live = self
+            .stashed
+            .values()
+            .any(|t| t.live.user.is_some() || !t.live.tools.is_empty());
+        if !previews_can_move(self.busy, stashed_live, self.rail.streaming_count()) {
             return;
         }
         if self
@@ -6752,6 +8167,145 @@ impl Dashboard {
         }
         self.preview_refreshed_at = Some(std::time::Instant::now());
         self.refresh_previews(cx);
+    }
+
+    /// ctrl+f's deep search (#2720): let the typing settle, then read which
+    /// sessions mention the query in their messages, off the paint path. Each
+    /// call bumps the generation and the spawned query carries it; a result
+    /// only lands when the generation still matches, so the newest text wins
+    /// even when an older query finishes last (the notice timer's trick,
+    /// editor.rs). An empty field clears the hits at once and spawns nothing.
+    fn schedule_rail_find(&mut self, cx: &mut Context<Self>) {
+        let query = self.sessions.filter.trim().to_string();
+        self.rail_find_gen = self.rail_find_gen.wrapping_add(1);
+        let generation = self.rail_find_gen;
+        if query.is_empty() {
+            self.sessions.content_matches.clear();
+            cx.notify();
+            return;
+        }
+        let db_path = self.db_path.clone();
+        cx.spawn(async move |this, cx| {
+            // A burst of keystrokes costs one query, not one per character.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            // A newer keystroke or a closed rail already moved the generation
+            // on: this query is stale, so it never touches the database.
+            let stale = this
+                .update(cx, |this, _| this.rail_find_gen != generation)
+                .unwrap_or(true);
+            if stale {
+                return;
+            }
+            match sessions::load_content_matches(db_path, query).await {
+                Ok(rows) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.rail_find_gen == generation {
+                            this.apply_rail_find(rows);
+                            cx.notify();
+                        }
+                    });
+                }
+                Err(e) => logging::error(&format!("rail find: {e}")),
+            }
+        })
+        .detach();
+    }
+
+    /// Fold the content rows into the rail's deep-hit map (#2720): title
+    /// matches lead in ledger order, content-only sessions follow with their
+    /// snippet, and a session found both ways appears once. Only the
+    /// snippet-bearing rows are kept here; `visible()` already holds the title
+    /// matches on screen through `matches`, so this map is purely the deep
+    /// hits and the snippets that stand in for their previews.
+    fn apply_rail_find(&mut self, content: Vec<opencrabs::db::repository::ContentSearchRow>) {
+        let title_ids: Vec<Uuid> = self
+            .sessions
+            .items
+            .iter()
+            .filter(|s| sessions::matches(s, &self.sessions.filter))
+            .map(|s| s.id)
+            .collect();
+        let merged = sessions::merge_find_results(title_ids, &content);
+        self.sessions.content_matches = merged
+            .into_iter()
+            .filter_map(|m| m.snippet.map(|snippet| (m.session_id, snippet)))
+            .collect();
+    }
+
+    /// Schedule a deep read only when the trimmed query actually changed
+    /// (#2721). Both typing (finder_key) and the editing chords
+    /// (apply_finder_edit) funnel here, while caret moves and arrows leave the
+    /// query untouched and so never rebuild the catalog.
+    fn seeker_find_if_changed(&mut self, cx: &mut Context<Self>) {
+        let query = self
+            .finder
+            .as_ref()
+            .map(|state| state.query().trim().to_string())
+            .unwrap_or_default();
+        if query == self.seeker_scheduled_query {
+            return;
+        }
+        self.seeker_scheduled_query = query;
+        self.schedule_seeker_find(cx);
+    }
+
+    /// Seeker deep search (#2721): let the typing settle, then read which
+    /// sessions mention the query in their messages and rebuild the card's
+    /// rows with the snippets. Same generation guard as the rail's ctrl+f, so
+    /// the newest query wins even when an older read finishes last. A cached
+    /// query rebuilds at once; an empty query needs no read.
+    fn schedule_seeker_find(&mut self, cx: &mut Context<Self>) {
+        let query = self
+            .finder
+            .as_ref()
+            .map(|state| state.query().trim().to_string())
+            .unwrap_or_default();
+        if query.is_empty() {
+            return;
+        }
+        if self.seeker_find.contains_key(&query) {
+            self.refresh_seeker_items(cx);
+            return;
+        }
+        self.seeker_find_gen = self.seeker_find_gen.wrapping_add(1);
+        let generation = self.seeker_find_gen;
+        let db_path = self.db_path.clone();
+        cx.spawn(async move |this, cx| {
+            // A burst of keystrokes costs one query, not one per character.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            let stale = this
+                .update(cx, |this, _| this.seeker_find_gen != generation)
+                .unwrap_or(true);
+            if stale {
+                return;
+            }
+            match sessions::load_content_matches(db_path, query.clone()).await {
+                Ok(rows) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.seeker_find_gen == generation {
+                            this.seeker_find.insert(query, rows);
+                            this.refresh_seeker_items(cx);
+                        }
+                    });
+                }
+                Err(e) => logging::error(&format!("seeker find: {e}")),
+            }
+        })
+        .detach();
+    }
+
+    /// Rebuild the open Seeker's rows from the current catalog (which now
+    /// folds in any cached content hits) without touching the query or caret.
+    fn refresh_seeker_items(&mut self, cx: &mut Context<Self>) {
+        let items = self.finder_items();
+        if let Some(state) = self.finder.as_mut() {
+            state.refresh_items(items);
+        }
+        cx.notify();
     }
 
     /// The bar that stands where the composer stands in select mode (#2613):
@@ -7030,12 +8584,14 @@ impl Dashboard {
             .collect()
     }
 
-    /// Open the message menu on a stored row (#2613).
-    fn msg_menu_open(&mut self, id: Uuid, cx: &mut Context<Self>) {
+    /// Open the message menu on a stored row (#2613), at the press that
+    /// asked for it (#2690).
+    fn msg_menu_open(&mut self, id: Uuid, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
         // One menu at a time: the rail's open menu closes, and so does any
         // other row's.
         self.sessions.close_rail_menu();
         self.msg_menu = Some(id);
+        self.msg_menu_at = Some(at);
         cx.notify();
     }
 
@@ -7315,10 +8871,18 @@ impl Dashboard {
     /// stays until the fetch returns a transcript that includes it.
     fn reload_transcript(&mut self, sid: Uuid, cx: &mut Context<Self>) {
         let db_path = self.db_path.clone();
-        // The turn that just finished should add one to the turn count. A
-        // reload that comes back short is a write that has not landed yet.
+        // The turn that just finished should add at least one row to the
+        // session. A reload that comes back short is a write that has not
+        // landed yet. The count is the session's own row total, so a
+        // conversation past the display window settles like any other (#2705).
         let expect = self.settle_expect;
         let attempt = self.settle_retries;
+        // The budget starts at the first read that found the rows short, not
+        // when the question was sent: it measures the write, which only exists
+        // once the turn has ended.
+        let deadline = *self
+            .settle_deadline
+            .get_or_insert_with(|| std::time::Instant::now() + SETTLE_BUDGET);
         cx.spawn(async move |this, cx| {
             let result = transcript::load_recent(db_path, sid).await;
             this.update(cx, |this, cx| {
@@ -7326,12 +8890,33 @@ impl Dashboard {
                     return;
                 }
                 match result {
-                    Ok((rows, total)) => {
-                        let (hidden, turns) =
-                            transcript::turns_with_metrics(&rows, total, &this.turn_metrics);
-                        let landed = expect.is_none_or(|want| turns.len() >= want);
+                    Ok(loaded) => {
+                        let (hidden, turns) = transcript::turns_with_origins(
+                            &loaded.rows,
+                            loaded.total,
+                            &this.turn_metrics,
+                            &loaded.origins,
+                        );
+                        let landed = settle_landed(expect, loaded.total);
+                        // Taken before `rows` is moved out below: every retry
+                        // log names the row total it was comparing against.
+                        let total = loaded.total;
                         this.transcript.hidden = hidden;
                         this.transcript.turns = turns;
+                        // The rows now carry the question the card opened the
+                        // turn with, so this exchange has been identified
+                        // against the DB once. Record it, because the
+                        // persisted turn is skipped while the card draws it:
+                        // dropping the card's own question here would leave
+                        // the prompt on neither side of the seam (#2705).
+                        let question_landed = this
+                            .transcript
+                            .turns
+                            .last()
+                            .is_some_and(|turn| transcript::newest_live_turn_matches(turn, &this.live));
+                        if question_landed {
+                            this.live.landed = true;
+                        }
                         // A turn that is still running owns the live card.
                         // Reading the conversation under it (a boot resume, or
                         // opening a session mid-turn) must not wipe the card
@@ -7340,7 +8925,7 @@ impl Dashboard {
                         // The ordered ids the selection resolves its ranges and
                         // its copy order against, which the visible turns alone
                         // cannot answer once they are folded (#2613).
-                        this.transcript.rows = rows;
+                        this.transcript.rows = loaded.rows;
                         if landed {
                             // The rows are in: the newest turn is the one
                             // that just answered, so it can claim the metrics
@@ -7351,26 +8936,63 @@ impl Dashboard {
                             }
                             this.settle_expect = None;
                             this.settle_retries = 0;
+                            this.settle_deadline = None;
+                            this.settle_rechecks = 0;
                         } else if in_flight {
                             // Short of the count while a turn is running is not
                             // a missed write, it is a turn still writing.
                             this.settle_expect = None;
                             this.settle_retries = 0;
-                        } else if attempt < SETTLE_ATTEMPTS {
+                            this.settle_deadline = None;
+                        } else if std::time::Instant::now() < deadline {
                             // The row is still in flight: retry shortly, the
                             // live turn keeps the answer on screen meanwhile.
+                            // The row total travels with the attempt so the
+                            // next incident is diagnosable from the log alone.
                             this.settle_retries = attempt + 1;
                             logging::info(&format!(
-                                "transcript short of the finished turn, retry {}",
-                                attempt + 1
+                                "transcript short of the finished turn, retry {} (rows {total}, want {})",
+                                attempt + 1,
+                                expect.map_or("?".to_string(), |n| n.to_string()),
                             ));
                             this.reload_transcript(sid, cx);
+                        } else if this.settle_rechecks < SETTLE_RECHECKS {
+                            // The budget ran out, but the payload is usually
+                            // written by now and only this read missed it. One
+                            // more look after a pause turns a permanently
+                            // pinned live card into a bounded delay (the
+                            // 2026-11-08 incident sat there until the session
+                            // was reopened).
+                            this.settle_rechecks += 1;
+                            this.settle_expect = expect;
+                            this.settle_retries = 0;
+                            this.settle_deadline = None;
+                            logging::info(&format!(
+                                "transcript short after {SETTLE_BUDGET:?}; recheck {} (rows {total}, want {})",
+                                this.settle_rechecks,
+                                expect.map_or("?".to_string(), |n| n.to_string()),
+                            ));
+                            let view = cx.entity().downgrade();
+                            cx.spawn(async move |_, cx| {
+                                cx.background_executor().timer(SETTLE_RECHECK).await;
+                                view.update(cx, |this, cx| {
+                                    if this.transcript.session == Some(sid) {
+                                        this.reload_transcript(sid, cx);
+                                    }
+                                })
+                                .ok();
+                            })
+                            .detach();
                         } else {
                             // Bounded: the live turn keeps the answer, so the
                             // pane is never empty even if the write never lands.
-                            logging::info("transcript never caught up; keeping the live turn");
+                            logging::info(&format!(
+                                "transcript never caught up; keeping the live turn (rows {total}, want {})",
+                                expect.map_or("?".to_string(), |n| n.to_string()),
+                            ));
                             this.settle_expect = None;
                             this.settle_retries = 0;
+                            this.settle_deadline = None;
                         }
                     }
                     Err(e) => this.transcript.error = Some(e.into()),
@@ -7708,6 +9330,13 @@ impl Dashboard {
             }
             return;
         }
+        // The open filter panel takes Escape first (#2787): it closes the
+        // chips without touching the find query underneath.
+        if self.sessions.rail_filter_open && ev.keystroke.key.as_str() == "escape" {
+            self.sessions.rail_filter_open = false;
+            cx.notify();
+            return;
+        }
         if self.sessions.filter_active {
             let ks = &ev.keystroke;
             match ks.key.as_str() {
@@ -7718,7 +9347,9 @@ impl Dashboard {
                     let target = self.sessions.find_target();
                     self.close_rail_filter(cx);
                     if let Some(id) = target {
-                        self.open_session(id, cx);
+                        // The field answers the split pick the way the row
+                        // underneath it does (#2760).
+                        self.pick_or_open(id, cx);
                     }
                 }
                 "up" | "down" => {
@@ -7735,6 +9366,7 @@ impl Dashboard {
                 }
                 "backspace" => {
                     self.sessions.filter.pop();
+                    self.schedule_rail_find(cx);
                     self.normalize_cursor();
                     cx.notify();
                 }
@@ -7743,6 +9375,7 @@ impl Dashboard {
                         && !ch.is_control()
                     {
                         self.sessions.filter.push(ch);
+                        self.schedule_rail_find(cx);
                         self.normalize_cursor();
                         cx.notify();
                     }
@@ -8229,14 +9862,6 @@ impl Dashboard {
                     cx.notify();
                     return;
                 }
-                "z" if self.rail_focused => {
-                    // Fold or unfold that session's topic tree (#2427).
-                    if let Some(id) = self.sessions.rail_target() {
-                        self.toggle_fold_topic(id, cx);
-                    }
-                    cx.notify();
-                    return;
-                }
                 _ => {}
             }
         }
@@ -8362,17 +9987,85 @@ impl Dashboard {
     /// window strip and every pane strip share one seen set, so a plan drawn
     /// twice rings once, and a reload of an unchanged file rings not at all.
     fn chime_settled_plan_tasks(&mut self) {
-        let seen = &mut self.announced_task_completions;
+        let now = std::time::Instant::now();
+
+        // A pane strip only re-reads its file when it is drawn, and this pass
+        // runs before the split body is built. Refresh here so a background
+        // pane that settled rings on this frame instead of the next redraw it
+        // happens to get (#2733). Each read is mtime-gated.
+        for pane in self.pane_states.values_mut() {
+            pane.plan.refresh();
+        }
+
+        // Every plan in this frame, each paired with the row that draws it, in
+        // one order so a settled task reaches the chime, the banner, and the
+        // flash from a single pass. A pre-init plan writes the nil session
+        // until the hook stamps it, so the drawing row is the honest fallback.
         let mut plans: Vec<Option<&opencrabs::tui::plan::PlanDocument>> =
             Vec::with_capacity(1 + self.pane_states.len());
+        let mut owners: Vec<Uuid> = Vec::with_capacity(1 + self.pane_states.len());
+
         plans.push(self.plan.document());
-        for pane in self.pane_states.values() {
+        owners.push(self.transcript.session.unwrap_or(Uuid::nil()));
+        for (pane_id, pane) in &self.pane_states {
             plans.push(pane.plan.document());
+            owners.push(*pane_id);
         }
-        if opencrabs::utils::completion_sound::newly_resolved(seen, &plans) == 0 {
+
+        let seen = &mut self.announced_task_completions;
+
+        // Which sessions settle in this pass. Read before the announce, because
+        // the announce is what writes them into `seen`, the only record of what
+        // already rang. Asking `contains` rather than `insert` keeps that write
+        // in one place, so the flash and the chime cannot disagree about which
+        // task was fresh.
+        let mut settled: Vec<Uuid> = Vec::new();
+        for (slot, owner) in plans.iter().zip(owners.iter()) {
+            let Some(doc) = *slot else {
+                continue;
+            };
+            let fresh = opencrabs::utils::completion_sound::resolved_task_ids(Some(doc))
+                .into_iter()
+                .any(|id| !seen.contains(&id));
+            if !fresh {
+                continue;
+            }
+            settled.push(if doc.session_id == Uuid::nil() {
+                *owner
+            } else {
+                doc.session_id
+            });
+        }
+
+        // #2729: the same set drives the OS banner, so a task that rings also
+        // reaches the Notification Center, and neither can fire twice for one
+        // settle.
+        if opencrabs::utils::desktop_notify::announce_settled_tasks(seen, &plans) == 0 {
             return;
         }
+        // One flash per settled session, on the same instant the chime rings:
+        // the sound and the blink are two surfaces of one event.
+        for session in settled {
+            if session == Uuid::nil() {
+                continue;
+            }
+            self.plan_flash_until.insert(
+                session,
+                now + opencrabs::utils::completion_sound::FLASH_WINDOW,
+            );
+        }
         Self::play_task_chime();
+    }
+
+    /// Whether any rail flash window is still open, dropping the expired ones.
+    ///
+    /// Read by the idle poll: while a bar blinks, the rail has to keep
+    /// repainting so the orange alternates, and once every window closed the
+    /// repaint budget goes back to zero. Pruned here rather than at paint time
+    /// so the map cannot grow past the sessions that are actually flashing.
+    fn plan_flash_active(&mut self, now: std::time::Instant) -> bool {
+        self.plan_flash_until.retain(|_, until| now < *until);
+        !self.plan_flash_until.is_empty()
     }
 
     /// The chime itself, honouring the operator's opt-in and the build
@@ -8430,7 +10123,7 @@ impl Dashboard {
             return chat;
         }
         let title = match self.session_title() {
-            Some(title) => SharedString::from(title.to_string()),
+            Some(title) => SharedString::from(title),
             None => SharedString::from("Chat"),
         };
         // Every pane carries its own status row (#2593). Resolved once here, from
@@ -8467,18 +10160,20 @@ impl Dashboard {
                 } else {
                     focus == Some(*session)
                 };
-                // This pane's own topics, resolved from its own session
-                // (#2686). The root is the pane's parent when the pane holds
-                // a topic, so a pane showing a topic still lists its family,
-                // and the open chip is that pane's session rather than the
-                // chat's.
+                // This pane's own topics, resolved from its own session.
+                // The root is the pane's parent when the pane holds a topic,
+                // so the open chip is that pane's session rather than the
+                // chat's. In a split the strip belongs to the pane that
+                // carries the family, not to every topic inside it: a wall of
+                // topic panes repeated the same bar once per pane (#2761).
                 let pane_root = self
                     .sessions
                     .parents
                     .get(session)
                     .copied()
                     .unwrap_or(*session);
-                if self.sessions.is_topic_enabled(pane_root) {
+                let carries_topics = leaves.len() == 1 || pane_root == *session;
+                if carries_topics && self.sessions.is_topic_enabled(pane_root) {
                     let pane_key = session.to_string();
                     let tabs = self.topic_tabs(Some(*session), cx);
                     let toggle_edge = cx.listener(|this, _ev: &ClickEvent, _window, cx| {
@@ -8509,10 +10204,15 @@ impl Dashboard {
                 };
                 let density = plan_strip::pane_density(count, pane_width);
                 let expanded = self.plan_expanded.contains(session);
+                // A plan waiting on approval is the one card a pane must not
+                // lose in a split (#2755): it is the only place the tap lives.
+                let actions = self.plan_actions(*session, cx);
                 let (plan_view, queued, editor) = if is_chat {
                     self.plan.refresh();
                     (
-                        self.plan.pane_view(density, expanded),
+                        self.plan
+                            .editing_view(Some(&actions))
+                            .or_else(|| self.plan.pane_view(density, expanded)),
                         self.queued_for_strip(),
                         self.editor.clone(),
                     )
@@ -8521,7 +10221,9 @@ impl Dashboard {
                         Some(pane) => {
                             pane.plan.refresh();
                             (
-                                pane.plan.pane_view(density, expanded),
+                                pane.plan
+                                    .editing_view(Some(&actions))
+                                    .or_else(|| pane.plan.pane_view(density, expanded)),
                                 agent_bridge::queue_snapshot(*session),
                                 pane.editor.clone(),
                             )
@@ -8565,6 +10267,13 @@ impl Dashboard {
                                 }),
                             ),
                     );
+                }
+                // The follow-up offer sits with the queue, above the composer
+                // it will send into (#2708).
+                let offers = agent_bridge::options_snapshot(*session);
+                if !offers.is_empty() {
+                    let rows = self.option_rows(*session, offers, cx);
+                    col = col.child(options_strip(&rows));
                 }
                 if let Some(label) = self.running_tasks_label_for(*session) {
                     col = col.child(task_strip(label));
@@ -8640,6 +10349,14 @@ impl Dashboard {
 
 impl Render for Dashboard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The machine's font catalog is read once, on the first paint (#2786):
+        // `all_font_names` walks CoreText on macOS and keeps no cache of its
+        // own, so asking it per frame would re-enumerate every installed
+        // family on every paint.
+        if !self.fonts_loaded {
+            self.fonts_loaded = true;
+            fonts::remember_installed(cx.text_system().all_font_names());
+        }
         // Focus follows the keyboard owner, decided here because this is the
         // only place holding a window to focus through. A transition that
         // forgot to ask would leave the composer answering under an open
@@ -8647,6 +10364,10 @@ impl Render for Dashboard {
         // reconciled every frame instead of trusted from each call site.
         let owner = keyboard_owner(&self.open_overlays(), self.screen);
         if self.last_owner != Some(owner) {
+            // A receipt in the daily log, the same shape as `pane focus ->`
+            // (#2549): a switch that never moves the owner is exactly the
+            // case the reconciler below cannot repair (#2741).
+            logging::debug(&format!("keyboard owner -> {owner:?}"));
             self.last_owner = Some(owner);
             self.refocus = Some(focus_target(owner));
         }
@@ -8659,9 +10380,61 @@ impl Render for Dashboard {
                     // a rotated caret that left focus on the chat leaf typed
                     // into a field the split was not drawing.
                     let composer = self.composer_entity();
-                    window.focus(&composer.read(cx).focus_handle);
+                    let handle = composer.read(cx).focus_handle.clone();
+                    // `before` is true when gpui turned the request into a
+                    // no-op, because it returns early on the handle that is
+                    // already focused. `now` names who holds the keys after
+                    // the call, so "the caret never came back" is answerable
+                    // from the log instead of guessed from a screenshot
+                    // (#2741).
+                    let before = handle.is_focused(window);
+                    window.focus(&handle);
+                    logging::debug(&format!(
+                        "caret -> composer before={before} now={}",
+                        self.caret_owner_name(window, cx)
+                    ));
                 }
-                FocusTarget::Root => window.focus(&self.focus),
+                FocusTarget::Root => {
+                    let before = self.focus.is_focused(window);
+                    window.focus(&self.focus);
+                    logging::debug(&format!(
+                        "caret -> root before={before} now={}",
+                        self.caret_owner_name(window, cx)
+                    ));
+                }
+            }
+        }
+        // A press on plain chrome takes the caret without moving the owner:
+        // the root tracks focus, so every element that does not sits under it
+        // and the press lands there, while the derived owner is still the
+        // composer. The transition above cannot see that, so the drift is read
+        // off the window instead and repaired before the user types (#2741).
+        if owner == KeyboardOwner::Composer {
+            let composer = self.composer_entity();
+            let drifted = !composer.read(cx).focus_handle.is_focused(window)
+                && window.focused(cx).is_none_or(|handle| handle == self.focus);
+            if drifted {
+                let handle = composer.read(cx).focus_handle.clone();
+                window.focus(&handle);
+                logging::debug(&format!(
+                    "caret -> composer repaired now={}",
+                    self.caret_owner_name(window, cx)
+                ));
+            }
+        } else {
+            // The mirror of the repair above, and the half that was missing
+            // (#2767): an overlay or a screen took the keys while the composer
+            // kept the caret, so everything typed into the prompt also landed
+            // in the message field and Enter submitted it. A field the overlay
+            // owns is not this drift; only the composer is.
+            let composer = self.composer_entity();
+            let leaked = composer.read(cx).focus_handle.is_focused(window);
+            if leaked {
+                window.focus(&self.focus);
+                logging::debug(&format!(
+                    "caret -> root repaired now={}",
+                    self.caret_owner_name(window, cx)
+                ));
             }
         }
         // Coming back to the conversation is a return, not a resume: a panel
@@ -8723,16 +10496,30 @@ impl Render for Dashboard {
         // The rail's rows: each carries its own click listener, built in its
         // own loop turn so the `&mut cx` borrow stays legal.
         let mut rail_rows: Vec<AnyElement> = Vec::with_capacity(self.sessions.items.len());
+        // The plan chip filters rows by progress, so resolve every session's
+        // counts before any pass calls `visible()` (#2719). This also warms
+        // the index the badge and bar passes read below.
+        self.snapshot_rail_plan_progress();
         // What every row says about work in flight (#2636), resolved once
         // before the loop: the index needs `&mut self` and the row iterator
         // holds `&self`.
         let activity = self.rail_activity_map();
+        // The plan bar reads the same cached index the badges just warmed:
+        // one stat per row with a plan file, no second loader.
+        let plan_progress = self.rail_plan_progress_map();
+        // Detached commands say "work is still running here" even when the
+        // turn is idle, so every card answers it without being opened.
+        let running_tasks = self.rail_running_map();
+        // One clock for the whole pass, so every flashing card blinks on the
+        // same frame instead of one behind its neighbour.
+        let flash_now = std::time::Instant::now();
         // Telegram-style topics: a parent's children paint as compact chips
         // on its card, not as their own rows. Resolve the chip set once before
         // the loop so the paint can skip those rows and hang the strip on the
         // parent. A live search falls back to flat rows so a match is never
-        // hidden inside a chip; a favorite stays a full row; a collapsed
-        // parent keeps its children as rows so the fold still reads.
+        // hidden inside a chip; a favorite stays a chip on its parent, never
+        // a row. Chips always paint: a terminal-written `topics_collapsed`
+        // flag never blanks the strip, the GUI has no row-era fold (#2701).
         let searching = !self.sessions.filter.trim().is_empty();
         let visible_ids: std::collections::HashSet<Uuid> =
             self.sessions.visible().map(|s| s.id).collect();
@@ -8741,9 +10528,8 @@ impl Render for Dashboard {
         } else {
             self.sessions
                 .visible()
-                .filter(|s| !self.sessions.is_favorite(s.id))
                 .filter_map(|s| self.sessions.parents.get(&s.id).map(|p| (s.id, *p)))
-                .filter(|(_, p)| visible_ids.contains(p) && !self.sessions.is_collapsed(*p))
+                .filter(|(_, p)| visible_ids.contains(p))
                 .map(|(cid, _)| cid)
                 .collect()
         };
@@ -8752,10 +10538,16 @@ impl Render for Dashboard {
             if chip_children.contains(&s.id)
                 && let Some(p) = self.sessions.parents.get(&s.id)
             {
-                children_by_parent
-                    .entry(*p)
-                    .or_default()
-                    .push((s.id, s.title.clone().unwrap_or_default()));
+                children_by_parent.entry(*p).or_default().push((
+                    s.id,
+                    // A chip names its own topic, never the chat plus the
+                    // topic plus the channel key (#2766): the card above it
+                    // already says the chat.
+                    rail::chip_name(
+                        s.title.as_deref(),
+                        self.sessions.topic_titles.get(&s.id).map(String::as_str),
+                    ),
+                ));
             }
         }
         // Pinned rows first, the rest untouched: the TUI's own order.
@@ -8814,16 +10606,14 @@ impl Render for Dashboard {
             // Right-click asks for the row's menu: pin and delete without
             // the slide gesture or a chord (#2354). It closes any open
             // strip first: one affordance at a time, the rail's own rule.
-            let ask_menu = cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+            let ask_menu = cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
                 this.sessions.rail_menu = Some(id);
+                // Where the card opens from: the row's own height, so it
+                // lands beside the row instead of over it (#2742).
+                this.rail_menu_at = Some(ev.position);
                 this.rail_actions = None;
                 cx.notify();
             });
-            // The menu overlays its row, so a pick must not fall through to
-            // the row's click (which opens the chat) or read as a dismissal.
-            // Shared with the topic chips: a chip's right-click builds the
-            // same popover through this helper.
-            let menu = self.rail_menu_popover_for(id, cx);
             let indented = self.sessions.is_indented(id);
             let closed = self.sessions.is_closed(id);
             // One glyph cell, from the window's shared clock, so a list of
@@ -8841,7 +10631,45 @@ impl Render for Dashboard {
                 badge,
                 // Already formatted in the loader: the paint only clones a
                 // shared string, so the shared clock costs no allocation.
-                preview: self.sessions.previews.get(&id).cloned(),
+                // While ctrl+f is open a deep hit's snippet stands in for the
+                // preview so the reader sees why the row matched (#2720).
+                // Idle rows read the DB preview.
+                preview: self
+                    .sessions
+                    .content_matches
+                    .get(&id)
+                    .filter(|_| self.sessions.filter_active)
+                    .map(|snippet| SharedString::from(snippet.clone()))
+                    .or_else(|| self.sessions.previews.get(&id).cloned()),
+                // A turn nobody has a pane for still gets a line on its card
+                // (#2718). The wording is the pane's own (#2326), so a split
+                // leaf and its rail row never describe the same turn two
+                // different ways.
+                activity: self.rail_activity_for(id),
+                plan: plan_progress.get(&id).copied(),
+                // The bar blinks orange for a few seconds after a task in
+                // this session's plan settles, on the same event that rings
+                // the chime, then falls back to its resting teal.
+                flash: opencrabs::utils::completion_sound::flash_blink_on(
+                    self.plan_flash_until.get(&id).copied(),
+                    flash_now,
+                ),
+                // The card's last line: whatever detached command is still
+                // running here, formatted exactly as the composer strip does.
+                running: running_tasks.get(&id).cloned(),
+                // The stored icon leads the row (#2790), resolved exactly
+                // like the topic tab resolves it: an embedded mark, a
+                // custom image from the view's cache, or a legacy glyph.
+                // A pick in the rename dialog reaches the card without a
+                // restart, and the paint never reads a file.
+                icon: self.sessions.topic_icons.get(&id).and_then(|stored| {
+                    topic_icons::tab_icon(stored, 1.0)
+                        .or_else(|| self.custom_icon_picture(stored, 1.0))
+                        .or_else(|| {
+                            (!stored.starts_with(topic_icons::IMG_PREFIX))
+                                .then(|| topic_icons::tab_glyph(stored, 1.0))
+                        })
+                }),
             };
             // A parent card carries its topics as inline chips: three by
             // default, a "+N" pill expands the rest, a collapse pill folds
@@ -8862,20 +10690,31 @@ impl Render for Dashboard {
                     let open = cx.listener(move |this, _ev, _window, cx| {
                         cx.stop_propagation();
                         this.close_rail_filter(cx);
-                        this.open_session(kid_id, cx);
+                        // A chip is a pick like any row: while a split waits,
+                        // it fills the pane instead of opening the topic in
+                        // the chat leaf (#2760).
+                        this.pick_or_open(kid_id, cx);
                     });
-                    let ask = cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                    let ask = cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
                         this.sessions.rail_menu = Some(kid_id);
+                        // A chip sits inside its parent's row, so the press
+                        // gives the card its height the same way a row's
+                        // does (#2742).
+                        this.rail_menu_at = Some(ev.position);
                         this.rail_actions = None;
                         cx.notify();
                     });
-                    let mut chip = sessions::topic_chip(kid_id, title, live, st.ring, sel)
-                        .on_click(open)
-                        .on_mouse_down(MouseButton::Right, ask);
-                    if let Some(pop) = self.rail_menu_popover_for(kid_id, cx) {
-                        chip = chip.child(gpui::deferred(pop).with_priority(1));
-                    }
+                    let chip = sessions::topic_chip(
+                        kid_id,
+                        title,
+                        live,
+                        st.ring,
+                        sel,
+                        plan_progress.get(&kid_id).copied(),
+                    )
+                    .on_click(open)
+                    .on_mouse_down(MouseButton::Right, ask);
                     els.push(chip);
                 }
                 let hidden = kids.len().saturating_sub(limit);
@@ -8898,7 +10737,10 @@ impl Render for Dashboard {
                 }
                 sessions::topic_chips(id, els)
             });
-            let r = sessions::row(s, flags, action, menu, chips);
+            // No menu is passed in: the card is built once at the window
+            // root, because a child of the row would inherit the row's frame
+            // and the card is placed in window coordinates (#2742).
+            let r = sessions::row(s, flags, action, chips);
             // The press starts the slide and closes any other row's strip.
             let press = cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
                 this.rail_slide_opened = None;
@@ -8909,6 +10751,9 @@ impl Render for Dashboard {
                 // A left press on the rail dismisses a context menu: the
                 // press is elsewhere, so the menu goes with it (#2354).
                 this.sessions.close_rail_menu();
+                // The filter panel folds on a row press too (#2787): the
+                // reader picked a chat, the chips have done their job.
+                this.sessions.rail_filter_open = false;
                 // Same rule for a transcript row's menu (#2613): the rail is
                 // outside the transcript, so the press closes it too.
                 this.msg_menu = None;
@@ -8994,12 +10839,84 @@ impl Render for Dashboard {
             )
             .into_any_element()
         });
+        // The rail filter menu (#2719, #2787): one funnel button top-right.
+        // Click opens the plan-state chips plus the cron/RSI toggle; click
+        // again closes them. The funnel wears the accent while a non-default
+        // filter hides rows, so a closed panel never silently filters. The
+        // state lives on `sessions`, so it survives the repaint and resets
+        // when the rail closes.
+        let rail_filter = self.sessions.rail_filter;
+        let pal = palette::current();
+        let toggle = cx.listener(|this, _ev: &ClickEvent, _window, cx| {
+            this.sessions.rail_filter_open = !this.sessions.rail_filter_open;
+            cx.notify();
+        });
+        let mut control = div()
+            .id("rail-filter-menu")
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap_0p5()
+            .child(
+                div()
+                    .id("rail-filter-toggle")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .p_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(pal.panel_hi)))
+                    .child(sessions::filter_icon(
+                        1.0,
+                        if sessions::filter_is_active(&rail_filter) {
+                            pal.accent
+                        } else {
+                            pal.text_muted
+                        },
+                    ))
+                    .on_click(toggle),
+            );
+        if self.sessions.rail_filter_open {
+            let plan_chips: [(&'static str, &'static str, sessions::PlanFilter); 4] = [
+                ("rail-filter-all", "all", sessions::PlanFilter::All),
+                ("rail-filter-active", "active", sessions::PlanFilter::Active),
+                ("rail-filter-done", "done", sessions::PlanFilter::Done),
+                (
+                    "rail-filter-noplan",
+                    "no plan",
+                    sessions::PlanFilter::NoPlan,
+                ),
+            ];
+            let mut chips = div().flex().flex_row().items_center().gap_0p5();
+            for (id, label, plan) in plan_chips {
+                let pick = cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
+                    this.sessions.rail_filter.plan = plan;
+                    cx.notify();
+                });
+                chips = chips.child(
+                    sessions::filter_chip(id, label, rail_filter.plan == plan).on_click(pick),
+                );
+            }
+            let auto = cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
+                this.sessions.rail_filter.show_automation =
+                    !this.sessions.rail_filter.show_automation;
+                cx.notify();
+            });
+            chips = chips.child(
+                sessions::filter_chip("rail-filter-auto", "auto", rail_filter.show_automation)
+                    .on_click(auto),
+            );
+            control = control.child(chips);
+        }
         let rail = sessions::rail(
             &self.sessions,
             rail_rows,
             self.rail_width,
             &self.rail_scroll,
             chip_footer,
+            Some(control.into_any_element()),
         );
 
         // One label drives the in-window chrome and the OS titlebar: the old
@@ -9021,7 +10938,7 @@ impl Render for Dashboard {
             Screen::MissionControl => "OpenCrabs \u{b7} mission control".to_string(),
             Screen::Chat => format!(
                 "OpenCrabs \u{b7} {}",
-                self.session_title().unwrap_or("chat")
+                self.session_title().unwrap_or_else(|| "chat".to_string())
             ),
         };
         window.set_window_title(&label);
@@ -9112,18 +11029,12 @@ impl Render for Dashboard {
                 });
                 message_click.insert(id, std::rc::Rc::new(handler));
             }
-            let handler = cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+            let handler = cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
                 cx.stop_propagation();
-                this.msg_menu_open(id, cx);
+                this.msg_menu_open(id, ev.position, cx);
             });
             message_press.insert(id, std::rc::Rc::new(handler));
         }
-        // The open menu, resolved once: its items are the same list whatever
-        // pane draws the transcript.
-        let message_menu = self.msg_menu.map(|id| transcript::MessageMenu {
-            id,
-            items: self.msg_menu_items(id, cx),
-        });
         // A left press anywhere in the transcript dismisses the message menu
         // (#2613): the press is elsewhere, so the menu goes with it, the same
         // rule the rail applies to its own menu (#2354). The card and the rows
@@ -9140,6 +11051,12 @@ impl Render for Dashboard {
         // re-arms it the moment the reader is back at the bottom.
         let wheel: transcript::ScrollHandler =
             Rc::new(cx.listener(|this, ev: &ScrollWheelEvent, _window, cx| {
+                // The card is pinned to a window point, not to its row, so a
+                // scroll leaves it floating over a row it no longer names
+                // (#2690). The wheel closes it.
+                if this.msg_menu.take().is_some() {
+                    cx.notify();
+                }
                 if !wheel_releases_follow(wheel_dy(&ev.delta)) {
                     return;
                 }
@@ -9223,7 +11140,6 @@ impl Render for Dashboard {
                         live_click: Some(live_click.clone()),
                         message_click: message_click.clone(),
                         message_press: message_press.clone(),
-                        message_menu: message_menu.clone(),
                         selection: select_on.then(|| msg_picked.clone()),
                         menu_dismiss: Some(msg_dismiss.clone()),
                     },
@@ -9286,7 +11202,7 @@ impl Render for Dashboard {
                         // name is not printed twice anywhere (#2578).
                         let identity = format!(
                             "{} · {}",
-                            self.session_title().unwrap_or("chat"),
+                            self.session_title().unwrap_or_else(|| "chat".to_string()),
                             status_identity(
                                 &provider,
                                 &model,
@@ -10727,6 +12643,9 @@ impl Render for Dashboard {
                     // keep working from the provider the hand just chose.
                     let first = row.first;
                     let count = row.count;
+                    // A provider with one model has nothing left to choose, so
+                    // its tile is the switch itself (#2782).
+                    let single = models::single_model_pair(&visible, row);
                     let mut entry = div()
                         .id(SharedString::from(format!("models-provider-{id}")))
                         .flex()
@@ -10763,6 +12682,12 @@ impl Render for Dashboard {
                         move |this, _ev, _window, cx| {
                             this.models_provider = Some(id.clone());
                             this.models_index = first;
+                            // One model in view means the click is the pick:
+                            // the picker used to stay open on a list with a
+                            // single row and nothing to confirm.
+                            if let Some(pair) = single.clone() {
+                                this.switch_model(pair, cx);
+                            }
                             cx.notify();
                         },
                     )));
@@ -11021,7 +12946,14 @@ impl Render for Dashboard {
                 // window keeps exactly the layout it has always had, measure
                 // wrapper included (#2594).
                 if !self.window_is_split() {
-                    if let Some(plan_view) = self.plan.view() {
+                    let open = self.transcript.session;
+                    let actions = open.map(|session| self.plan_actions(session, cx));
+                    self.plan.refresh();
+                    let card = self
+                        .plan
+                        .editing_view(actions.as_ref())
+                        .or_else(|| self.plan.view());
+                    if let Some(plan_view) = card {
                         col = col.child(central(
                             plan_view.into_any_element(),
                             centred_chat,
@@ -11046,6 +12978,19 @@ impl Render for Dashboard {
                             centred_chat,
                             chat_measure_px,
                         ));
+                    }
+                    // The follow-up offer sits where the queue does, directly
+                    // above the composer it sends into (#2708).
+                    if let Some(sid) = self.transcript.session {
+                        let offers = agent_bridge::options_snapshot(sid);
+                        if !offers.is_empty() {
+                            let rows = self.option_rows(sid, offers, cx);
+                            col = col.child(central(
+                                options_strip(&rows).into_any_element(),
+                                centred_chat,
+                                chat_measure_px,
+                            ));
+                        }
                     }
                     // A detached command sits directly above the editor: the same
                     // place the TUI puts it (on the input box's top border), which
@@ -11099,19 +13044,19 @@ impl Render for Dashboard {
             Screen::MissionControl => right.child(footer),
         };
 
-        // The card is the column's LAST child on purpose. Children paint in
-        // order, so a menu drawn inside the header is painted before the
-        // transcript and the conversation covers it.
-        if let Some(menu) = self.chat_menu(cx) {
-            right = right.child(menu);
-        }
-
         let mut root = div()
             .flex()
             .flex_row()
             .size_full()
             .bg(rgb(palette::current().bg))
             .text_color(rgb(palette::current().text))
+            // One family for the window (#2786): `font_family` sets the family
+            // of this element and its children, so the composer, the
+            // transcript and every bare label inherit the pick instead of each
+            // one naming a face. The transcript's own `TextStyle`s name it
+            // explicitly, because `TextStyle::default()` fills the field with
+            // the platform font and would pin it.
+            .font_family(fonts::current_ui())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             // A context menu closes when its row is left alone: any left
@@ -11128,6 +13073,16 @@ impl Render for Dashboard {
                     if this.sessions.rail_menu.take().is_some() {
                         cx.notify();
                     }
+                    if this.topic_menu.take().is_some() {
+                        cx.notify();
+                    }
+                    // A message card is pinned to a window point now, so it is
+                    // not the transcript's to dismiss any more: every card
+                    // closes on the same press, wherever it landed (#2690).
+                    if this.msg_menu.take().is_some() {
+                        cx.notify();
+                    }
+                    this.close_composer_menus(cx);
                 }),
             )
             // The drag lives on the root so it survives the pointer leaving
@@ -11522,7 +13477,7 @@ impl Render for Dashboard {
                 .topic_draft_icon
                 .clone()
                 .unwrap_or_else(|| DEFAULT_TOPIC_ICON.to_string());
-            let picks: Vec<Stateful<Div>> = topic_icons::TOPIC_ICONS
+            let mut picks: Vec<Stateful<Div>> = topic_icons::TOPIC_ICONS
                 .iter()
                 .map(|&(name, bytes)| {
                     let pick = cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
@@ -11531,15 +13486,64 @@ impl Render for Dashboard {
                     });
                     div()
                         .id(SharedString::from(format!("topic-icon-{name}")))
-                        .p_0p5()
-                        .rounded(px(4.0))
+                        // A pick is a picture, not a bullet (#2768): at the
+                        // old 1.5rem the eight badges were specks and picking
+                        // one was guesswork. They render at 4.0rem now
+                        // (#2789): big enough to recognise, and the 512x512
+                        // sources stay crisp at 2x.
+                        .p_1()
+                        .rounded(px(6.0))
                         .cursor_pointer()
                         .hover(|d| d.bg(rgb(palette::current().panel_hi)))
                         .on_click(pick)
-                        .child(topic_icons::picture(bytes, 1.5))
+                        .child(topic_icons::picture(bytes, 4.0))
                 })
                 .collect();
-            root = root.child(topic_prompt_overlay(label, &draft, &icon, picks, cancel));
+            // One extra cell opens the platform file picker for a custom
+            // image, Telegram style (#2790). The tile matches the embedded
+            // picks' geometry so the grid keeps its rhythm.
+            let add_image = cx.listener(|this, _ev: &ClickEvent, _window, cx| {
+                this.pick_icon_image(cx);
+            });
+            picks.push(
+                div()
+                    .id("topic-icon-add-image")
+                    .p_1()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(palette::current().panel_hi)))
+                    .on_click(add_image)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(rems(4.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(rgb(palette::current().panel_hi))
+                            .text_color(rgb(palette::current().text_muted))
+                            .text_size(rems(1.6))
+                            .child("+"),
+                    ),
+            );
+            // The badge previews a custom pick from the same cache the rail
+            // and tabs draw from (#2790).
+            let custom_picture = self.custom_icon_picture(&icon, 3.2);
+            // The session image itself opens the picker, the same handler
+            // the add-image cell uses (#2790).
+            let pick_image = cx.listener(|this, _ev: &ClickEvent, _window, cx| {
+                this.pick_icon_image(cx);
+            });
+            root = root.child(topic_prompt_overlay(
+                label,
+                &draft,
+                &icon,
+                picks,
+                custom_picture,
+                pick_image,
+                cancel,
+            ));
         }
         // The update dialog (#2406): two stages, and /evolve runs only after the second yes.
         if let Some(second) = self.update_prompt {
@@ -11666,6 +13670,30 @@ impl Render for Dashboard {
                 find::channel_hint(state.query(), &self.finder_channels),
             ));
         }
+        // Both context menus live here, at the window root, never inside the
+        // row or column that asked for them (#2690). Their cards are placed at
+        // the press point in window coordinates, and a parent's own frame would
+        // translate those coordinates to its corner. Deferred, so they paint
+        // over the cards and the conversation they open above.
+        if let Some(menu) = self.chat_menu(cx) {
+            root = root.child(gpui::deferred(menu).with_priority(2));
+        }
+        if let Some(id) = self.sessions.rail_menu
+            && let Some(menu) = self.rail_menu_popover_for(id, cx)
+        {
+            root = root.child(gpui::deferred(menu).with_priority(2));
+        }
+        // The message menu is a window-level card too (#2690): it used to be a
+        // child of its row, so a long message pushed it far from the press and
+        // a split pane's frame moved it again.
+        if let Some(id) = self.msg_menu
+            && let Some(at) = self.msg_menu_at
+        {
+            let items = self.msg_menu_items(id, cx);
+            root = root.child(
+                gpui::deferred(transcript::message_menu_popover(&items, at)).with_priority(2),
+            );
+        }
         // The theme modal is attached last, so it paints over every other
         // surface: while it is open it is what the user is looking at, and the
         // scrim is what the pointer meets (#2619).
@@ -11784,16 +13812,6 @@ fn main() {
             })
             .into_iter()
             .collect();
-    // Folded topic trees are read up front too, from the column the terminal
-    // writes, so a fold made there holds here on boot (#2670).
-    let collapsed: std::collections::HashSet<uuid::Uuid> =
-        futures::executor::block_on(sessions::load_collapsed(db_path.clone()))
-            .unwrap_or_else(|e| {
-                logging::error(&format!("collapsed load: {e}"));
-                Vec::new()
-            })
-            .into_iter()
-            .collect();
     // Which topic sits under which session, so the rail can group them (#2303).
     let parents: std::collections::HashMap<uuid::Uuid, uuid::Uuid> =
         futures::executor::block_on(sessions::load_topic_parents(db_path.clone()))
@@ -11823,7 +13841,6 @@ fn main() {
             topics: topics.clone(),
             parents: parents.clone(),
             closed: closed.clone(),
-            collapsed: collapsed.clone(),
             topic_icons: topic_icons.clone(),
             topic_titles: HashMap::new(),
             previews: HashMap::new(),
@@ -11833,6 +13850,10 @@ fn main() {
             error: None,
             filter: String::new(),
             filter_active: false,
+            rail_filter: sessions::RailFilter::default(),
+            rail_filter_open: false,
+            plan_progress: HashMap::new(),
+            content_matches: HashMap::new(),
         },
         Err(e) => sessions::SessionsState {
             items: Vec::new(),
@@ -11840,7 +13861,6 @@ fn main() {
             topics,
             parents,
             closed,
-            collapsed,
             topic_icons,
             topic_titles: HashMap::new(),
             previews: HashMap::new(),
@@ -11850,6 +13870,10 @@ fn main() {
             error: Some(e.into()),
             filter: String::new(),
             filter_active: false,
+            rail_filter: sessions::RailFilter::default(),
+            rail_filter_open: false,
+            plan_progress: HashMap::new(),
+            content_matches: HashMap::new(),
         },
     };
     // The split the last run closed with (#2675). Read here, on the main
@@ -11899,7 +13923,15 @@ fn main() {
             },
             |window, cx| {
                 let focus = cx.focus_handle();
-                let editor = cx.new(editor::Editor::new);
+                // The window's history, loaded once and shared with every
+                // composer this window builds, split panes included.
+                let history_path = composer::default_history_path();
+                let history = composer::new_shared_history(composer::load_history(&history_path));
+                let editor = cx.new({
+                    let history = history.clone();
+                    let history_path = history_path.clone();
+                    move |cx| editor::Editor::new_with_history(history, history_path, cx)
+                });
                 // A drag-copied range lands on the clipboard inside the
                 // transcript, which cannot see the composer. The dashboard owns
                 // both halves, so it is the one that turns a landed copy into
@@ -11911,6 +13943,8 @@ fn main() {
                         let _ = editor.update(cx, |editor, cx| editor.show_copied(cx));
                     }));
                 }
+                // The dashboard keeps its own handle on the same list.
+                let dashboard_history = history.clone();
                 let view = cx.new(move |cx: &mut Context<Dashboard>| {
                     // Enter on the editor is a send: routed into the agent
                     // turn path on the Dashboard itself.
@@ -12026,6 +14060,10 @@ fn main() {
                         )),
                         rail_clock: std::time::Instant::now(),
                         preview_refreshed_at: None,
+                        rail_find_gen: 0,
+                        seeker_find: HashMap::new(),
+                        seeker_find_gen: 0,
+                        seeker_scheduled_query: String::new(),
                         rail_chips_expanded: std::collections::HashSet::new(),
                         rail_width: RAIL_DEFAULT_REM,
                         rail_open: true,
@@ -12044,16 +14082,20 @@ fn main() {
                         split_pick: None,
                         split_creating: false,
                         msg_menu: None,
+                        msg_menu_at: None,
                         msg_select: Selection::new(),
                         forward_pick: None,
                         forward_query: String::new(),
                         forward_cursor: None,
                         topic_draft_icon: None,
+                        icon_images: HashMap::new(),
                         help_scroll: ScrollHandle::new(),
                         dragging_rail: false,
                         drag_from: None,
                         drag_seen: None,
                         rail_actions: None,
+                        rail_menu_at: None,
+                        rail_live: HashMap::new(),
                         rail_swipe: None,
                         rail_slide_opened: None,
                         confirm_delete: None,
@@ -12068,6 +14110,7 @@ fn main() {
                         preview_video: None,
                         help_open: false,
                         topic_menu: None,
+                        topic_menu_at: None,
                         topic_draft: None,
                         topic_warning: None,
                         topic_edge: topic_tabs::Edge::from_config(
@@ -12087,6 +14130,8 @@ fn main() {
                         themes_wheel: std::rc::Rc::new(std::cell::RefCell::new(None)),
                         themes_sat_track: std::rc::Rc::new(std::cell::RefCell::new(None)),
                         themes_val_track: std::rc::Rc::new(std::cell::RefCell::new(None)),
+                        fonts_open: false,
+                        fonts_loaded: false,
                         cd_dir: std::env::current_dir().unwrap_or_default(),
                         cd_entries: Vec::new(),
                         cd_selected: 0,
@@ -12112,6 +14157,7 @@ fn main() {
                         plan_for: None,
                         plan_expanded: std::collections::HashSet::new(),
                         announced_task_completions: std::collections::HashSet::new(),
+                        plan_flash_until: HashMap::new(),
                         transcript: transcript::TranscriptState {
                             session: initial_session,
                             ..Default::default()
@@ -12124,6 +14170,9 @@ fn main() {
                         ctrl_c_interceptor: None,
                         rail_scroll: ScrollHandle::new(),
                         editor,
+                        history: dashboard_history,
+                        drafts: composer::DraftStore::new(),
+                        anim_tick: 0,
                         agent_rx,
                         sink: agent_sink,
                         agent_ready: false,
@@ -12131,6 +14180,8 @@ fn main() {
                         stashed: HashMap::new(),
                         settle_expect: None,
                         settle_retries: 0,
+                        settle_deadline: None,
+                        settle_rechecks: 0,
                         busy: false,
                         cancel: None,
                         hint_painted: None,
@@ -12144,6 +14195,10 @@ fn main() {
                         branch: git_branch(&opencrabs::utils::cwd::launch_cwd()),
                     }
                 });
+                // Custom icon images are read once at startup, not per paint
+                // (#2790): the stored values were loaded with the rest of the
+                // topic state above.
+                view.update(cx, |this, _| this.refresh_icon_images());
                 // Ctrl+C has to reach the window even while the composer holds
                 // the keyboard, and the editor binds the key to its own copy
                 // action (#2587): a keymap match stops every listener behind
@@ -12213,6 +14268,10 @@ fn main() {
             },
         )
         .expect("failed to open the gpui window");
+        // The window exists: only now may the GUI claim the profile and preempt
+        // the running TUI/daemon. Claiming before open_window meant a window
+        // that failed to open left the user with no surface at all (#2784).
+        agent_bridge::window_is_up();
         cx.activate(true);
     });
 }
@@ -13468,6 +15527,50 @@ fn queue_strip(queued: &[agent_bridge::PendingMessage], expanded: bool) -> Div {
     col
 }
 
+/// The follow-up options `suggest_options` offered, above the composer where
+/// the queued list sits. One numbered row per label, styled the way the
+/// channel buttons are: primary in the accent, danger in the red, default
+/// quiet. A click sends that exact label as the next turn (#2708).
+///
+/// The rows arrive with their handlers already minted by the window, because
+/// only it knows which session the offer belongs to. Nothing here reaches the
+/// database: see `agent_bridge::SUGGESTIONS` for why there is nothing to
+/// persist.
+fn options_strip(rows: &[(SuggestionItem, transcript::ClickHandler)]) -> Div {
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_3()
+        .rounded(px(CARD_RADIUS))
+        .bg(glass_fill(palette::current().panel))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(palette::current().text_muted))
+                .child(SharedString::from("suggested")),
+        );
+    for (i, (item, pick)) in rows.iter().enumerate() {
+        let color = match item.style {
+            SuggestionStyle::Primary => palette::current().accent,
+            SuggestionStyle::Danger => palette::current().red,
+            SuggestionStyle::Default => palette::current().text_muted,
+        };
+        let pick = pick.clone();
+        col = col.child(
+            div()
+                .id(SharedString::from(format!("option-row-{i}")))
+                .text_xs()
+                .text_color(rgb(color))
+                .cursor_pointer()
+                .hover(|d| d.bg(rgb(palette::current().panel_hi)))
+                .child(SharedString::from(format!("{}. {}", i + 1, item.label)))
+                .on_click(move |ev, window, app| pick(ev, window, app)),
+        );
+    }
+    col
+}
+
 /// The composer's hint line for a state. Grey and quiet, it names the keys
 /// that work right now: stopping the turn, recalling a queued message, and
 /// queueing another (#2630).
@@ -13509,7 +15612,7 @@ fn popup_window(total: usize, selected: usize, visible: usize) -> Range<usize> {
 /// the terminal's `/help`.
 /// The emoji list under a `:query` (#2413): the glyph and its shortcode per row,
 /// the highlighted row marked as the command list marks its own.
-fn emoji_popup_view(items: &[(&'static str, &'static str)], selected: usize) -> Div {
+fn emoji_popup_view(items: &[editor::EmojiRow], selected: usize) -> Div {
     let mut col = div()
         .flex()
         .flex_col()
@@ -13519,8 +15622,14 @@ fn emoji_popup_view(items: &[(&'static str, &'static str)], selected: usize) -> 
         .border_1()
         .border_color(rgb(palette::current().panel_hi))
         .bg(glass_fill(palette::current().panel));
-    for (index, (glyph, code)) in items.iter().enumerate() {
+    for (index, row) in items.iter().enumerate() {
         let on = index == selected;
+        // A crab row is one of our pictures (#2769): it has no character to
+        // draw, so the row shows the picture the chat will receive.
+        let face: AnyElement = match row.crab {
+            Some(bytes) => topic_icons::picture(bytes, 1.6).into_any_element(),
+            None => SharedString::from(row.glyph.to_string()).into_any_element(),
+        };
         col = col.child(
             div()
                 .flex()
@@ -13537,8 +15646,8 @@ fn emoji_popup_view(items: &[(&'static str, &'static str)], selected: usize) -> 
                         .border_l_2()
                         .border_color(rgb(palette::current().accent))
                 })
-                .child(SharedString::from(glyph.to_string()))
-                .child(SharedString::from(format!(":{code}:"))),
+                .child(face)
+                .child(SharedString::from(format!(":{}:", row.shortcode))),
         );
     }
     col
@@ -13605,24 +15714,57 @@ fn command_popup_view(names: &[&'static str], selected: usize) -> Div {
     )
 }
 
+/// The card's single line for a turn running with no pane of its own (#2718).
+///
+/// The pane paints the lead in the accent colour and the tail muted, and a
+/// card line has one colour to spend, so the halves are joined with the same
+/// separator the terminal uses. Empty means the turn has said nothing yet: the
+/// card then keeps its preview instead of blanking a line to show a blank.
+fn rail_activity_line(live: &transcript::LiveTurn) -> String {
+    // `live_status_line` invents "OpenCrabs is thinking..." for a turn that has
+    // produced nothing at all, which on a card would out-shout the preview it
+    // is replacing. The rail waits for the first real event (#2718).
+    let idle = !live.thinking
+        && live.tools.is_empty()
+        && live.chunks == 0
+        && live.stream.is_empty()
+        && live.reasoning.is_empty();
+    if idle {
+        return String::new();
+    }
+    let (lead, tail) = transcript::live_status_line(live);
+    match (lead.is_empty(), tail.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => tail,
+        (false, true) => lead,
+        (false, false) => format!("{lead} \u{b7} {tail}"),
+    }
+}
+
 /// Fold one progress event into a live card.
 ///
 /// Free because two owners draw the same card: a split leaf's pane (#2614) and
 /// a turn parked under a conversation the user switched away from (#2616). The
 /// fold has to be identical for both or the card would tell a different story
 /// depending on where the session happens to be sitting.
-fn fold_live(live: &mut transcript::LiveTurn, progress: opencrabs::brain::agent::ProgressEvent) {
+fn fold_live(
+    live: &mut transcript::LiveTurn,
+    progress: opencrabs::brain::agent::ProgressEvent,
+    at: std::time::Instant,
+) {
     use opencrabs::brain::agent::ProgressEvent;
     match progress {
         ProgressEvent::Thinking => live.thinking = true,
         ProgressEvent::StreamingChunk { text } => {
             live.thinking = false;
-            live.note_chunk(&text);
+            // The arrival stamp, so a batch folded in one loop still measures
+            // the time the provider actually spent streaming (#2703).
+            live.note_chunk_at(&text, at);
         }
         ProgressEvent::IntermediateText { text, reasoning } => {
             live.thinking = false;
             if let Some(reasoning) = reasoning {
-                live.push_reasoning(&reasoning);
+                live.push_reasoning_at(&reasoning, at);
             }
             live.push_narration(&text);
         }
@@ -13736,6 +15878,16 @@ fn swap_visible_turn(
             *busy = false;
         }
     }
+}
+
+/// Whether a reload holds the turn it was waiting for (#2705).
+///
+/// The comparison is against the session's row total as the ledger reports it,
+/// never against the windowed turn count: past `transcript::WINDOW` rows the
+/// window stops growing, so a turn count could never reach an expectation
+/// taken from it and the metrics of every later turn were thrown away.
+fn settle_landed(expect: Option<usize>, total: i64) -> bool {
+    expect.is_none_or(|want| total.max(0) as usize >= want)
 }
 
 /// The running detached command, above the input.
@@ -13987,12 +16139,14 @@ fn topic_label(name: &str) -> String {
 ///
 /// Both marks reserve their space while inactive, so switching topics never
 /// changes the strip's geometry. The cells themselves stay transparent.
+#[allow(clippy::too_many_arguments)]
 fn topic_tab(
     id: Uuid,
     label: String,
     icon: Option<AnyElement>,
     shape: topic_bar::ChipShape,
     current: bool,
+    activity: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
@@ -14038,7 +16192,38 @@ fn topic_tab(
         .on_click(on_click)
         .on_mouse_down(MouseButton::Right, on_right)
         .children(icon)
+        // Work in flight in this topic: a dot after the name, in the accent
+        // the open chip uses, so the strip answers "is anything happening in
+        // there" without opening it (#2762).
+        .when(activity, |d| {
+            d.child(
+                div()
+                    .size(px(6.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(rgb(topic_tabs::TELEGRAM_ACCENT)),
+            )
+        })
         .child(content)
+}
+
+/// The pill standing for the topics a narrow bar folded away (#2762). A label,
+/// not a control: it says how much of the family is off the edge, and how much
+/// of that is busy. Same cell geometry as a chip, so the row keeps one height.
+fn overflow_chip(label: String, shape: topic_bar::ChipShape) -> AnyElement {
+    let vertical = shape == topic_bar::ChipShape::IconAbove;
+    let style = topic_tabs::style(vertical);
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .text_sm()
+        .text_color(rgb(palette::current().text_faint))
+        .when(vertical, |d| d.size(rems(style.cell_rems)).p_1())
+        .when(!vertical, |d| d.flex_row().gap_1().px_2().py_0p5())
+        .child(SharedString::from(label))
+        .into_any_element()
 }
 
 /// The update dialog (#2406). The first stage asks whether to update by
@@ -14237,6 +16422,25 @@ fn pane_footer(id: SharedString, text: Option<SharedString>, focused: bool) -> A
         .into_any_element()
 }
 
+/// Who asked for a send.
+///
+/// Window chrome owns the keyboard, so a composer that sends while an overlay
+/// is up is answering keys nobody gave it (#2767). A turn the window minted
+/// itself is the opposite case: the plan card's Approve tap and a command's
+/// own turn come from a click, not from a field. They were refused all the
+/// same, because the gate read the window's chrome and the chrome has no
+/// session in it: a plan waiting on approval sat there with its tap landing
+/// nowhere, while every other session's composer stayed dead behind the same
+/// overlay until the window was restarted (#2795). The origin travels with the
+/// send so the gate can tell the two apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SendOrigin {
+    /// Typed into a composer: the overlay gate applies.
+    Composer,
+    /// Minted by the window for a named session: chrome cannot refuse it.
+    Window,
+}
+
 /// A pane's composer while another pane holds the keyboard (#2530): the draft
 /// it keeps, dimmed and inert. Clicking it hands the keyboard to that pane, so
 /// the next frame draws the real field in the same spot and the typed text
@@ -14262,6 +16466,15 @@ fn pane_composer_dim(
         .id(SharedString::from(format!("pane-composer-{session}")))
         .flex()
         .flex_none()
+        // A pane that does not own the keyboard still shows the draft of the
+        // session it holds, and a long draft used to widen the whole pane
+        // instead of staying inside it: `flex_none` with no width floor lets
+        // the row refuse to shrink below its text, and the column grew with
+        // it (#2688). The dim row is one line by definition, so it takes the
+        // pane's width, clamps to it and ellipsises the rest.
+        .w_full()
+        .min_w_0()
+        .truncate()
         .min_h(px(44.))
         .p_3()
         .rounded(px(CARD_RADIUS))
@@ -14758,7 +16971,14 @@ fn pane_element(
                 .border_color(rgb(focus_ring_color(focused)))
                 .when(!focused, |d| d.opacity(UNFOCUSED_PANE_OPACITY))
                 .when(interactive, |d| {
-                    d.on_mouse_down(MouseButton::Left, take_keyboard)
+                    // Capture, not bubble. A transcript row stops the press
+                    // on its way up (`cx.stop_propagation()` in the text-row
+                    // handler), so a bubble-phase listener never ran for a
+                    // click on text, which is most of a pane: the caret
+                    // stayed on another leaf and ctrl+| split that one while
+                    // the window called the pane just clicked focused
+                    // (#2758).
+                    d.capture_any_mouse_down(take_keyboard)
                         // Every pane is a drop target (#2683). The half the
                         // pointer is nearest picks the axis and the side while
                         // the drag is still in flight, so the band under it is
@@ -14772,17 +16992,39 @@ fn pane_element(
                                 f32::from(b.origin.x + b.size.width),
                                 f32::from(b.origin.y + b.size.height),
                             ];
-                            let half = drop_half(
-                                bounds,
-                                f32::from(ev.event.position.x),
-                                f32::from(ev.event.position.y),
-                            );
-                            // A pane dropped on itself is not a move, so it
-                            // never shows a landing band of its own.
-                            let next = (from != hover_session).then_some((hover_session, half));
+                            let x = f32::from(ev.event.position.x);
+                            let y = f32::from(ev.event.position.y);
+                            // gpui delivers `on_drag_move` to EVERY pane while
+                            // a drag is live, hovered or not (the dispatch has
+                            // no `is_hovered` gate, unlike `on_mouse_move`), so
+                            // each pane used to answer with its own bounds and
+                            // the last pane painted won: the band landed on a
+                            // pane the pointer was nowhere near, and its half
+                            // described that pane's nearest edge instead of the
+                            // one under the pointer (#2759).
+                            let inside = x >= bounds[0]
+                                && x <= bounds[2]
+                                && y >= bounds[1]
+                                && y <= bounds[3];
                             let _ = hover_weak.update(cx, |this, cx| {
-                                if this.pane_drop != next {
-                                    this.pane_drop = next;
+                                if inside {
+                                    // A pane dropped on itself is not a move,
+                                    // so it never shows a landing band of its
+                                    // own.
+                                    let next = (from != hover_session)
+                                        .then(|| (hover_session, drop_half(bounds, x, y)));
+                                    if this.pane_drop != next {
+                                        this.pane_drop = next;
+                                        cx.notify();
+                                    }
+                                } else if this
+                                    .pane_drop
+                                    .is_some_and(|(target, _)| target == hover_session)
+                                {
+                                    // Clear only a band this pane owns, so a
+                                    // pane hearing the move does not wipe the
+                                    // band the pane under the pointer set.
+                                    this.pane_drop = None;
                                     cx.notify();
                                 }
                             });
@@ -14992,6 +17234,8 @@ fn topic_prompt_overlay(
     draft: &str,
     icon: &str,
     picks: Vec<Stateful<Div>>,
+    custom_picture: Option<AnyElement>,
+    pick_image: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let field = div()
@@ -15006,22 +17250,36 @@ fn topic_prompt_overlay(
         .text_color(rgb(palette::current().text))
         .child(SharedString::from(format!("{draft}|")));
     // The chosen icon, as a picture when it names an embedded one and as the
-    // stored glyph when the row predates the picture set (#2478).
-    let picture = topic_icons::topic_icon(icon)
-        .or_else(|| topic_icons::crab_icon(icon))
-        .map(|bytes| topic_icons::picture(bytes, 1.6).into_any_element());
+    // stored glyph when the row predates the picture set (#2478). A custom
+    // image arrives already built from the view's cache (#2790); an img:
+    // reference never prints as a label, even when its file is missing.
+    let picture = custom_picture.or_else(|| {
+        topic_icons::topic_icon(icon)
+            .or_else(|| topic_icons::crab_icon(icon))
+            .map(|bytes| topic_icons::picture(bytes, 3.2).into_any_element())
+    });
+    // The badge is the session's own image, so it doubles as the upload
+    // trigger: clicking it opens the same file picker the add-image cell
+    // opens (#2790). The picture itself is the button, Telegram style.
     let icon_badge = div()
+        .id("topic-prompt-image")
         .flex_none()
-        .size(rems(2.4))
+        // The badge carries the same picture the picker showed, so it has to
+        // be big enough to recognise (#2768, #2789).
+        .size(rems(4.0))
         .flex()
         .items_center()
         .justify_center()
         .rounded(px(CARD_RADIUS))
         .bg(glass_fill(palette::current().bg))
         .text_size(rems(1.4))
-        .when(picture.is_none(), |d| {
-            d.child(SharedString::from(icon.to_string()))
-        })
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(palette::current().panel_hi)))
+        .on_click(pick_image)
+        .when(
+            picture.is_none() && !icon.starts_with(topic_icons::IMG_PREFIX),
+            |d| d.child(SharedString::from(icon.to_string())),
+        )
         .children(picture);
     let picker = div().flex().flex_row().flex_wrap().gap_1().children(picks);
     let panel = div()
@@ -15030,7 +17288,7 @@ fn topic_prompt_overlay(
         .flex()
         .flex_col()
         .gap_3()
-        .w(rems(28.0))
+        .w(rems(30.0))
         .p_4()
         .rounded(px(CARD_RADIUS))
         .border_1()
@@ -15528,6 +17786,19 @@ fn cd_entries_for(dir: &std::path::Path, show_hidden: bool) -> Vec<std::path::Pa
 mod tests {
     use super::{CHAT_MEASURE_PX, cd_entries_for, pick_initial_session, remember_open_session};
 
+    /// A live turn repaints on every fourth poll tick, not on every one. The
+    /// spinner and the clock are the only things moving in that branch, and at
+    /// 20 Hz each repaint rebuilt every pane's transcript (#2688).
+    #[test]
+    fn a_live_turn_repaints_on_every_fourth_poll_tick() {
+        assert!(super::busy_repaint_due(4));
+        assert!(super::busy_repaint_due(0));
+        assert!(!super::busy_repaint_due(1));
+        assert!(!super::busy_repaint_due(2));
+        assert!(!super::busy_repaint_due(3));
+        assert!(super::busy_repaint_due(8));
+    }
+
     /// The conversation caps at a readable measure in a single pane, and any
     /// pane narrower than the cap draws at its own width (#2586).
     #[test]
@@ -15958,6 +18229,51 @@ mod tests {
         assert!(src.contains(&chord), "ctrl+d must be bound on the rail");
     }
 
+    /// #2721: the Seeker's deep search is wired end to end. The item builder
+    /// folds the cached content hits into snippet rows, a debounced generation
+    /// guarded read fills that cache, and both typing and the editing chords
+    /// schedule it only when the query changes. A source scan, because the
+    /// spawn needs a live event loop to exercise end to end.
+    #[test]
+    fn seeker_deep_search_wiring() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the production half of the file");
+        assert!(
+            production.contains("fn schedule_seeker_find"),
+            "the debounced content read exists"
+        );
+        assert!(
+            production.contains("fn refresh_seeker_items"),
+            "the card rebuild hook exists"
+        );
+        assert!(
+            production.contains("state.refresh_items(items)"),
+            "the rebuild swaps the open card's catalog"
+        );
+        assert!(
+            production.contains("Some(snippet) if !seeker_query.is_empty()"),
+            "a content hit stands its snippet in for the date"
+        );
+        assert!(
+            production.contains(".with_keywords(&seeker_query)"),
+            "the query keyword surfaces a content-only session"
+        );
+        assert_eq!(
+            production
+                .matches("self.seeker_find_if_changed(cx);")
+                .count(),
+            2,
+            "typing and the editing chords both schedule on a query change"
+        );
+        assert!(
+            production.contains("this.seeker_find_gen == generation"),
+            "a stale read never rebuilds the card"
+        );
+    }
+
     /// A conversation's turn belongs to that conversation, not to the window.
     ///
     /// #2616: the window keeps ONE live turn, so switching away used to throw
@@ -16132,8 +18448,17 @@ mod tests {
             .next()
             .expect("the end of the arm");
         assert!(
-            arm.contains("self.live.begin(user_message)"),
-            "the card names the message the killed process was answering"
+            arm.contains("self.live.resume(user_message)"),
+            "the card names the message the killed process was answering, and says its row is already written"
+        );
+        assert_eq!(
+            arm.matches("resume(user_message)").count(),
+            2,
+            "both the on-screen card and the parked copy are resumed: each draws a row the ledger already holds"
+        );
+        assert!(
+            !arm.contains("begin(user_message)"),
+            "a resumed turn that starts as a fresh one stamps the resume time and paints the question twice (#2740)"
         );
         assert!(arm.contains("self.busy = true"), "a recovered turn is busy");
         assert!(
@@ -16266,6 +18591,50 @@ mod tests {
         );
     }
 
+    /// The Seeker prints the window-only rows and routes them into the doors
+    /// that already exist: the group modal and the split pick (#2712, #2713).
+    #[test]
+    fn the_seeker_prints_the_window_only_rows_and_routes_them() {
+        let code = include_str!("main.rs")
+            .split("\nmod tests {")
+            .next()
+            .expect("the production half of the file");
+        assert!(
+            code.contains("items.extend(actions::gui_items());"),
+            "the window adds the rows that need a window"
+        );
+        let finder = fn_body(code, "finder_items");
+        assert!(
+            finder.contains("actions::gui_items()"),
+            "the picker carries them"
+        );
+
+        // The arm is read from the glyph that follows the needle, never from
+        // the needle itself: the needle starts with `PaletteAction::`, so a
+        // bare `find` on the tail returns zero and proves nothing.
+        let group_pick = "PaletteAction::GroupTopicsOn(id) =>";
+        let handler = code.find(group_pick).expect("the group pick has a handler");
+        let tail = code
+            .get(handler + group_pick.len()..)
+            .expect("the arm starts on a glyph");
+        let arm = tail.split("PaletteAction::").next().expect("the arm body");
+        assert!(
+            arm.contains("start_group_topics(Uuid::from_u128(id), cx)"),
+            "the pick opens the same modal the rail menu opens"
+        );
+
+        let split_row = "PaletteAction::BeginSplit(layout) =>";
+        let split = code.find(split_row).expect("the split row has a handler");
+        let tail = code
+            .get(split + split_row.len()..)
+            .expect("the arm starts on a glyph");
+        let arm = tail.split("PaletteAction::").next().expect("the arm body");
+        assert!(
+            arm.contains("self.begin_split(layout, cx)"),
+            "the row walks the same split door the chord walks"
+        );
+    }
+
     #[test]
     fn a_wheel_tick_up_releases_the_follow_it_does_not_fight_the_scroll() {
         // #2698: the window follows its own bottom until the reader's hand
@@ -16349,11 +18718,7 @@ mod tests {
         // screen transition is the one place every panel funnels through, so
         // the re-arm lives there instead of in each close path.
         let src = include_str!("main.rs");
-        let render = src
-            .split("fn render(&mut self, window: &mut Window, cx: &mut Context<Self>)")
-            .nth(1)
-            .and_then(|rest| rest.split("\n    fn ").next())
-            .expect("the window render");
+        let render = dashboard_render(src);
         assert!(
             render.contains("self.screen == Screen::Chat && self.last_screen != Screen::Chat"),
             "the transition into the chat is detected"
@@ -16367,19 +18732,214 @@ mod tests {
             "the window starts on the chat, so the first frame is not a return"
         );
         // Sending is the other half of the contract: a send follows its own
-        // answer whatever the reader was doing before.
+        // answer whatever the reader was doing before. Since #2756 the send is
+        // two functions, the entry and the one that runs a turn, so the follow
+        // is pinned in the half that actually sends.
         assert!(
-            fn_body(src, "send_message").contains("self.rearm_transcript_follow();"),
+            fn_body(src, "send_message").contains("self.send_message_showing("),
+            "a send reaches the path that runs a turn"
+        );
+        assert!(
+            fn_body(src, "send_message_showing").contains("self.rearm_transcript_follow();"),
             "a send re-arms the follow"
         );
     }
 
     /// The body of `fn name(` up to the next item at the same indent.
     fn fn_body(src: &'static str, name: &str) -> &'static str {
-        src.split(&format!("fn {name}("))
-            .nth(1)
-            .and_then(|rest| rest.split("\n    fn ").next())
-            .unwrap_or_else(|| panic!("{name} not found"))
+        item_body(src, &format!("fn {name}("))
+    }
+
+    /// The Dashboard's window render. Two impls in this file define `render`,
+    /// and only this signature is the one that holds the window (#2741).
+    fn dashboard_render(src: &'static str) -> &'static str {
+        item_body(
+            src,
+            "fn render(&mut self, window: &mut Window, cx: &mut Context<Self>)",
+        )
+    }
+
+    /// The body of one item, from its own definition to its closing brace.
+    ///
+    /// Two things this gets right that a plain `split` does not: only a real
+    /// definition counts, because the scans below quote the names they look
+    /// for inside their own strings, and the body ends at the brace that
+    /// closes it rather than at the next method, so a top level function in
+    /// another module file reads the same as a `Dashboard` method (#2741).
+    fn item_body(src: &'static str, needle: &str) -> &'static str {
+        let at = src
+            .match_indices(needle)
+            .map(|(at, _)| at)
+            .find(|&at| {
+                let line = src[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+                let prefix = src[line..at].trim();
+                prefix.is_empty() || prefix.starts_with("pub")
+            })
+            .unwrap_or_else(|| panic!("{needle} not found"));
+        let line = src[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+        let indent = src[line..at]
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .count();
+        let close = format!("\n{}}}", " ".repeat(indent));
+        let rest = &src[at..];
+        rest.split(&close).next().unwrap_or(rest)
+    }
+
+    #[test]
+    fn a_running_turn_says_what_it_is_doing_on_its_card() {
+        // #2718: the card drew only the last persisted message, so a
+        // conversation running its first tool calls claimed to be idle, and a
+        // sub-agent working with no pane at all said nothing anywhere.
+        let mut live = transcript::LiveTurn::default();
+        assert_eq!(
+            rail_activity_line(&live),
+            "",
+            "a turn with nothing to report leaves the preview in its slot"
+        );
+        live.thinking = true;
+        assert_eq!(
+            rail_activity_line(&live),
+            "OpenCrabs is thinking...",
+            "the pane's own wording, not a second one for the rail"
+        );
+        live.thinking = false;
+        live.tools.push(transcript::ToolCall::running(
+            "bash".to_string(),
+            "cargo test".to_string(),
+        ));
+        let line = rail_activity_line(&live);
+        assert!(
+            line.contains("cargo test"),
+            "the call in flight is what the card names: {line}"
+        );
+
+        let src = include_str!("main.rs");
+        // A session with no leaf keeps its turn here, folded by the same
+        // function the panes use, so the two cannot describe it differently.
+        let fold = fn_body(src, "fold_pane_progress");
+        assert!(
+            fold.contains("self.rail_live.get_mut(&session)"),
+            "the event is kept, not just a streaming flag"
+        );
+        assert!(
+            fold.contains("fold_live(live, progress, at)"),
+            "the pane's own fold gives the card its line"
+        );
+        // The card takes the activity over the preview while it lasts, and
+        // the render supplies it from the row map.
+        let sessions = include_str!("sessions.rs");
+        let row = fn_body(sessions, "row");
+        assert!(
+            row.contains("let preview = activity.or(preview);"),
+            "the live line takes the preview's own slot"
+        );
+        assert!(
+            row.contains("live_line"),
+            "and reads in the accent colour while it is live"
+        );
+        let render = dashboard_render(src);
+        assert!(
+            render.contains("activity: self.rail_activity_for(id)"),
+            "the render feeds the card from whichever owner holds the turn"
+        );
+        let lookup = fn_body(src, "rail_activity_for");
+        for source in [
+            "self.pane_states.get(&id)",
+            "self.stashed.get(&id)",
+            "self.busy && self.transcript.session == Some(id)",
+            "self.rail_live.get(&id)",
+        ] {
+            assert!(
+                lookup.contains(source),
+                "a turn can be held by any of the four owners: {source}"
+            );
+        }
+        // Every way a turn ends retires the line, or a card would keep
+        // claiming work after it stopped.
+        let poll = fn_body(src, "poll");
+        let retires = poll.matches("self.rail_live.remove(&session);").count();
+        assert_eq!(retires, 3, "Done, Failed and Cancelled each clear it");
+    }
+
+    #[test]
+    fn the_menu_opens_at_the_pointer_that_asked_for_it() {
+        // #2690: the press point is the anchor. The card used to be placed
+        // beside the rail at the press height, which is not where the click
+        // happened: a chip sits mid-row, and in a split the rail edge is not
+        // the pane the user was looking at.
+        let src = include_str!("main.rs");
+        let builder = fn_body(src, "rail_menu_popover_for");
+        assert!(
+            builder
+                .split_whitespace()
+                .collect::<String>()
+                .contains("self.rail_menu_at"),
+            "the press the row recorded is what places the card"
+        );
+        assert!(
+            !builder.contains("rail_width"),
+            "the rail's width no longer decides where the card opens"
+        );
+        assert!(
+            builder.contains("sessions::menu_popover(\"rail-context-menu\", items, at)"),
+            "the card goes through the one pointer-anchored popover"
+        );
+    }
+
+    #[test]
+    fn the_rail_menu_is_anchored_at_the_press_through_one_popover() {
+        // #2690: the card was absolute inside the row at `right_1` / `top_1`
+        // (#2742), then placed beside the rail at the press height. Both
+        // answered "where is the row"; the pointer is what the user clicked.
+        let menu = include_str!("menu.rs");
+        let popover = fn_body(menu, "menu_popover");
+        assert!(
+            popover.contains("anchored()"),
+            "the card is anchored in window coordinates, not absolute in the row"
+        );
+        assert!(
+            popover.contains(".position(at)"),
+            "the press point is the anchor it opens from"
+        );
+        assert!(
+            popover.contains(".snap_to_window_with_margin("),
+            "a card near the window edge is pulled back inside it"
+        );
+        let src = include_str!("main.rs");
+        // The window render builds it at the root: a row's own frame would
+        // translate the window coordinates to that row's corner.
+        let render = dashboard_render(src);
+        assert!(
+            render.contains("gpui::deferred(menu).with_priority(2)"),
+            "the menu is attached at the window root, above the content"
+        );
+        assert!(
+            render.contains("self.rail_menu_popover_for(id, cx)"),
+            "the root render is what builds the open row's card"
+        );
+        // Both entry points record where the press landed: a row and a chip.
+        // Counted inside the render, because this scan's own string holds the
+        // same text and a whole-file count would read three.
+        let asks = dashboard_render(src)
+            .matches("this.rail_menu_at = Some(ev.position);")
+            .count();
+        assert_eq!(
+            asks, 2,
+            "a rail row and a topic chip each record their press"
+        );
+        let builder = fn_body(src, "rail_menu_popover_for");
+        assert!(
+            builder
+                .split_whitespace()
+                .collect::<String>()
+                .contains("self.rail_menu_at"),
+            "the card opens at the point the press recorded"
+        );
+        assert!(
+            !builder.contains("rail_width"),
+            "and not at the rail's edge, which is not where the click landed"
+        );
     }
 
     #[test]
@@ -16387,14 +18947,10 @@ mod tests {
         // #2625: the row menu named the session, so opening it as the chat
         // first and then asking again grew the split from the first pane.
         let src = include_str!("main.rs");
-        // The drag ghost (#2683) implements Render too, so the scan anchors
-        // on the window's own signature instead of the first `fn render(`.
-        let window_render = src
-            .split("fn render(&mut self, window: &mut Window, cx: &mut Context<Self>)")
-            .nth(1)
-            .and_then(|rest| rest.split("\n    fn ").next())
-            .expect("the window render");
-        let menu = window_render
+        // Rows and topic chips share one popover builder (#2701), so the
+        // split arms live there instead of inside the window render.
+        let popover = fn_body(src, "rail_menu_popover_for");
+        let menu = popover
             .split("sessions::MenuKind::SplitSide")
             .nth(1)
             .and_then(|rest| rest.split("MenuKind::Delete").next())
@@ -16413,12 +18969,75 @@ mod tests {
         );
         let split_row = fn_body(src, "split_row");
         assert!(
-            split_row.contains("self.focused_pane()"),
+            split_row.contains("self.split_origin()"),
             "the pane being split is the one holding the caret"
         );
         assert!(
             split_row.contains("self.choose_split(id, cx)"),
             "the row already answered the pick"
+        );
+    }
+
+    #[test]
+    fn a_topic_chip_answers_the_split_pick() {
+        // #2760: a chip stops propagation, so the parent row's picker never
+        // ran and the topic opened in the chat leaf while the split waited
+        // for a session nobody was going to pick.
+        // Only the render counts for the chip: the whole file holds this
+        // test's own quoted names, so a plain scan reads its own strings as
+        // the chip's (#2741). The helper is defined outside the render, so the
+        // body scan below still needs the whole file.
+        let src = include_str!("main.rs");
+        let render = dashboard_render(src);
+        assert!(
+            !render.contains("this.open_session(kid_id, cx)"),
+            "the chip must not open the topic directly"
+        );
+        assert!(
+            render.contains("this.pick_or_open(kid_id, cx)"),
+            "the chip answers the picker the way a row does"
+        );
+        let helper = fn_body(src, "pick_or_open");
+        assert!(
+            helper.contains("self.split_pick.is_some()"),
+            "the helper asks whether a pane is waiting"
+        );
+        assert!(
+            helper.contains("self.choose_split(id, cx)"),
+            "and fills it instead of opening the conversation"
+        );
+    }
+
+    #[test]
+    fn the_seeker_and_the_filter_answer_the_split_pick() {
+        // #2760: the Seeker's OpenSession arm and the rail filter's Enter both
+        // opened directly, so a pick from either left the waiting pane armed.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains(
+                "PaletteAction::OpenSession(id) => self.pick_or_open(Uuid::from_u128(id), cx)"
+            ),
+            "a Seeker row answers the picker"
+        );
+        assert!(
+            fn_body(src, "on_key").contains("self.pick_or_open(id, cx)"),
+            "the filter's Enter answers it too"
+        );
+    }
+
+    #[test]
+    fn a_split_keeps_the_topics_bar_on_the_pane_that_carries_it() {
+        // #2761: every topic pane drew the whole family strip, so a wall of
+        // topics repeated one bar per pane and each bar claimed topics that
+        // belong to a different pane.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("let carries_topics = leaves.len() == 1 || pane_root == *session;"),
+            "only the pane carrying the topics draws the strip"
+        );
+        assert!(
+            src.contains("if carries_topics && self.sessions.is_topic_enabled(pane_root) {"),
+            "and the strip is gated on it"
         );
     }
 
@@ -16440,22 +19059,33 @@ mod tests {
 
     #[test]
     fn begin_split_targets_the_focused_leaf() {
-        // #2625: the chord door resolves its target through `focused_pane`,
-        // so a split grows from the leaf holding the caret rather than from
-        // whichever leaf the tree happens to reach first.
+        // #2625: the chord door resolves its target, so a split grows from the
+        // leaf holding the caret rather than from whichever leaf the tree
+        // happens to reach first. #2757: the resolution lives in
+        // `split_origin`, which answers with the caret leaf the RENDER drew
+        // instead of refusing on a stale `pane_focus`.
         let src = include_str!("main.rs");
         let body = fn_body(src, "begin_split");
         assert!(
-            body.contains("let target = self.focused_pane();"),
+            body.contains("let Some(target) = self.split_origin() else"),
             "the chord door splits the pane that holds the caret"
         );
         assert!(
             !body.contains("self.pane_focus.or(self.transcript.session)"),
-            "the resolution stays in `focused_pane`, not a second copy here"
+            "the resolution stays in `split_origin`, not a second copy here"
+        );
+        let origin = fn_body(src, "split_origin");
+        assert!(
+            origin.contains("resolve_split_focus(&leaves, self.pane_focus, chat)"),
+            "a stale caret id falls back the way the render falls back"
         );
         assert!(
-            body.contains("t.contains(*id)"),
+            origin.contains(".filter(|id| leaves.contains(id))"),
             "a leaf the tree no longer holds is not a split target"
+        );
+        assert!(
+            origin.contains("self.panes = Some(PaneTree::leaf(chat));"),
+            "a window with no tree starts from the chat's own leaf"
         );
         assert!(
             body.contains("self.split_target = Some(target);"),
@@ -16505,6 +19135,61 @@ mod tests {
         assert!(
             !body.contains(".plan.view()"),
             "no split pane draws the full checklist"
+        );
+    }
+
+    #[test]
+    fn a_click_anywhere_in_a_pane_takes_the_keyboard() {
+        // #2758: the pane took the keyboard in the BUBBLE phase, and a
+        // transcript text row stops the press on its way up, so a click on
+        // text never moved the caret and ctrl+| split whatever leaf the
+        // window still called focused instead of the pane just clicked.
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn pane_element(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("pane element");
+        assert!(
+            body.contains(".capture_any_mouse_down(take_keyboard)"),
+            "the pane takes the keyboard before a row can stop the press"
+        );
+        assert!(
+            !body.contains(".on_mouse_down(MouseButton::Left, take_keyboard)"),
+            "a bubble-phase listener never runs under a transcript row"
+        );
+    }
+
+    #[test]
+    fn the_drop_band_only_follows_the_pane_under_the_pointer() {
+        // #2759: gpui hands every `on_drag_move` listener every move while a
+        // drag is live, hovered or not, so each pane answered with its own
+        // bounds and the last pane painted put the band on itself.
+        let src = include_str!("main.rs");
+        let body = src
+            .split(".on_drag_move::<PaneDrag>(")
+            .nth(1)
+            .and_then(|rest| rest.split(".on_drop::<PaneDrag>(").next())
+            .expect("the drag-move listener");
+        assert!(
+            body.contains("let inside = x >= bounds[0]"),
+            "the pane checks the pointer is inside its own bounds"
+        );
+        assert!(
+            body.contains("&& y <= bounds[3];"),
+            "the check covers both axes"
+        );
+        assert!(
+            body.contains("if inside {"),
+            "only a pane the pointer is over answers with a half"
+        );
+        assert!(
+            body.contains("drop_half(bounds, x, y)"),
+            "the half still comes from the same bounds and pointer"
+        );
+        assert!(
+            body.contains(".is_some_and(|(target, _)| target == hover_session)"),
+            "a pane clears only the band it owns"
         );
     }
 
@@ -16563,7 +19248,7 @@ mod tests {
     fn the_hint_never_survives_a_draft() {
         let editor = include_str!("editor.rs");
         assert!(
-            editor.contains("let display = if empty { placeholder } else { content.clone() };"),
+            editor.contains("let display = if empty { placeholder } else { content };"),
             "the field paints the placeholder only while it is empty"
         );
         assert!(
@@ -16694,6 +19379,56 @@ mod tests {
         assert!(
             drain.contains("agent_bridge::spawn_turn("),
             "the flush sends the joined turn"
+        );
+    }
+
+    /// Chrome may not refuse a turn the window minted for a named session
+    /// (#2795).
+    ///
+    /// `open_overlays()` is window state with no session in it, so the overlay
+    /// gate in `send_from_pane` used to refuse every pane send while any
+    /// overlay was open. The plan card's Approve and Discard taps, and a
+    /// command's own reply turn, are exactly that shape: a click for one
+    /// session, refused because another part of the window held the keyboard.
+    /// The plan then sat in Editing with a dead button, and the composer of
+    /// every other session stayed dead behind the same overlay until restart.
+    /// The gate now reads the send's origin, and the window's own path names
+    /// itself.
+    #[test]
+    fn the_overlay_gate_only_refuses_a_composers_own_send() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source before the test module");
+        let send = production
+            .split("    fn send_from_pane(")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("        // A send ends that pane's offer")
+                    .next()
+            })
+            .expect("send_from_pane");
+        assert!(
+            send.contains("origin: SendOrigin,"),
+            "the send carries who asked for it"
+        );
+        assert!(
+            send.contains("origin == SendOrigin::Composer"),
+            "the overlay gate is keyed on the composer, not on the window"
+        );
+        let turn = production
+            .split("    fn send_turn_to(")
+            .nth(1)
+            .and_then(|rest| rest.split("    /// Dispatch the one turn").next())
+            .expect("send_turn_to");
+        assert!(
+            turn.contains("SendOrigin::Window"),
+            "a turn the window minted is never refused by chrome"
+        );
+        assert!(
+            production.contains("None, SendOrigin::Composer, cx)"),
+            "a pane composer's own send keeps the gate"
         );
     }
 
@@ -16940,16 +19675,17 @@ mod tests {
             ("enter", "Open the highlighted session"),
             ("ctrl+f", "Find a session"),
             ("ctrl+shift+p", "Pin the selected session"),
-            ("ctrl+d", "Delete the selected session"),
+            ("ctrl+d", "Delete session (asks first)"),
             ("ctrl+g", "Session files"),
             ("esc", "Cancel or step back"),
             // The session letters the rail answers now (#2670). p is absent on
             // purpose: the window has no projects screen yet (#2669), so its
-            // row carries no window chord.
+            // row carries no window chord. z is absent too: #2701 replaced the
+            // fold tree with chips that always paint, so the window answers no
+            // z and must not advertise one.
             ("r", "Rename the selected session"),
-            ("t", "New topic under this session"),
+            ("t", "Topics on, then a new topic"),
             ("c", "Close or reopen the selected topic"),
-            ("z", "Fold or unfold the topic tree"),
         ];
         let sessions: Vec<_> = help_keys::section_rows(HelpSection::Sessions).collect();
         for (chord, description) in wanted {
@@ -17323,21 +20059,99 @@ mod tests {
         );
     }
 
-    /// The completion event is handled, and the cross-session branch says so
-    /// out loud instead of dropping the receipt. Halves again: the file this
+    /// The window and every split pane walk ONE history, and it is the file
+    /// the terminal reads, so recall shows the same past whichever composer
+    /// has the caret (#2494).
+    #[test]
+    fn gui_composer_history_is_one_shared_list() {
+        let src = include_str!("main.rs");
+        let shared = ["composer::new_shared_", "history("].concat();
+        assert!(src.contains(&shared), "the window loads one shared list");
+        let pane = ["editor::Editor::new_with_", "history(history"].concat();
+        assert!(
+            src.contains(&pane),
+            "a split pane takes the window's handle, never a private list"
+        );
+        let field = ["history: composer::", "SharedHistory,"].concat();
+        assert!(src.contains(&field), "the dashboard owns the handle");
+    }
+
+    /// Switching conversations files the draft under the one being left and
+    /// puts the destination's own draft back. A pane whose editor is dropped
+    /// files its text before it goes (#2494).
+    #[test]
+    fn gui_switching_conversations_keeps_the_draft() {
+        let src = include_str!("main.rs");
+        let (_, helper) = src
+            .split_once(&["fn begin_", "conversation(&mut self, id: Uuid"].concat())
+            .expect("begin_conversation exists");
+        let (body, _) = helper
+            .split_once("\n    fn ")
+            .expect("the next method ends it");
+        let filed = ["self.drafts.", "store(previous, draft)"].concat();
+        assert!(body.contains(&filed), "leaving files the draft");
+        let back = ["self.drafts.", "take(id)"].concat();
+        assert!(body.contains(&back), "arriving takes the stored draft");
+        let restore = ["ed.restore_", "state(draft, cx)"].concat();
+        assert!(body.contains(&restore), "the returned draft is put back");
+        let pane = ["self.stash_pane_", "draft(session, cx)"].concat();
+        assert!(
+            src.contains(&pane),
+            "a closing pane files its draft before its editor is dropped"
+        );
+    }
+
+    /// The completion event resumes the session that started the task, never
+    /// only the conversation on screen (#2704). Halves again: the file this
     /// reads includes this test.
     #[test]
-    fn the_completion_event_is_handled() {
+    fn the_completion_event_resumes_its_own_session() {
         let src = include_str!("main.rs");
         let event = ["TurnEvent::", "BackgroundTaskDone"].concat();
-        let warn = ["logging::", "warn("].concat();
         assert!(
             src.contains(&event),
             "the poll loop must handle the completion event"
         );
+        let arm = src.split(&event).nth(1).expect("the completion arm");
+        let arm = arm
+            .split("agent_bridge::TurnEvent::")
+            .next()
+            .expect("the end of the arm");
         assert!(
-            src.contains(&warn),
-            "a completion for another session is logged, never dropped"
+            arm.contains("self.running_here(session_id)"),
+            "a session already working takes the receipt in its queue"
+        );
+        assert!(
+            arm.contains("self.resume_off_screen_task(session_id"),
+            "a completion for a conversation nobody is looking at starts its turn"
+        );
+        assert!(
+            !arm.contains("background task finished on session"),
+            "the receipt is resumed, not logged away"
+        );
+    }
+
+    /// A conversation longer than the display window still settles (#2705).
+    ///
+    /// The old expectation was `turns.len() + 1`, taken from the newest 200
+    /// rows: past that the count stops growing, so a real turn could never be
+    /// seen to land and its ctx and rate were thrown away. Measured on the
+    /// session's row total, the same turn lands on the first reload.
+    #[test]
+    fn a_session_past_the_window_still_settles() {
+        let rows_before = 335usize;
+        let expect = Some(rows_before + 1);
+        assert!(
+            !settle_landed(expect, rows_before as i64),
+            "the turn's row is not in the ledger yet"
+        );
+        assert!(
+            settle_landed(expect, (rows_before + 1) as i64),
+            "the row lands on the first reload, however long the conversation is"
+        );
+        assert!(
+            settle_landed(None, 0),
+            "a reload with nothing to wait for is never short"
         );
     }
 
@@ -17754,6 +20568,28 @@ mod gui {
                     "with the model the shipped section declares"
                 );
             });
+        }
+
+        /// The preview gate asks about the work, not only about the rail's
+        /// pane-less set: an open turn, a parked turn holding a question or a
+        /// tool, or a background pane-less session each mean the newest row
+        /// can still change. All three empty means nothing to read.
+        #[test]
+        fn a_preview_refresh_follows_any_live_work() {
+            use super::super::previews_can_move;
+            assert!(previews_can_move(true, false, 0), "the open turn streams");
+            assert!(
+                previews_can_move(false, true, 0),
+                "a parked turn is working"
+            );
+            assert!(
+                previews_can_move(false, false, 1),
+                "a pane-less session runs"
+            );
+            assert!(
+                !previews_can_move(false, false, 0),
+                "with no work at all the last row cannot have moved"
+            );
         }
     }
 }

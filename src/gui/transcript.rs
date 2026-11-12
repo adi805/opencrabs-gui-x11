@@ -17,24 +17,29 @@
 //! truncation everywhere (#2271).
 
 use crate::palette;
+use crate::topic_icons;
 use opencrabs::services::message::{CompletedPlanPayload, PLAN_COMPLETED_ROLE};
 use opencrabs::ui_core::card::{CARD_RADIUS, concentric_radius, glass_fill};
 use opencrabs::ui_core::copy_select::{self, TextPoint};
+use opencrabs::ui_core::links::{self, ClickTarget};
 use opencrabs::ui_core::plan_history::CompletedPlanView;
+use opencrabs::ui_core::rail;
+use opencrabs::utils::is_internal_system_message;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AbsoluteLength, AnyElement, App, ClickEvent, Div, HighlightStyle, MouseButton, ObjectFit,
+    AbsoluteLength, AnyElement, App, ClickEvent, Div, HighlightStyle, MouseButton, Pixels, Point,
     ScrollHandle, SharedString, Stateful, Styled, StyledText, TextLayout, TextStyle, Window, div,
-    img, prelude::*, px, rems, rgb, rgba,
+    prelude::*, px, rems, rgb, rgba,
 };
 
 use opencrabs::db::Database;
 use opencrabs::db::models::Message;
 use opencrabs::db::repository::message::MessageRepository;
+use opencrabs::db::repository::session::SessionRepository;
 use opencrabs::tui::app::ledger_scan::next_ledger;
 use opencrabs::tui::app::reasoning_split::{self, Segment, is_intermediate, split_segments};
 // The fold header's wording is the TUI's own (#759), re-exported from the lib
@@ -154,15 +159,6 @@ pub type PressHandler = std::rc::Rc<dyn Fn(&gpui::MouseDownEvent, &mut Window, &
 /// for the same reason as [`ClickHandler`]: only it holds the state to change.
 pub type ScrollHandler =
     std::rc::Rc<dyn Fn(&gpui::ScrollWheelEvent, &mut Window, &mut App) + 'static>;
-
-/// The open message menu (#2613): the row it belongs to and its resolved
-/// items. The window mints each pick, because the actions live on the window's
-/// own state; the transcript only draws the card over the row that asked.
-#[derive(Clone)]
-pub struct MessageMenu {
-    pub id: uuid::Uuid,
-    pub items: Vec<(String, ClickHandler)>,
-}
 
 /// A rendered piece of the conversation. The TUI's `DisplayMessage` kinds,
 /// narrowed to what the gui pane draws.
@@ -284,6 +280,11 @@ pub struct Turn {
     pub blocks: Vec<Block>,
     /// The turn's final answer, the one assistant block the fold never hides.
     pub final_idx: Option<usize>,
+    /// Which topic this turn came from, `None` outside a merged `All` view
+    /// (#2762). The transcript draws a divider whenever the label changes, so
+    /// a forum read whole labels its rows the way Telegram does instead of
+    /// showing one undifferentiated stream.
+    pub origin: Option<String>,
 }
 
 /// One entry in the live card's body, in the order it happened. The Telegram
@@ -338,19 +339,12 @@ pub struct LiveTurn {
     /// TUI runs over every chunk (`brain::tokenizer`), so the live counter and
     /// the TUI's agree instead of being two estimates.
     pub tokens: u32,
-    /// Seconds the provider spent ACTUALLY streaming this turn (#2325), the
-    /// denominator every other surface divides by. Tool execution, approval
-    /// waits and between-response round-trips are excluded: a 30s tool run
-    /// used to turn a 200 tok/s burst into "8 tok/s".
-    active_secs: f64,
-    /// When the currently open streaming window started.
-    window_start: Option<std::time::Instant>,
-    /// When the newest chunk landed, which is where the open window ends.
-    last_token_at: Option<std::time::Instant>,
-    /// The last finalized rate, kept across idle so the footer shows the
-    /// previous turn's number until the next turn produces its first token,
-    /// exactly like the terminal's streaming tracker.
-    last_tps: Option<f64>,
+    /// The turn's streaming rate, measured by the same tracker the terminal
+    /// footer runs (#2703). It holds the active streaming seconds (tool runs,
+    /// approval waits and between-response round-trips excluded) and keeps the
+    /// last finalized rate across idle, so the footer shows the previous turn's
+    /// number instead of blanking.
+    tps: opencrabs::ui_core::rate::StreamingTpsTracker,
     /// When the turn opened. The status line's clock reads from here, which is
     /// the only reason a silent provider no longer looks like a frozen window.
     pub started: Option<std::time::Instant>,
@@ -363,6 +357,12 @@ pub struct LiveTurn {
     /// When the question was sent, wall clock: the live bubble's timestamp, so
     /// a fresh turn reads the same as the row it becomes.
     pub sent_at: Option<chrono::DateTime<chrono::Local>>,
+    /// Whether a reload has already read this turn's question back out of the
+    /// DB. Set once, never before the row exists, so the card can stop asking
+    /// whether the newest persisted turn is its own: it has seen it land.
+    /// The question itself stays here, because the card is what draws it
+    /// while the persisted copy is skipped.
+    pub landed: bool,
     /// When the answer's first chunk arrived. Stamped once, not per repaint,
     /// or the timestamp would drift every frame.
     pub answer_at: Option<chrono::DateTime<chrono::Local>>,
@@ -404,6 +404,19 @@ impl LiveTurn {
         self.sent_at = Some(chrono::Local::now());
     }
 
+    /// Start a turn the ledger already owns: a restart resumed it (#2740).
+    ///
+    /// The question's row was written before the previous process died, so this
+    /// card is drawing an exchange the rows can also produce. Saying so once, up
+    /// front, is the whole point: without it the card stamps the resume time,
+    /// the time window in [`newest_live_turn_matches`] misses a row that can be
+    /// minutes older, and the question is painted twice, once from the row and
+    /// once from the echo.
+    pub fn resume(&mut self, user: String) {
+        self.begin(user);
+        self.landed = true;
+    }
+
     /// The DB has the turn: drop the live copy.
     pub fn clear(&mut self) {
         self.user = None;
@@ -422,44 +435,17 @@ impl LiveTurn {
         self.first_chunk = None;
         self.sent_at = None;
         self.answer_at = None;
+        self.landed = false;
         // The accumulator belongs to the turn that just ended; the finalized
         // rate deliberately survives, so an idle footer keeps the number
         // instead of blanking until the next turn streams.
-        self.active_secs = 0.0;
-        self.window_start = None;
-        self.last_token_at = None;
-    }
-
-    /// A gap longer than this between chunks closes the active window: tool
-    /// runs, approval prompts and between-response round-trips all exceed it,
-    /// so they are excluded from the rate's denominator.
-    const IDLE_GAP_SECS: f64 = 1.0;
-
-    /// Feed the active-window accumulator one token event (#2325), the same
-    /// rule `tui::app::state::StreamingTpsTracker::advance` applies. The clock
-    /// is a parameter so a seat can drive it deterministically.
-    fn advance_streaming(&mut self, now: std::time::Instant) {
-        match (self.window_start, self.last_token_at) {
-            (None, _) => self.window_start = Some(now),
-            (Some(start), Some(last)) => {
-                if (now - last).as_secs_f64() > Self::IDLE_GAP_SECS {
-                    // Idle gap: close the old window, open a new one.
-                    self.active_secs += (last - start).as_secs_f64();
-                    self.window_start = Some(now);
-                }
-            }
-            (Some(_), None) => self.window_start = Some(now),
-        }
-        self.last_token_at = Some(now);
+        self.tps.reset_window();
     }
 
     /// Active streaming seconds so far, including the open window. Measured
     /// to the LAST chunk, never to now, so idle ticks cannot inflate it.
     pub fn streaming_active_secs(&self) -> f64 {
-        match (self.window_start, self.last_token_at) {
-            (Some(start), Some(last)) => self.active_secs + (last - start).as_secs_f64().max(0.0),
-            _ => self.active_secs,
-        }
+        self.tps.active_secs()
     }
 
     /// Finish the turn's rate (#2325): prefer the service's own
@@ -468,15 +454,7 @@ impl LiveTurn {
     /// active-window estimate, and reset the accumulator. A turn that produced
     /// nothing keeps the previous number rather than reporting a fake zero.
     pub fn finalize(&mut self, authoritative: Option<f64>) {
-        let active = self.streaming_active_secs();
-        if let Some(tps) = authoritative.filter(|t| t.is_finite() && *t > 0.0) {
-            self.last_tps = Some(tps);
-        } else if self.tokens > 0 && active > 0.0 {
-            self.last_tps = Some(self.tokens as f64 / active);
-        }
-        self.active_secs = 0.0;
-        self.window_start = None;
-        self.last_token_at = None;
+        self.tps.finalize(self.tokens, authoritative);
     }
 
     /// Seconds since the turn opened; zero before one has.
@@ -490,21 +468,23 @@ impl LiveTurn {
     /// window is open the last finalized rate is returned, which is what keeps
     /// an idle footer from blanking the moment a turn settles.
     pub fn tokens_per_sec(&self) -> f32 {
-        let active = self.streaming_active_secs();
-        let live = (active > 0.0).then(|| self.tokens as f64 / active);
-        live.or(self.last_tps).map_or(0.0, |t| t as f32)
+        // The same guard the service and the terminal use (#2703): a window
+        // that collapsed below the floor, or a rate over the ceiling, is not a
+        // measurement, so the last credible number stays on screen instead.
+        opencrabs::ui_core::rate::credible_rate(self.tokens, self.tps.active_secs())
+            .or(self.tps.last_tps)
+            .map_or(0.0, |t| t as f32)
     }
 
-    /// Count one answer chunk: text plus its tokens. Counting here keeps the
-    /// live counter honest for every caller (a chunk that never renders still
-    /// cost the tokens).
-    pub fn note_chunk(&mut self, text: &str) {
-        self.note_chunk_at(text, std::time::Instant::now());
-    }
-
-    /// [`note_chunk`](Self::note_chunk) with the clock injected, so tests can
-    /// rehearse a stream with a tool wait in the middle.
-    fn note_chunk_at(&mut self, text: &str, now: std::time::Instant) {
+    /// Count one answer chunk: text plus its tokens, stamped with the instant
+    /// it arrived. Counting here keeps the live counter honest for every
+    /// caller (a chunk that never renders still cost the tokens).
+    ///
+    /// The stamp is a parameter rather than a `now()` read because `drain`
+    /// hands the GUI a whole batch at once (#2703). Reading the clock in here
+    /// stamped every chunk in the batch with one instant, collapsed the window
+    /// the rate is measured over, and is how 4640 tok/s reached the status bar.
+    pub(crate) fn note_chunk_at(&mut self, text: &str, now: std::time::Instant) {
         let tokens = opencrabs::brain::tokenizer::count_tokens(text) as u32;
         self.tokens = self.tokens.saturating_add(tokens);
         self.chunks += 1;
@@ -516,7 +496,7 @@ impl LiveTurn {
             self.answer_at = Some(chrono::Local::now());
         }
         if tokens > 0 {
-            self.advance_streaming(now);
+            self.tps.advance(now);
         }
         self.stream.push_str(text);
     }
@@ -572,9 +552,13 @@ impl LiveTurn {
         self.tools.push(call);
     }
 
-    /// The same guard for reasoning, which travels as `ReasoningChunk` and
-    /// again inside `IntermediateText`.
-    pub fn push_reasoning(&mut self, text: &str) {
+    /// The same guard for reasoning, which travels as `IntermediateText`.
+    ///
+    /// The clock is a parameter for the same reason as [`Self::note_chunk_at`]
+    /// (#2703): reasoning arrives inside a drained batch, so a clock read in
+    /// here would measure the fold loop instead of the stream and collapse the
+    /// rate window. The stamp travels from the bridge with the event.
+    pub fn push_reasoning_at(&mut self, text: &str, now: std::time::Instant) {
         let text = text.trim();
         if text.is_empty() {
             return;
@@ -586,24 +570,19 @@ impl LiveTurn {
         if !self.reasoning.trim_end().is_empty() {
             self.reasoning.push_str("\n\n");
         }
-        self.note_reasoning(text);
+        self.note_reasoning_at(text, now);
     }
 
-    /// Count one reasoning chunk. Reasoning IS model output and the TUI counts
-    /// it toward the turn's total (2026-05-29 receipt: a 38s reasoning turn
-    /// read "65 tok"), so excluding it here would understate the turn.
-    pub fn note_reasoning(&mut self, text: &str) {
-        self.note_reasoning_at(text, std::time::Instant::now());
-    }
-
-    /// [`note_reasoning`](Self::note_reasoning) with the clock injected.
+    /// Count one reasoning chunk, stamped with the instant it arrived.
     ///
-    /// Reasoning advances the streaming window the same way the answer does:
-    /// the channel bridge feeds `StreamingOutputTokens` for reasoning chunks
-    /// too (`cli/ui.rs`, "reasoning chunks ARE model output"), so the terminal
-    /// tracker counts that time, and counting the tokens here without the
-    /// time would inflate the rate (#2325).
-    fn note_reasoning_at(&mut self, text: &str, now: std::time::Instant) {
+    /// Reasoning advances the streaming window the same way the answer does,
+    /// because it is model output and the window must cover the time it took.
+    /// The stamp is injected for the same reason as `note_chunk_at` (#2703):
+    /// the GUI folds a drained batch in one loop, so a clock read here would
+    /// measure the loop rather than the stream. The terminal reads its clock
+    /// per event because its bridge mints `StreamingOutputTokens` one at a
+    /// time (`cli/ui.rs`); the GUI has no such event and must carry arrival.
+    pub(crate) fn note_reasoning_at(&mut self, text: &str, now: std::time::Instant) {
         let tokens = opencrabs::brain::tokenizer::count_tokens(text) as u32;
         self.tokens = self.tokens.saturating_add(tokens);
         if self.first_chunk.is_none() {
@@ -611,7 +590,7 @@ impl LiveTurn {
         }
         self.thinking = false;
         if tokens > 0 {
-            self.advance_streaming(now);
+            self.tps.advance(now);
         }
         self.reasoning.push_str(text);
         match self.entries.last_mut() {
@@ -628,6 +607,20 @@ impl LiveTurn {
         } else {
             self.settled.as_deref().filter(|t| !t.trim().is_empty())
         }
+    }
+
+    /// The paragraphs the crab actually spoke between tool calls, in order.
+    ///
+    /// They live in the card's body, which is folded by default, so a turn
+    /// with 27 tool calls read as a header and a count while the rail's
+    /// one-line preview quoted the sentence the reader could not find in the
+    /// chat. The prose is the turn's own words, not working-out, so the pane
+    /// prints it beside the card instead of hiding it behind a click.
+    pub fn narration(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().filter_map(|entry| match entry {
+            LiveEntry::Narration(text) => Some(text.as_str()),
+            _ => None,
+        })
     }
 }
 
@@ -659,6 +652,17 @@ pub struct TranscriptState {
 }
 
 impl TranscriptState {
+    /// The session's true row total: the rows on screen plus the ones the
+    /// window hid, which is the count `load_recent` reads straight from the
+    /// ledger (#2705).
+    ///
+    /// This is what a settle test has to measure. The windowed turn count
+    /// stops growing once a session passes `WINDOW`, so a turn that appends
+    /// rows could never be seen to land.
+    pub fn row_total(&self) -> usize {
+        self.hidden + self.rows.len()
+    }
+
     /// Newest turn's anchor: the one ctrl-o acts on, as in the TUI where
     /// ctrl+o toggles the newest turn only.
     pub fn newest_anchor(&self) -> Option<&str> {
@@ -716,14 +720,29 @@ pub fn attachment_paths_with_live(state: &TranscriptState, live: &LiveTurn) -> V
     keys
 }
 
+/// One transcript read: the rows, the total the family holds, and which topic
+/// each row came from when the read merged several sessions (#2762).
+pub struct Loaded {
+    pub rows: Vec<Message>,
+    pub total: i64,
+    /// Row id to topic label. Empty for a single session, which is every read
+    /// that is not a forum's `All` view.
+    pub origins: HashMap<uuid::Uuid, String>,
+}
+
 /// Fetch the newest window of the conversation plus the session's total row
 /// count, on a thread with a real stack (crash receipt in `main.rs`).
 /// `Database::connect` runs pragmas only, never migrations.
+///
+/// A session that has topics comes back as its whole family: the parent plus
+/// every topic under it, merged by time, with each row's topic recorded in
+/// [`Loaded::origins`] (#2762). That is what `All` shows. A topic opened on its
+/// own has no children, so it reads alone and carries no labels at all.
 pub async fn load_recent(
     db_path: std::path::PathBuf,
     session_id: uuid::Uuid,
-) -> Result<(Vec<Message>, i64), String> {
-    let (tx, rx) = futures::channel::oneshot::channel::<Result<(Vec<Message>, i64), String>>();
+) -> Result<Loaded, String> {
+    let (tx, rx) = futures::channel::oneshot::channel::<Result<Loaded, String>>();
     let spawned = std::thread::Builder::new()
         .name("transcript-fetch".into())
         .stack_size(4 * 1024 * 1024)
@@ -736,10 +755,45 @@ pub async fn load_recent(
                     .block_on(async {
                         let db = Database::connect(&db_path).await?;
                         let repo = MessageRepository::new(db.pool().clone());
-                        let rows: Vec<Message> =
-                            repo.find_recent_by_session(session_id, WINDOW).await?;
-                        let total: i64 = repo.count_by_session(session_id).await?;
-                        Ok::<_, anyhow::Error>((rows, total))
+                        let sessions = SessionRepository::new(db.pool().clone());
+                        let family = sessions.family_of(session_id).await?;
+                        // One row in the family is the ordinary read this
+                        // function has always made.
+                        if family.len() <= 1 {
+                            let rows = repo.find_recent_by_session(session_id, WINDOW).await?;
+                            let total = repo.count_by_session(session_id).await?;
+                            return Ok::<_, anyhow::Error>(Loaded {
+                                rows,
+                                total,
+                                origins: HashMap::new(),
+                            });
+                        }
+                        let mut rows: Vec<Message> = Vec::new();
+                        let mut origins: HashMap<uuid::Uuid, String> = HashMap::new();
+                        let mut total: i64 = 0;
+                        for (id, title) in family {
+                            let label = topic_family_label(&title);
+                            let window = repo.find_recent_by_session(id, WINDOW).await?;
+                            total += repo.count_by_session(id).await?;
+                            for row in &window {
+                                // A label is only worth carrying when the
+                                // family has more than one name to tell apart,
+                                // which is exactly this branch.
+                                if let Some(label) = &label {
+                                    origins.insert(row.id, label.clone());
+                                }
+                            }
+                            rows.extend(window);
+                        }
+                        // Same order the TUI's reader gets from SQL. The id
+                        // breaks a tie between two rows stamped the same
+                        // second, so the union is stable across reloads.
+                        rows.sort_by_key(|m| (m.created_at, m.id));
+                        Ok::<_, anyhow::Error>(Loaded {
+                            rows,
+                            total,
+                            origins,
+                        })
                     })
                     .map_err(|e| format!("{e:#}")),
                 Err(e) => Err(format!("tokio runtime failed: {e}")),
@@ -753,6 +807,23 @@ pub async fn load_recent(
         },
         Err(e) => Err(format!("transcript fetch thread failed to spawn: {e}")),
     }
+}
+
+/// What a stored session title reads as once the bookkeeping is off it. `All`
+/// labels every row with this, and the label names the conversation the row
+/// came from, never the transport (#2766): a topic reads `Memes`, and a row
+/// from the base chat reads `OpenCrabs Dev`. Before this the platform word and
+/// its key came through whole, so every divider printed `Telegram: OpenCrabs
+/// Dev / Memes [chat:-100:topic:42]` above the rows it was labelling.
+fn topic_family_label(title: &str) -> Option<String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(topic) = rail::topic_name(Some(trimmed)) {
+        return Some(topic);
+    }
+    Some(rail::chat_name(Some(trimmed)))
 }
 
 /// A model-switch receipt used to be persisted with the user role. Draw the
@@ -824,6 +895,12 @@ fn row_blocks(m: &Message, forward: Option<ForwardMark>) -> Vec<Block> {
         return blocks;
     }
     if m.content.starts_with("[CONTEXT COMPACTION") {
+        return blocks;
+    }
+    // A hidden prompt is not a conversation row (#2756). Rows written before
+    // the display line existed still hold the `[SYSTEM: ...]` scaffolding, and
+    // a row persisted while a turn was in flight can too; neither may render.
+    if m.role == "user" && is_internal_system_message(&m.content) {
         return blocks;
     }
     if m.role != "assistant" {
@@ -918,10 +995,17 @@ fn row_blocks(m: &Message, forward: Option<ForwardMark>) -> Vec<Block> {
 /// `metrics` carries the per-turn ctx and rate this process still remembers,
 /// keyed by turn anchor (#2324): a turn keeps them across reloads of the same
 /// session and forgets them only when the process does.
-pub fn turns_with_metrics(
+///
+/// `origins` is the per-row provenance of a merged `All` view (#2762): it maps
+/// a row id to the topic that row lives in, so every turn carries the label its
+/// first row was written under. A change of label is a hard turn boundary,
+/// because without one the previous topic's answer would be drawn as the next
+/// topic's output.
+pub fn turns_with_origins(
     rows: &[Message],
     total: i64,
     metrics: &HashMap<String, TurnMetrics>,
+    origins: &HashMap<uuid::Uuid, String>,
 ) -> (usize, Vec<Turn>) {
     let hidden = total.saturating_sub(rows.len() as i64).max(0) as usize;
     if rows.is_empty() {
@@ -939,7 +1023,10 @@ pub fn turns_with_metrics(
         let continues_batch = i > 0
             && m.forward.is_some()
             && m.forward.as_ref().map(|f| f.batch) == rows[i - 1].forward.as_ref().map(|f| f.batch);
-        if m.role == "user" && i > start && !continues_batch {
+        // A merged read sorts several topics into one stream, and the seam
+        // between them is a boundary like any question is (#2762).
+        let origin_changed = i > start && origins.get(&rows[i - 1].id) != origins.get(&m.id);
+        if i > start && (origin_changed || (m.role == "user" && !continues_batch)) {
             bounds.push((start, i));
             start = i;
         }
@@ -976,6 +1063,10 @@ pub fn turns_with_metrics(
         // The turn's anchor and remembered numbers are read before the
         // summary so the tally the live card showed can floor it (#2632).
         let anchor = format!("{}@{}", rows[s].role, rows[s].created_at.timestamp());
+        // The label the turn opens under. A turn cannot straddle two topics
+        // (the boundary above forbids it), so the first row speaks for the
+        // whole turn (#2762).
+        let origin = origins.get(&rows[s].id).cloned();
         let metrics = metrics.get(&anchor).copied();
         let mut summary = TurnSummary::default();
         for b in &blocks {
@@ -1022,9 +1113,70 @@ pub fn turns_with_metrics(
             anchor,
             blocks,
             final_idx,
+            origin,
         });
     }
     (hidden, out)
+}
+
+/// Whether the persisted rows of one turn stay out of the conversation
+/// because the live card is already drawing that same exchange.
+///
+/// Only the newest turn can be the one on screen, and only while the card
+/// still owns it. Every other turn prints from its rows, including the turn
+/// the reader just finished: a new request sets `busy` for its whole
+/// duration, and keying this on `busy` alone hid the previous answer until
+/// the new turn ended (#2709).
+pub fn persisted_turn_is_hidden(ti: usize, last: usize, newest_is_live: bool) -> bool {
+    ti == last && newest_is_live
+}
+
+/// Whether this persisted turn is the exchange the live card is drawing.
+///
+/// The window keeps a live turn beside the rows it reloads, so the newest
+/// persisted turn and the live card can describe the same exchange. Identity
+/// is the question plus the second it was sent, never the row's position: a
+/// reload can install a different newest turn while a card keeps running, and
+/// the same text asked again later is a different turn.
+pub fn newest_live_turn_matches(turn: &Turn, live: &LiveTurn) -> bool {
+    let Some(question) = live.user.as_deref() else {
+        return false;
+    };
+    let question = question.trim();
+    if question.is_empty() {
+        return false;
+    }
+    let Some(Block::Msg {
+        role,
+        content,
+        time,
+        ..
+    }) = turn.blocks.first()
+    else {
+        return false;
+    };
+    if role != "user" || content.trim() != question {
+        return false;
+    }
+    let Some(sent) = live.sent_at else {
+        return true;
+    };
+    // A reload already read this question back out of the rows, so the turn
+    // whose question it is has been identified once and the seconds no longer
+    // have to agree: a write that landed late must not hand the same exchange
+    // back to the persisted copy while the card is still drawing it.
+    if live.landed {
+        return true;
+    }
+    // The row is stamped when the write landed, which can cross a second
+    // boundary, so a couple of seconds either way still reads as the same
+    // exchange. Text alone would also swallow a question the reader asked
+    // twice, and the previous answer would vanish while the new turn ran.
+    time.is_empty()
+        || [-2, -1, 0, 1, 2].iter().any(|offset| {
+            sent.checked_add_signed(chrono::TimeDelta::seconds(*offset))
+                .is_some_and(|at| live_time(Some(at)) == *time)
+        })
 }
 
 /// Whether one block still renders while its turn is folded. Mirrors
@@ -1169,6 +1321,7 @@ fn message_surface(role: &str) -> u32 {
 
 fn body_style(size: f32) -> TextStyle {
     TextStyle {
+        font_family: crate::fonts::current_ui().into(),
         color: rgb(palette::current().text).into(),
         font_size: AbsoluteLength::Pixels(px(size)),
         ..Default::default()
@@ -1179,6 +1332,7 @@ fn body_style(size: f32) -> TextStyle {
 /// tool calls, the completed plan card, the live card's ledger.
 pub(crate) fn small_style(size: f32, color: u32) -> TextStyle {
     TextStyle {
+        font_family: crate::fonts::current_ui().into(),
         color: rgb(color).into(),
         font_size: AbsoluteLength::Pixels(px(size)),
         ..Default::default()
@@ -1187,7 +1341,11 @@ pub(crate) fn small_style(size: f32, color: u32) -> TextStyle {
 
 fn mono_style() -> TextStyle {
     TextStyle {
-        font_family: "Menlo".into(),
+        // The mono walk, not a fixed name (#2786): `Menlo` ships on macOS
+        // only, and the platform resolves an unknown family through a chain
+        // whose entries are proportional, so a code block used to lose column
+        // alignment on Windows and Linux.
+        font_family: crate::fonts::current_mono().into(),
         color: rgb(palette::current().text_normal).into(),
         font_size: AbsoluteLength::Pixels(px(12.0)),
         ..Default::default()
@@ -1218,7 +1376,13 @@ fn md_line(l: &markdown::MdLine, selection: Option<&SelectionContext>) -> Div {
     let size = heading_size(l.heading_level);
     let mut style = body_style(size);
     style.font_weight = heading_weight(l.heading_level);
-    let text = selectable_styled_text(l.text.clone(), style, l.highlights.clone(), selection);
+    let text = inline_crabs(
+        l.text.clone(),
+        style,
+        l.highlights.clone(),
+        &l.links,
+        selection,
+    );
     let base = div().pl(rems(f32::from(l.indent) * 0.9));
     if l.heading {
         base.mt(px(RHYTHM_HEADING_ABOVE))
@@ -1234,6 +1398,7 @@ fn md_line(l: &markdown::MdLine, selection: Option<&SelectionContext>) -> Div {
 /// gets wide columns, a narrow one wraps the text instead of clipping it.
 fn table_cell(cell: &markdown::MdCell, header: bool, selection: Option<&SelectionContext>) -> Div {
     let style = TextStyle {
+        font_family: crate::fonts::current_ui().into(),
         color: rgb(if header {
             palette::current().text_strong
         } else {
@@ -1243,13 +1408,47 @@ fn table_cell(cell: &markdown::MdCell, header: bool, selection: Option<&Selectio
         font_size: AbsoluteLength::Pixels(px(13.0)),
         ..Default::default()
     };
-    let text = selectable_styled_text(cell.text.clone(), style, cell.highlights.clone(), selection);
+    let text = selectable_styled_text(
+        cell.text.clone(),
+        style,
+        cell.highlights.clone(),
+        &cell.links,
+        selection,
+    );
     div()
         .flex_1()
         .min_w_0()
         .px(px(RHYTHM_CELL_PAD_X))
         .py(px(RHYTHM_CELL_PAD_Y))
         .child(text)
+}
+
+/// The topic a run of rows belongs to, drawn above the first turn of that
+/// topic in a merged `All` view (#2762): the name, then a hairline out to the
+/// edge. `rule` is false only at the very top of the transcript, where nothing
+/// sits above the label to be separated from.
+fn origin_divider(label: &str, rule: bool) -> Div {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .min_w_0()
+        .pt(px(10.0))
+        .pb(px(2.0));
+    if rule {
+        row = row.border_t_1().border_color(rgb(palette::current().track));
+    }
+    row.child(
+        div()
+            .text_xs()
+            .font_weight(gpui::FontWeight::BOLD)
+            .text_color(rgb(palette::current().text_muted))
+            .flex_shrink_0()
+            .child(SharedString::from(label.to_string())),
+    )
+    .child(table_rule().flex_1())
 }
 
 /// A rule between two rows, drawn as its own element so no table depends on
@@ -1270,6 +1469,7 @@ fn md_table(t: &markdown::MdTable, selection: Option<&SelectionContext>) -> Div 
     let empty = markdown::MdCell {
         text: String::new(),
         highlights: Vec::new(),
+        links: Vec::new(),
     };
     let mut grid = div()
         .flex()
@@ -1446,6 +1646,7 @@ fn md_block(src: &str, selection: Option<&SelectionContext>) -> Div {
                                 l.text.clone(),
                                 mono_style(),
                                 l.highlights.clone(),
+                                &[],
                                 selection,
                             ));
                             i += 1;
@@ -1465,18 +1666,177 @@ fn md_block(src: &str, selection: Option<&SelectionContext>) -> Div {
 }
 
 /// User/system content stays plain: the TUI renders input verbatim, markdown
-/// styling is an answer-text treatment.
+/// styling is an answer-text treatment. A line whose shortcodes name the crab
+/// pack still draws those pictures (#2771), so a user who picks an emoji from
+/// the composer sees the emoji, not its name.
 fn plain_block(content: &str, size: f32, selection: Option<&SelectionContext>) -> Div {
     let mut lines = div().flex().flex_col().gap_0p5();
     for line in content.split('\n') {
-        lines = lines.child(selectable_styled_text(
+        let style = body_style(size);
+        lines = lines.child(inline_crabs(
             line.to_string(),
-            body_style(size),
+            style,
             Vec::new(),
+            &[],
             selection,
         ));
     }
     lines
+}
+
+/// An inline crab is a touch larger than the body text it sits in, so it reads
+/// as an emoji rather than a character glued into the line (#2771).
+const CRAB_INLINE_SIZE: f32 = 1.1;
+
+/// The crab a line of text draws at: the size of that line's own glyphs, a
+/// little taller, so a heading keeps its scale.
+fn inline_crab_size(style: &TextStyle) -> f32 {
+    // The picture is laid out in rems, so a pixel size is converted at the
+    // 16px base and a rem size is already in the unit the picture wants.
+    match style.font_size {
+        AbsoluteLength::Pixels(pixels) => (f32::from(pixels) * 1.15 / 16.0).max(CRAB_INLINE_SIZE),
+        AbsoluteLength::Rems(rems) => (rems.0 * 1.15).max(CRAB_INLINE_SIZE),
+    }
+}
+
+/// Draw one line of text, with the shortcodes that name a crab pack emoji
+/// standing in as pictures (#2771).
+///
+/// A line with no token takes the plain `StyledText` path untouched, so nothing
+/// about an ordinary row changes. A line that does carry tokens is laid out as
+/// a wrapping flex row: a run of words is one text segment, and a token is the
+/// pack's picture sitting in the text flow. Code fences and table cells keep
+/// calling `selectable_styled_text` directly: a shortcode inside a fence is
+/// source, not an emoji.
+///
+/// Every segment declares the length the whole line would have given it, never
+/// its own byte count, because `SelectionContext` separates its segments with
+/// one byte each: splitting a line into three pieces would otherwise move every
+/// later offset down by two and drag-select would copy the wrong characters.
+fn inline_crabs(
+    text: String,
+    style: TextStyle,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    links: &[(Range<usize>, String)],
+    selection: Option<&SelectionContext>,
+) -> Div {
+    let Some(pieces) = topic_icons::inline_pieces(&text) else {
+        return selectable_styled_text(text, style, highlights, links, selection);
+    };
+    // The row takes the width its parent gave it, so the wrap below has a
+    // width to wrap at. Without `w_full` a flex row measures its children
+    // against an indefinite width, and every chunk collapses to one character
+    // wide and stacks the whole line into a vertical column (#2794).
+    let mut row = div().flex().flex_wrap().items_center().w_full().min_w_0();
+    let crab_size = inline_crab_size(&style);
+    for piece in pieces {
+        if let Some(bytes) = piece.crab {
+            // A picture is not a segment: the run ahead of it already claims
+            // the token's bytes, and one extra separator here would shift
+            // every offset after the picture.
+            row = row.child(topic_icons::picture(bytes, crab_size));
+            continue;
+        }
+        if piece.range.is_empty() {
+            // The spacer draws nothing: it only carries the bytes the pictures
+            // ahead of the first word took.
+            if let Some(context) = selection {
+                context.begin_segment(piece.accounted);
+            }
+            continue;
+        }
+        let chunks = inline_chunks(&text, piece.range.clone(), piece.accounted);
+        for (range, length) in chunks {
+            let covered = local_highlights(&highlights, &range);
+            let chunk_links = local_links(links, &range);
+            let chunk = text[range].to_string();
+            let drawn =
+                selectable_text_segment(chunk, length, &style, covered, &chunk_links, selection);
+            // A chunk keeps the width its own text needs and the row wraps
+            // between chunks. `min_w_0` here was the bug: it let every chunk
+            // shrink under its content, and a shrinking `StyledText` wraps one
+            // character per line, so a whole message came out as vertical
+            // columns of single letters (#2794). A word wider than the pane
+            // now overflows its row instead of shredding the line.
+            row = row.child(drawn.flex_none());
+        }
+    }
+    row
+}
+
+/// One chunk of a run of text: the bytes it draws, and the length the selection
+/// accounting consumes for it (#2771).
+type Chunk = (Range<usize>, usize);
+
+/// Cut one run of an inline-crab line into word-sized chunks, each with the
+/// length the selection accounting must consume for it (#2771).
+///
+/// A flex row breaks between its children, never inside one, so a single long
+/// run would overflow the pane instead of wrapping. Cutting at the spaces puts
+/// the breaks where the text itself would have wrapped. A chunk ends after its
+/// space, so a break never eats the gap between two words.
+fn inline_chunks(text: &str, span: Range<usize>, accounted: usize) -> Vec<Chunk> {
+    let (start, end) = (span.start, span.end);
+    let mut chunks = Vec::new();
+    let mut cursor = start;
+    for (offset, byte) in text[start..end].bytes().enumerate() {
+        if byte == b' ' {
+            let cut = start + offset + 1;
+            chunks.push(cursor..cut);
+            cursor = cut;
+        }
+    }
+    if cursor < end {
+        chunks.push(cursor..end);
+    }
+    // The run ends where its own accounting says it does: one byte short of
+    // the next segment, or at the end of the line for the last run on it.
+    let run_end = start + accounted;
+    let accounting: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| match chunks.get(index + 1) {
+            Some(next) => next.start.saturating_sub(chunk.start + 1),
+            None => run_end.saturating_sub(chunk.start),
+        })
+        .collect();
+    chunks.into_iter().zip(accounting).collect()
+}
+
+/// Keep the highlights that fall inside one chunk, rebased onto it, so a bold
+/// span that crosses a crab keeps its weight on both sides of it (#2771).
+fn local_highlights(
+    highlights: &[(Range<usize>, HighlightStyle)],
+    range: &Range<usize>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    highlights
+        .iter()
+        .filter_map(|(span, style)| {
+            let from = span.start.max(range.start);
+            let to = span.end.min(range.end);
+            (from < to).then(|| (from - range.start..to - range.start, *style))
+        })
+        .collect()
+}
+
+/// Keep the link labels that fall inside one chunk, rebased onto it, so a link
+/// split across a crab picture still opens from either side of it (#2317).
+fn local_links(
+    links: &[(Range<usize>, String)],
+    range: &Range<usize>,
+) -> Vec<(Range<usize>, String)> {
+    links
+        .iter()
+        .filter_map(|(span, dest)| {
+            let from = span.start.max(range.start);
+            let to = span.end.min(range.end);
+            if from < to {
+                Some((from - range.start..to - range.start, dest.clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Only the user message paints a bubble. The assistant answer is drawn
@@ -1675,14 +2035,11 @@ fn attachment_cell(path: &std::path::Path, side: f32) -> Div {
             .rounded(px(CARD_RADIUS))
             .border_1()
             .border_color(rgb(palette::current().track))
-            .child(
-                img(path.to_path_buf())
-                    .size_full()
-                    // Clip the pixels as well as the box. GPUI's image paint
-                    // can otherwise cover the outer card's rounded top edge.
-                    .rounded(px(concentric_radius(1.0)))
-                    .object_fit(ObjectFit::Cover),
-            )
+            // A square crop painted with `Fill`, so the painted quad is the
+            // box and the radius lands inside the tile's own arc. `Cover` on
+            // the original painted a larger quad and its arc sat outside the
+            // tile's, which is what let pixels past the corner (#2796).
+            .child(crate::thumbs::picture(path, px(concentric_radius(1.0))))
             .into_any_element()
     } else {
         // A document and a clip have nothing to draw, so the box states what a
@@ -1804,6 +2161,7 @@ fn tools_block(calls: &[ToolCall], selection: Option<&SelectionContext>) -> Div 
                     tool_line(call),
                     small_style(SMALL_TEXT_SIZE, color),
                     Vec::new(),
+                    &[],
                     selection,
                 )),
         );
@@ -1858,7 +2216,7 @@ fn fold_chevron(folded: bool) -> &'static str {
 /// turn ends. `None` for a turn that did no work, which earns no card (#758).
 fn settled_card(turn: &Turn, folded: bool, body: Vec<AnyElement>) -> Option<Stateful<Div>> {
     turn.header.as_ref()?;
-    let (glyph, verb) = settled_verdict(turn.summary);
+    let (glyph, verb) = settled_verdict(turn);
     let failed = glyph == "\u{274c}";
     let accent = if failed {
         palette::current().red
@@ -1958,12 +2316,46 @@ fn settled_card(turn: &Turn, folded: bool, body: Vec<AnyElement>) -> Option<Stat
 /// The verdict a settled turn's head carries: the Telegram flow block's own
 /// pair (#480), which is what the live card becomes on `Done`. One word, never
 /// a step count the reader has to total (#2632).
-fn settled_verdict(summary: TurnSummary) -> (&'static str, &'static str) {
-    if summary.failed > 0 || summary.has_error {
+///
+/// The tally is not the verdict (#2707). `summary.failed` counts every call
+/// that returned `success: false`, and a refusal the model then worked around
+/// is exactly that: a failed call inside a turn that finished its job. Reading
+/// the tally painted an 85-call turn red over two self-corrected refusals and
+/// a plan-gate advisory, which teaches the reader to ignore the cross. So the
+/// question asked here is the one the reader is asking: did the turn end on a
+/// failure? A failed call with assistant text after it was answered, and the
+/// footer still reports the count for anyone who wants it.
+fn settled_verdict(turn: &Turn) -> (&'static str, &'static str) {
+    if turn.summary.has_error || (turn.summary.failed > 0 && !answered_after_the_last_failure(turn))
+    {
         ("\u{274c}", "Failed")
     } else {
         ("\u{2705}", "Finished")
     }
+}
+
+/// Whether the turn's last failed call was followed by assistant text, the
+/// shape of a wall the model climbed over instead of one it hit.
+///
+/// Only the LAST failed call counts: an answer between two failures does not
+/// excuse the second, and a failure after the final text is still a dead end.
+/// A placeholder row is structure, not an answer, so it never counts.
+fn answered_after_the_last_failure(turn: &Turn) -> bool {
+    let Some(last_failed) = turn.blocks.iter().rposition(|b| match b {
+        Block::Tools { calls } => calls.iter().any(|c| !c.success),
+        _ => false,
+    }) else {
+        return false;
+    };
+    turn.blocks[last_failed + 1..].iter().any(|b| match b {
+        Block::Msg {
+            role,
+            content,
+            placeholder,
+            ..
+        } => role == "assistant" && !*placeholder && !content.trim().is_empty(),
+        _ => false,
+    })
 }
 
 /// One settled turn's footer, wording and order taken from the Telegram flow
@@ -2098,6 +2490,7 @@ fn live_card_line(line: LiveCardLine, selection: Option<&SelectionContext>) -> A
             format!("{mark} {text}"),
             small_style(SMALL_TEXT_SIZE, color),
             Vec::new(),
+            &[],
             selection,
         )
         .into_any_element(),
@@ -2106,6 +2499,7 @@ fn live_card_line(line: LiveCardLine, selection: Option<&SelectionContext>) -> A
             text,
             small_style(SMALL_TEXT_SIZE, palette::current().text_muted),
             Vec::new(),
+            &[],
             selection,
         )
         .into_any_element(),
@@ -2194,6 +2588,23 @@ fn live_card(
         .child(head);
     if expanded {
         card = card.child(live_card_body(live, drag));
+    } else if let Some(paragraph) = collapsed_narration(live) {
+        // Narration stays in the card, never in the chat history. The collapsed
+        // card previews what the turn just said under its header, the way a
+        // summary rides beneath its title; opening the card prints every
+        // paragraph in order.
+        card = card.child(
+            div().px_2().pb_1().w_full().min_w_0().child(
+                selectable_styled_text(
+                    paragraph,
+                    small_style(SMALL_TEXT_SIZE, palette::current().text_muted),
+                    Vec::new(),
+                    &[],
+                    None,
+                )
+                .line_clamp(3),
+            ),
+        );
     }
     if let Some(footer) = live_card_footer(live, ctx) {
         card = card.child(
@@ -2301,7 +2712,7 @@ fn activity_glyph(call: &ToolCall) -> &'static str {
 /// The turn's latest activity, worded like the card's leading segment
 /// (#2326): the call running now, else the last one that ran. `None` until a
 /// tool has started.
-fn live_activity(live: &LiveTurn) -> Option<String> {
+pub(crate) fn live_activity(live: &LiveTurn) -> Option<String> {
     let call = live
         .tools
         .iter()
@@ -2328,7 +2739,7 @@ fn tool_count_label(count: usize) -> String {
 /// that ran, else "OpenCrabs is thinking..." while nothing has arrived at all.
 /// The tail is how much it did (the call count) and the clock the terminal
 /// builds with `format_turn_spinner_meta`.
-fn live_status_line(live: &LiveTurn) -> (String, String) {
+pub(crate) fn live_status_line(live: &LiveTurn) -> (String, String) {
     let mut lead = live_activity(live);
     if lead.is_none()
         && live.tools.is_empty()
@@ -2387,6 +2798,32 @@ fn live_block(
         )
         .into_any_element(),
     )
+}
+
+/// How much of the newest narration the collapsed card previews. The preview is
+/// a summary line, not the paragraph: the body carries the full text once the
+/// card is opened.
+const COLLAPSED_NARRATION_CHARS: usize = 280;
+
+/// The narration a collapsed card previews, char-safe clipped. Narration is the
+/// card's own prose and never a chat row of its own: a busy turn speaks between
+/// dozens of calls, and printing those paragraphs into the history turns one
+/// card into a wall. The body still prints every paragraph in order when the
+/// card is expanded.
+fn collapsed_narration(live: &LiveTurn) -> Option<String> {
+    live.narration()
+        .last()
+        .map(|text| {
+            // One source line only (#2731). gpui's line_clamp shapes each
+            // newline-separated line against the budget left over from the
+            // lines before it, and subtracts with overflow when an earlier
+            // line already wrapped past the clamp, aborting the window. A
+            // single source line is shaped once against the full budget, so
+            // collapsing every whitespace run to one space removes the trigger.
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            fit(&flat, COLLAPSED_NARRATION_CHARS)
+        })
+        .filter(|text| !text.is_empty())
 }
 
 /// The running turn, drawn with the transcript's own block grammar: the
@@ -2489,6 +2926,43 @@ fn selection_rgba() -> u32 {
 /// What a successful copy tells the view that owns the composer (#2587).
 type CopiedListener = Rc<dyn Fn(&mut App)>;
 
+/// The press that may turn into an open (#2317): the text under the pointer,
+/// the link labels on it, and the byte offset the press landed on.
+///
+/// Resolving at press time and opening at release is what keeps the gesture
+/// honest. Opening on press would fire before a drag had a chance to start,
+/// so selecting a url to copy it would also launch the browser. Only a press
+/// that ends without a selection opens anything.
+struct PendingClick {
+    /// The drawn text the pointer was over, so a click offset can be turned
+    /// back into a token without re-rendering the row.
+    text: String,
+    /// Link labels on that text with their destinations, already rebased onto
+    /// it. A label wins over token resolution because `docs` carries no url.
+    links: Vec<(Range<usize>, String)>,
+    /// Byte offset into `text`, as the shaped layout reported it.
+    offset: usize,
+}
+
+impl PendingClick {
+    /// The destination this press named, if any: the label it landed on
+    /// first, then any path or url the token at that offset resolves to.
+    fn target(&self) -> Option<ClickTarget> {
+        links::target_for_click(&self.text, &self.links, self.offset)
+    }
+
+    /// The word the pointer was on, for the log line a miss writes. Clipped by
+    /// characters, never by bytes (#2271).
+    fn word(&self) -> String {
+        let start = self.offset.min(self.text.len());
+        let tail = self.text.get(start..).unwrap_or_default();
+        tail.chars()
+            .take_while(|c| !c.is_whitespace())
+            .take(40)
+            .collect()
+    }
+}
+
 /// Drag-to-copy over transcript rows (#2383) and their UTF-8 text ranges
 /// (#2529). Each row records the text its selectable segments render. GPUI's
 /// `TextLayout` turns a pointer into a byte offset; this state orders the two
@@ -2496,6 +2970,8 @@ type CopiedListener = Rc<dyn Fn(&mut App)>;
 #[derive(Default)]
 pub struct CopyDrag {
     texts: RefCell<Vec<String>>,
+    /// The press under the pointer, cleared by every release (#2317).
+    pending_click: RefCell<Option<PendingClick>>,
     anchor: Cell<Option<TextPoint>>,
     end: Cell<Option<TextPoint>>,
     dragging: Cell<bool>,
@@ -2556,8 +3032,40 @@ impl CopyDrag {
         ));
         if copied {
             self.announce_copied(app);
+        } else {
+            // Nothing was selected, so the press was a click: open whatever it
+            // landed on. A drag that copied must never also launch (#2317).
+            self.open_clicked_target();
         }
         window.refresh();
+    }
+
+    /// Open the target the press under the pointer named (#2317). Returns
+    /// whether anything opened, so a caller can tell a miss from a hit.
+    ///
+    /// The pending press is taken whether or not it resolves, so one press can
+    /// never open twice and a stale candidate cannot survive to the next
+    /// click.
+    pub fn open_clicked_target(&self) -> bool {
+        let Some(pending) = self.pending_click.borrow_mut().take() else {
+            return false;
+        };
+        let Some(target) = pending.target() else {
+            // A click that found nothing still gets a line, so "I clicked and
+            // nothing happened" can be told apart from a click that never
+            // arrived instead of guessed at.
+            crate::logging::info(&format!(
+                "transcript link: nothing to open at {:?}",
+                pending.word()
+            ));
+            return false;
+        };
+        crate::logging::info(&format!("transcript link: open {}", target.label()));
+        match &target {
+            ClickTarget::Url(url) => crate::preview::launch(&crate::preview::url_command(url)),
+            ClickTarget::File(path) => crate::preview::launch(&crate::preview::open_command(path)),
+        }
+        true
     }
 
     fn points(&self) -> Option<(TextPoint, TextPoint)> {
@@ -2702,16 +3210,34 @@ pub(crate) fn selectable_styled_text(
     text: String,
     style: TextStyle,
     highlights: Vec<(Range<usize>, HighlightStyle)>,
+    links: &[(Range<usize>, String)],
     selection: Option<&SelectionContext>,
 ) -> Div {
-    let segment_start = selection.map(|context| context.begin_segment(text.len()));
+    let accounted = text.len();
+    selectable_text_segment(text, accounted, &style, highlights, links, selection)
+}
+
+/// The same, for a segment that draws less text than the row's copy string
+/// accounts for (#2771). A line split around a crab picture hands each run the
+/// length the whole line would have given it, so the offsets after the picture
+/// still land on the characters the unsplit line put there. `accounted` only
+/// moves the bookkeeping; hit testing stays inside the text that is drawn.
+fn selectable_text_segment(
+    text: String,
+    accounted: usize,
+    style: &TextStyle,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    links: &[(Range<usize>, String)],
+    selection: Option<&SelectionContext>,
+) -> Div {
+    let segment_start = selection.map(|context| context.begin_segment(accounted));
     let selected = selection.and_then(|context| {
         context
             .drag
             .segment_range(context.row, segment_start?, text.len())
     });
     let highlights = highlights_with_selection(text.len(), highlights, selected);
-    let styled = StyledText::new(text.clone()).with_default_highlights(&style, highlights);
+    let styled = StyledText::new(text.clone()).with_default_highlights(style, highlights);
     let layout = styled.layout().clone();
     let base = div().child(styled);
     let Some(context) = selection else {
@@ -2722,9 +3248,19 @@ pub(crate) fn selectable_styled_text(
     let len = text.len();
     let begin = context.drag.clone();
     let extend = context.drag.clone();
+    let pressed = context.drag.clone();
     let move_layout = layout.clone();
+    // What the pointer is over, kept for the release so a click can open it.
+    let click_text = text.clone();
+    let click_links = links.to_vec();
     base.on_mouse_down(MouseButton::Left, move |event, window, cx| {
-        let offset = start + layout_offset(&layout, event.position, len);
+        let local = layout_offset(&layout, event.position, len);
+        *pressed.pending_click.borrow_mut() = Some(PendingClick {
+            text: click_text.clone(),
+            links: click_links.clone(),
+            offset: local,
+        });
+        let offset = start + local;
         begin.anchor.set(Some(TextPoint::new(row, offset)));
         begin.end.set(Some(TextPoint::new(row, offset)));
         begin.dragging.set(true);
@@ -2742,23 +3278,21 @@ pub(crate) fn selectable_styled_text(
     })
 }
 
-/// One stored message row: its own menu anchor and select-mode checkbox
-/// (#2613).
+/// One stored message row: its own right-press handler and select-mode
+/// checkbox (#2613).
 ///
-/// The row is `relative` because the menu card is an absolutely positioned
-/// child of it: the card belongs to the row that opened it, so it moves with
-/// the scroll instead of floating over the pane at a stale offset.
+/// The row owns no menu card: the open menu is drawn at the window root, at
+/// the point the press landed (#2690), so it is never pushed around by the
+/// row's own frame.
 fn message_row(
     id: uuid::Uuid,
     child: Div,
     click: Option<&ClickHandler>,
     press: Option<&PressHandler>,
-    menu: &Option<MessageMenu>,
     picked: Option<bool>,
 ) -> Stateful<Div> {
     let mut row = div()
         .id(SharedString::from(format!("msg-{id}")))
-        .relative()
         .flex()
         .flex_row()
         .items_start()
@@ -2802,17 +3336,13 @@ fn message_row(
         });
     }
     row = row.child(body);
-    // The card is the last child so it paints over the row it belongs to.
-    if let Some(open) = menu.as_ref().filter(|m| m.id == id) {
-        row = row.child(message_menu_card(&open.items));
-    }
     row
 }
 
-/// The menu card itself: one row per resolved item, drawn over the message it
-/// belongs to. It reuses the rail's card so the two menus are one surface, and
-/// only the id and the anchor differ.
-fn message_menu_card(items: &[(String, ClickHandler)]) -> AnyElement {
+/// The menu card itself: one row per resolved item, drawn at the pointer that
+/// opened it. It reuses the rail's card and popover so every menu is one
+/// surface with one placement rule (#2690).
+pub fn message_menu_popover(items: &[(String, ClickHandler)], at: Point<Pixels>) -> AnyElement {
     let palette = palette::current();
     let rows: Vec<Stateful<Div>> = items
         .iter()
@@ -2831,20 +3361,10 @@ fn message_menu_card(items: &[(String, ClickHandler)]) -> AnyElement {
                 .on_click(move |ev, window, app| pick(ev, window, app))
         })
         .collect();
-    // The card swallows a left press so the window's click-outside dismiss
-    // (#2613) does not remove it before its own item's click lands: the pick
-    // fires on mouse-up, the dismiss on mouse-down.
-    let card = crate::menu::menu_card("message-context-menu", rows);
-    div()
-        .id("message-context-menu-card")
-        .on_mouse_down(gpui::MouseButton::Left, |_ev, _window, cx| {
-            cx.stop_propagation();
-        })
-        .child(card)
-        .absolute()
-        .right_2()
-        .top_1()
-        .into_any_element()
+    // The card stops its own presses, so the transcript's dismiss handler
+    // never removes it before its item's click lands: the pick fires on
+    // mouse-up, the dismiss on mouse-down (#2613).
+    crate::menu::menu_popover("message-context-menu", rows, at)
 }
 
 /// A row that takes part in a drag. Text segments provide exact offsets; these
@@ -2865,6 +3385,7 @@ fn selectable_row<E: gpui::IntoElement>(
         .id(SharedString::from(format!("tblock-{ordinal}")))
         .when(selected, |d| d.bg(rgba(selection_rgba())))
         .on_mouse_down(MouseButton::Left, move |_ev, window, _app| {
+            start.pending_click.borrow_mut().take();
             start.anchor.set(Some(TextPoint::new(ordinal, 0)));
             start.end.set(Some(TextPoint::new(ordinal, 0)));
             start.dragging.set(true);
@@ -2956,8 +3477,6 @@ pub struct ViewHooks {
     pub message_click: HashMap<uuid::Uuid, ClickHandler>,
     /// Right press per stored message row: opens the message menu (#2613).
     pub message_press: HashMap<uuid::Uuid, PressHandler>,
-    /// The row whose menu is open, with its items. `None` closes it.
-    pub message_menu: Option<MessageMenu>,
     /// The picked rows while select mode is on, or `None` when it is off.
     pub selection: Option<HashSet<uuid::Uuid>>,
     /// A left press on the transcript's own background, so an open message
@@ -2990,7 +3509,6 @@ pub fn view(
         live_click,
         message_click,
         message_press,
-        message_menu,
         selection: selected,
         menu_dismiss,
     } = hooks;
@@ -3061,8 +3579,30 @@ pub fn view(
         ));
     }
     let last = state.turns.len().saturating_sub(1);
+    // A turn still being drawn by the live card is not drawn again from the
+    // rows a reload just installed: the persisted copy has the same question,
+    // the same header and the same answer, and the screen showed all three
+    // twice. The card owns the exchange until `live` clears.
+    let live_on_screen = busy || !live.is_empty();
+    let newest_is_live = live_on_screen
+        && state
+            .turns
+            .last()
+            .is_some_and(|turn| newest_live_turn_matches(turn, live));
+    // A merged read labels its rows by topic the way Telegram's All view does
+    // (#2762): the name shows once, then again whenever the topic changes. A
+    // single session carries no label, so nothing is drawn there.
+    let mut shown_origin: Option<&str> = None;
     for (ti, turn) in state.turns.iter().enumerate() {
-        let newest = ti == last;
+        if persisted_turn_is_hidden(ti, last, newest_is_live) {
+            continue;
+        }
+        if let Some(origin) = turn.origin.as_deref()
+            && shown_origin != Some(origin)
+        {
+            col = col.child(origin_divider(origin, shown_origin.is_some()));
+            shown_origin = Some(origin);
+        }
         let folded = !state.expanded.contains(&turn.anchor);
         let full = state.details.contains(&turn.anchor);
         // The card's head sits above the turn's first non-user row, as in the
@@ -3083,17 +3623,12 @@ pub fn view(
             if folded && !visible_when_folded(block, turn.final_idx, i) {
                 continue;
             }
-            // The live turn draws the running answer, and keeps drawing the
-            // settled one until the reload proves the row persisted. While it
-            // is on screen the persisted copy of that same answer stays out,
-            // so the conversation never shows it twice.
-            if (busy || !live.is_empty())
-                && newest
-                && let Block::Msg { role, .. } = block
-                && role == "assistant"
-            {
-                continue;
-            }
+            // Every row here belongs to a turn the live card is NOT drawing,
+            // which is why it is on screen at all. Narration and thinking stay
+            // inside the card; the answer a settled turn already produced
+            // draws here, and keeps drawing while the next request runs. The
+            // skip used to key on `busy` alone, so the previous answer
+            // disappeared for the whole duration of a new turn (#2709).
             let text = block_text(block);
             let mut selectable = None;
             let child: Div = match &drag {
@@ -3132,7 +3667,6 @@ pub fn view(
                         child,
                         message_click.get(id),
                         message_press.get(id),
-                        &message_menu,
                         picked,
                     )
                     .into_any_element();
@@ -3563,8 +4097,11 @@ mod tests {
         );
     }
 
-    /// #2536: the image needs its own concentric clip. Clipping only the
-    /// outer box still lets the image paint over the card's top corners.
+    /// #2796: the picture is painted from the square cache, so the radius it is
+    /// given lands on a quad that is exactly the tile's box. #2536 gave the
+    /// picture the concentric radius but left `Cover` painting a larger quad,
+    /// so the arc sat outside the tile's and its test, which only looked for
+    /// the string, stayed green over a tile that still bled.
     #[test]
     fn attachment_media_clips_inside_the_card_radius() {
         let src = include_str!("transcript.rs");
@@ -3574,15 +4111,30 @@ mod tests {
             .and_then(|rest| rest.split("/// The last cell").next())
             .expect("attachment cell");
         assert!(cell.contains(".rounded(px(CARD_RADIUS))"));
-        assert!(cell.contains(".rounded(px(concentric_radius(1.0)))"));
         assert!(cell.contains(".overflow_hidden()"));
+        assert!(
+            cell.contains("crate::thumbs::picture(") && cell.contains("px(concentric_radius(1.0))"),
+            "the tile paints the square crop at the concentric radius"
+        );
+        // The comment above the call names `Cover` while explaining why it was
+        // wrong, so the guard has to read code rather than prose. Same trap the
+        // #2793 scans hit, one layer down.
+        let code = cell
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("Cover"),
+            "a cover fit paints outside the tile, whatever radius it is given"
+        );
         assert_eq!(concentric_radius(1.0), CARD_RADIUS - 1.0);
     }
 
     /// The stored-rows split with nothing remembered, which is what most
     /// seats here exercise. Metrics have their own seats.
     fn turns(rows: &[Message], total: i64) -> (usize, Vec<Turn>) {
-        turns_with_metrics(rows, total, &HashMap::new())
+        turns_with_origins(rows, total, &HashMap::new(), &HashMap::new())
     }
 
     fn row(role: &str, content: &str, sequence: i32) -> Message {
@@ -3743,6 +4295,24 @@ mod tests {
         assert!(!block_text(&blocks[0]).contains("GUI-PLAN-JSON-SENTINEL"));
     }
 
+    /// #2756: a seed that still sits in the ledger must not paint. The plan
+    /// approval prompt is uppercase and the old filter only knew the title
+    /// case spelling, so 145 of them rendered as user bubbles.
+    #[test]
+    fn gui_transcript_never_paints_an_internal_seed() {
+        for seed in [
+            "[SYSTEM: PLAN APPROVED] The user approved the checklist.",
+            "[System: You just rebuilt yourself from source and restarted]",
+        ] {
+            assert!(
+                row_blocks(&row("user", seed, 1), None).is_empty(),
+                "{seed} is scaffolding, not a conversation row"
+            );
+        }
+        // A message the user typed is still a row of its own.
+        assert_eq!(row_blocks(&row("user", "hello", 1), None).len(), 1);
+    }
+
     /// The card's narration lines, in order, so a test reads the words the
     /// pane paints instead of the buffer they came from.
     fn narration_lines(live: &LiveTurn) -> Vec<String> {
@@ -3753,6 +4323,23 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The settle test measures the session, not the window (#2705): a
+    /// conversation past `WINDOW` rows keeps growing in the ledger while the
+    /// windowed turn count stays flat.
+    #[test]
+    fn row_total_counts_the_rows_the_window_hid() {
+        let state = TranscriptState {
+            hidden: 135,
+            rows: vec![row("user", "in the window", 1)],
+            ..Default::default()
+        };
+        assert_eq!(
+            state.row_total(),
+            136,
+            "the total the ledger reports is what a settle test has to read"
+        );
     }
 
     #[test]
@@ -3796,7 +4383,7 @@ mod tests {
         // must appear once (#2442).
         let mut live = LiveTurn::default();
         live.begin("question".into());
-        live.note_chunk("Checking the parser now.");
+        live.note_chunk_at("Checking the parser now.", std::time::Instant::now());
         live.push_narration("Checking the parser now.");
         assert_eq!(
             live.stream, "",
@@ -3820,13 +4407,13 @@ mod tests {
         );
 
         // Reasoning takes the same guard.
-        live.push_reasoning("think about it");
-        live.push_reasoning("think about it");
+        live.push_reasoning_at("think about it", std::time::Instant::now());
+        live.push_reasoning_at("think about it", std::time::Instant::now());
         assert_eq!(live.reasoning, "think about it");
 
         // Anything still streaming when a tool starts is narration, so it
         // joins the card before the row rather than leaking into the answer.
-        live.note_chunk("one more line");
+        live.note_chunk_at("one more line", std::time::Instant::now());
         live.push_tool(ToolCall::running("bash".into(), "bash: ls".into()));
         assert_eq!(
             narration_lines(&live),
@@ -3845,7 +4432,7 @@ mod tests {
         let mut live = LiveTurn::default();
         assert_eq!(live.tokens_per_sec(), 0.0);
         live.begin("question".into());
-        live.note_chunk("hello");
+        live.note_chunk_at("hello", std::time::Instant::now());
         assert!(live.tokens_per_sec() >= 0.0);
     }
 
@@ -4133,7 +4720,7 @@ mod tests {
                 tool_calls: 0,
             },
         );
-        let (_, mut turns) = turns_with_metrics(&rows, 2, &known);
+        let (_, mut turns) = turns_with_origins(&rows, 2, &known, &HashMap::new());
         let turn = turns.pop().expect("one turn");
         let segment = turn
             .metrics
@@ -4169,7 +4756,7 @@ mod tests {
                 tool_calls: 4,
             },
         );
-        let (_, mut turns) = turns_with_metrics(&rows, 2, &known);
+        let (_, mut turns) = turns_with_origins(&rows, 2, &known, &HashMap::new());
         let turn = turns.pop().expect("one turn");
         assert_eq!(
             turn.summary.tool_calls, 4,
@@ -4435,6 +5022,177 @@ mod tests {
         assert_eq!(live.streaming_active_secs(), 0.0);
     }
 
+    /// #2703: the window must survive how the UI happens to poll.
+    ///
+    /// `agent_bridge::drain` hands the whole batch over at once and the fold
+    /// walks it in one loop, so every chunk in a burst was stamped with a fold
+    /// time microseconds after the one before it. Measured on the owner's
+    /// screen that read 4640 tok/s where the log's own numbers imply ~180.
+    ///
+    /// The bound is not invented: the service refuses to report a rate above
+    /// `ui_core::rate::MAX_PLAUSIBLE_TOK_S` (2000), so a surface that prints
+    /// more than that is printing a number no other surface would.
+    #[test]
+    fn tps_a_folded_batch_does_not_print_a_rate_the_service_would_refuse() {
+        const SERVICE_CEILING: f32 = 2000.0;
+
+        // The receipt this reproduces (#2703): one turn logged 18382 tokens
+        // beside 592s of wall clock, and the surface printed 4640 tok/s. The
+        // token count was honest; the WINDOW was the lie. `agent_bridge::drain`
+        // hands the UI a batch and the fold stamps every chunk with
+        // `Instant::now()` as it walks that batch, so the whole burst lands
+        // inside a few dozen milliseconds of clock no matter how long the
+        // provider actually spent streaming it.
+        //
+        // The clock is injected here so the collapse is exact instead of
+        // depending on how fast this machine happens to fold 12 strings.
+        let base = std::time::Instant::now();
+        let mut live = LiveTurn::default();
+        live.begin("explain the design".into());
+        for i in 0..400u64 {
+            let text = "the quick brown fox jumps ";
+            live.note_chunk_at(text, base + std::time::Duration::from_micros(i * 250));
+        }
+
+        let tokens = live.tokens;
+        let active = live.streaming_active_secs();
+        let rate = live.tokens_per_sec();
+        assert!(
+            tokens > 0,
+            "the fold counted no tokens, so the rate is moot"
+        );
+        assert!(
+            active < 1.0,
+            "this test must model a collapsed window, got {active:.3}s"
+        );
+        assert!(
+            rate <= SERVICE_CEILING,
+            "{tokens} tokens over {active:.4}s of folded clock reads {rate:.0} tok/s, \
+             over the service's own {SERVICE_CEILING:.0} ceiling: the window collapsed \
+             because the clock is read at fold time, not at arrival"
+        );
+    }
+
+    /// #2703: a burst that collapses the window keeps the rate already on
+    /// screen instead of adopting an unbounded estimate.
+    ///
+    /// The first half of the bug is the too-short window; the second half is
+    /// that nothing bounded what the too-short window produced. Both halves
+    /// are pinned here: the burst is refused, and the footer keeps the number
+    /// it was already showing rather than blanking to zero.
+    #[test]
+    fn tps_a_collapsed_window_keeps_the_last_credible_rate() {
+        let base = std::time::Instant::now();
+        let mut live = LiveTurn::default();
+
+        // A turn that streamed: one chunk every 100ms for four seconds.
+        live.begin("first turn".into());
+        for i in 0..40u64 {
+            live.note_chunk_at(
+                "the quick brown fox jumps ",
+                base + std::time::Duration::from_millis(i * 100),
+            );
+        }
+        live.finalize(None);
+        let credible = live.tokens_per_sec();
+        assert!(
+            credible > 0.0 && credible <= 2000.0,
+            "a turn that streamed must measure a believable rate, got {credible}"
+        );
+
+        // The next turn arrives as one burst, so the window collapses.
+        live.begin("second turn".into());
+        for i in 0..400u64 {
+            live.note_chunk_at(
+                "the quick brown fox jumps ",
+                base + std::time::Duration::from_secs(30)
+                    + std::time::Duration::from_micros(i * 250),
+            );
+        }
+        assert_eq!(
+            live.tokens_per_sec(),
+            credible,
+            "a collapsed window must keep the rate already on screen"
+        );
+    }
+
+    /// #2703: two bursts three seconds apart still measure a believable rate.
+    ///
+    /// This is the shape the tracker exists for. A provider that answers in
+    /// bursts leaves gaps the idle rule must exclude, and the time inside each
+    /// burst is still streaming time. With arrival stamps the two windows
+    /// accumulate; with fold-time stamps the same batch lands in microseconds
+    /// and the window reads zero.
+    #[test]
+    fn tps_two_bursts_three_seconds_apart_measure_a_believable_rate() {
+        let base = std::time::Instant::now();
+        let mut live = LiveTurn::default();
+        live.begin("summarise the design".into());
+
+        // Burst one: five chunks 100ms apart, so 0.4s of streaming.
+        for i in 0..5u64 {
+            live.note_chunk_at(
+                "the quick brown fox jumps ",
+                base + std::time::Duration::from_millis(i * 100),
+            );
+        }
+        // Burst two, three seconds later: the gap exceeds the 1.0s idle rule,
+        // so it closes the first window and opens a second one.
+        for i in 0..5u64 {
+            live.note_chunk_at(
+                "the quick brown fox jumps ",
+                base + std::time::Duration::from_millis(3400 + i * 100),
+            );
+        }
+
+        let active = live.streaming_active_secs();
+        assert!(
+            (active - 0.8).abs() < 0.01,
+            "both bursts must count: 0.4s + 0.4s of streaming, got {active:.3}s"
+        );
+
+        let rate = live.tokens_per_sec();
+        assert!(
+            rate > 0.0 && rate <= 2000.0,
+            "ten chunks over 0.8s is a believable rate, got {rate:.0} tok/s"
+        );
+    }
+
+    /// #2703: the window reports exactly what the shared tracker measures.
+    ///
+    /// The terminal and the window run one tracker now (`ui_core::rate`), so
+    /// the same event sequence must produce the same number and the same
+    /// window. Before the move the window kept its own copy, and that copy is
+    /// what drifted: it read the clock when it drained a batch instead of when
+    /// the chunks arrived.
+    #[test]
+    fn tps_the_window_reports_exactly_what_the_shared_tracker_measures() {
+        let base = std::time::Instant::now();
+        let mut live = LiveTurn::default();
+        live.begin("same events both sides".into());
+        let mut shared = opencrabs::ui_core::rate::StreamingTpsTracker::default();
+
+        for i in 0..60u64 {
+            let at = base + std::time::Duration::from_millis(i * 100);
+            live.note_chunk_at("the quick brown fox jumps ", at);
+            shared.advance(at);
+        }
+
+        assert_eq!(
+            live.streaming_active_secs(),
+            shared.active_secs(),
+            "the window must measure the same streaming time the tracker does"
+        );
+        let shared_rate =
+            opencrabs::ui_core::rate::credible_rate(live.tokens, shared.active_secs())
+                .expect("six seconds of streaming must measure");
+        assert_eq!(
+            live.tokens_per_sec(),
+            shared_rate as f32,
+            "the window must report the shared tracker's number, not its own"
+        );
+    }
+
     /// A turn that produced no tokens must not overwrite the last good rate
     /// with a fake zero, and a rate of zero from the provider is not a
     /// measurement either.
@@ -4541,7 +5299,7 @@ mod tests {
     fn a_streaming_turn_without_tools_stops_saying_thinking() {
         let mut live = LiveTurn::default();
         live.begin("hello".into());
-        live.note_chunk("hello there, streaming now ");
+        live.note_chunk_at("hello there, streaming now ", std::time::Instant::now());
 
         let text = live_status_text(&live);
         assert!(!text.contains("thinking"), "got {text}");
@@ -4744,6 +5502,7 @@ mod tests {
             anchor: "a".into(),
             blocks: Vec::new(),
             final_idx: None,
+            origin: None,
         };
         assert_eq!(
             turn_footer_text(&turn).as_deref(),
@@ -4751,7 +5510,7 @@ mod tests {
             "the footer is the live card's line, settled: calls, ctx, its own rate, clock"
         );
         assert_eq!(
-            settled_verdict(turn.summary),
+            settled_verdict(&turn),
             ("\u{2705}", "Finished"),
             "a clean turn says Finished, not its step count"
         );
@@ -4777,6 +5536,7 @@ mod tests {
             anchor: "b".into(),
             blocks: Vec::new(),
             final_idx: None,
+            origin: None,
         };
         assert_eq!(
             turn_footer_text(&measured).as_deref(),
@@ -4791,21 +5551,163 @@ mod tests {
             anchor: "c".into(),
             blocks: Vec::new(),
             final_idx: None,
+            origin: None,
         };
         assert!(
             turn_footer_text(&unmeasured).is_none(),
             "no record, no number"
         );
-        assert_eq!(
-            settled_verdict(TurnSummary {
+        // The tally alone is not the verdict (#2707): a failed call with no
+        // answer after it is the shape of a turn that ended on the failure.
+        let dead_end = Turn {
+            header: Some("\u{274c} 1 step \u{b7} 1 tool call".into()),
+            summary: TurnSummary {
+                tool_calls: 1,
                 failed: 1,
                 ..Default::default()
-            }),
+            },
+            metrics: None,
+            preview: None,
+            anchor: "d".into(),
+            blocks: vec![Block::Tools {
+                calls: vec![ToolCall {
+                    name: "bash".into(),
+                    task_id: None,
+                    description: "bash: exit 1".into(),
+                    success: false,
+                    done: true,
+                }],
+            }],
+            final_idx: None,
+            origin: None,
+        };
+        assert_eq!(
+            settled_verdict(&dead_end),
             ("\u{274c}", "Failed"),
-            "one failed call and the head says Failed"
+            "one failed call and no answer after it, the head says Failed"
         );
         assert_eq!(clock_glyph(9), "\u{23f1} 0:09", "the clock pads seconds");
         assert_eq!(clock_glyph(3_725), "\u{23f1} 1:02:05", "and rolls hours");
+    }
+
+    /// #2707: the verdict asks whether the turn ENDED on a failure, not how
+    /// many calls failed along the way. A refusal the model worked around
+    /// leaves assistant text after its failed call, and that turn finished its
+    /// job. Only the LAST failure counts: text between two failures excuses the
+    /// first and not the second.
+    #[test]
+    fn answered_after_last_failure() {
+        fn failed_call() -> ToolCall {
+            ToolCall {
+                name: "bash".into(),
+                task_id: None,
+                description: "bash: exit 1".into(),
+                success: false,
+                done: true,
+            }
+        }
+        fn answer(text: &str) -> Block {
+            Block::Msg {
+                role: "assistant".into(),
+                content: text.into(),
+                time: String::new(),
+                placeholder: false,
+                message_id: None,
+                forward: None,
+            }
+        }
+        fn turn(blocks: Vec<Block>, failed: usize) -> Turn {
+            Turn {
+                header: Some("x".into()),
+                summary: TurnSummary {
+                    tool_calls: failed,
+                    failed,
+                    ..Default::default()
+                },
+                metrics: None,
+                preview: None,
+                anchor: "f".into(),
+                blocks,
+                final_idx: None,
+                origin: None,
+            }
+        }
+
+        let recovered = turn(
+            vec![
+                Block::Tools {
+                    calls: vec![failed_call()],
+                },
+                answer("done"),
+            ],
+            1,
+        );
+        assert!(
+            answered_after_the_last_failure(&recovered),
+            "text after the failure is the answer the turn was working toward"
+        );
+        assert_eq!(
+            settled_verdict(&recovered),
+            ("\u{2705}", "Finished"),
+            "a self-corrected refusal is not a failed turn"
+        );
+
+        let dead_end = turn(
+            vec![
+                answer("trying"),
+                Block::Tools {
+                    calls: vec![failed_call()],
+                },
+            ],
+            1,
+        );
+        assert!(
+            !answered_after_the_last_failure(&dead_end),
+            "a failure after the last text is a dead end"
+        );
+        assert_eq!(
+            settled_verdict(&dead_end),
+            ("\u{274c}", "Failed"),
+            "a turn that ends on a failure says Failed"
+        );
+
+        let two_failures = turn(
+            vec![
+                Block::Tools {
+                    calls: vec![failed_call()],
+                },
+                answer("let me try another way"),
+                Block::Tools {
+                    calls: vec![failed_call()],
+                },
+            ],
+            2,
+        );
+        assert_eq!(
+            settled_verdict(&two_failures),
+            ("\u{274c}", "Failed"),
+            "the LAST failure is the one the verdict reads"
+        );
+
+        let clean = turn(vec![answer("all good")], 0);
+        assert!(
+            !answered_after_the_last_failure(&clean),
+            "a turn with no failed call has nothing to answer"
+        );
+        assert_eq!(settled_verdict(&clean), ("\u{2705}", "Finished"));
+
+        let errored = Turn {
+            summary: TurnSummary {
+                has_error: true,
+                ..Default::default()
+            },
+            ..turn(vec![answer("the answer arrived anyway")], 0)
+        };
+        assert_eq!(
+            settled_verdict(&errored),
+            ("\u{274c}", "Failed"),
+            "a harness error row still means Failed, whatever came after it"
+        );
     }
 
     /// #2442: the live card is the only block now, so the pane never grows a
@@ -5098,5 +6000,366 @@ mod tests {
             row.contains(["release.", "release(window, app)"].concat().as_str()),
             "the row release goes through the one copy path"
         );
+    }
+
+    /// The duplicate the reader sees mid-turn: a reload installs the rows for
+    /// the turn the card is still drawing, so the screen holds two copies of
+    /// the question, the header and the answer. Identity is the question plus
+    /// its second, never the row's position.
+    #[test]
+    fn the_running_turn_is_recognised_in_the_rows_it_reloads() {
+        let mut live = LiveTurn::default();
+        live.begin("audit the repo config".into());
+        let stamped = live_time(live.sent_at);
+        let turn_with = |question: &str, time: String| Turn {
+            header: None,
+            summary: TurnSummary::default(),
+            metrics: None,
+            preview: None,
+            anchor: format!("{question}@{time}"),
+            blocks: vec![Block::Msg {
+                role: "user".into(),
+                content: question.into(),
+                time,
+                placeholder: false,
+                message_id: None,
+                forward: None,
+            }],
+            final_idx: None,
+            origin: None,
+        };
+        let turn = turn_with("audit the repo config", stamped.clone());
+        assert!(
+            newest_live_turn_matches(&turn, &live),
+            "the newest row is the question the card is drawing"
+        );
+
+        // The write can land a second after the send stamped the card.
+        let later = live
+            .sent_at
+            .and_then(|at| at.checked_add_signed(chrono::TimeDelta::seconds(1)))
+            .map(|at| live_time(Some(at)))
+            .unwrap_or_default();
+        assert!(
+            newest_live_turn_matches(&turn_with("audit the repo config", later), &live),
+            "a row stamped a second later is still the same exchange"
+        );
+
+        // A different question is a different turn, however close in time.
+        assert!(
+            !newest_live_turn_matches(&turn_with("something else", stamped), &live),
+            "a different question must not hide its answer"
+        );
+
+        // A row read back once identifies the exchange for good. A write that
+        // landed minutes late still belongs to this card, and matching by
+        // seconds alone would put the persisted turn and the card on screen
+        // together, which is the duplicate this fixes.
+        let mut known = LiveTurn::default();
+        known.begin("audit the repo config".into());
+        known.landed = true;
+        let drifted = known
+            .sent_at
+            .and_then(|at| at.checked_add_signed(chrono::TimeDelta::minutes(3)))
+            .map(|at| live_time(Some(at)))
+            .unwrap_or_default();
+        assert!(
+            newest_live_turn_matches(&turn_with("audit the repo config", drifted.clone()), &known),
+            "a question already read back is this exchange however late it was stamped"
+        );
+        assert!(
+            !newest_live_turn_matches(&turn_with("something else", drifted), &known),
+            "the text still decides, so a late stamp cannot hide another turn"
+        );
+    }
+
+    /// A turn resumed after a restart is drawn from a row the previous process
+    /// already wrote, so the card has to claim that row from its first frame.
+    /// The row keeps the original send time while the card stamps the resume
+    /// time, which can be minutes later, and matching on seconds alone painted
+    /// the question twice: once from the row, once from the echo (#2740).
+    #[test]
+    fn a_resumed_turn_hides_the_question_it_already_owns() {
+        let mut live = LiveTurn::default();
+        live.resume("audit the repo config".into());
+        let resumed_at = live.sent_at.expect("a resumed turn is stamped");
+        let original = resumed_at
+            .checked_sub_signed(chrono::TimeDelta::minutes(2))
+            .map(|at| live_time(Some(at)))
+            .unwrap_or_default();
+        let turn = Turn {
+            header: None,
+            summary: TurnSummary::default(),
+            metrics: None,
+            preview: None,
+            anchor: format!("audit the repo config@{original}"),
+            blocks: vec![Block::Msg {
+                role: "user".into(),
+                content: "audit the repo config".into(),
+                time: original,
+                placeholder: false,
+                message_id: None,
+                forward: None,
+            }],
+            final_idx: None,
+            origin: None,
+        };
+        let newest_is_live = newest_live_turn_matches(&turn, &live);
+        assert!(
+            newest_is_live,
+            "the resumed card draws the row the crashed process already wrote"
+        );
+        assert!(
+            persisted_turn_is_hidden(0, 0, newest_is_live),
+            "the row stays out while the resumed card draws the same question"
+        );
+    }
+
+    /// Resuming is not a fresh send: the row exists, so the card says so once
+    /// and stops asking whether the newest persisted turn is its own.
+    #[test]
+    fn resume_marks_the_turn_landed_and_keeps_the_question() {
+        let mut live = LiveTurn::default();
+        assert!(!live.landed, "nothing is in flight yet");
+        live.resume("audit the repo config".into());
+        assert_eq!(live.user.as_deref(), Some("audit the repo config"));
+        assert!(live.landed, "the ledger already holds the resumed question");
+        assert!(
+            live.sent_at.is_some(),
+            "the card still shows when the turn resumed"
+        );
+        // A fresh send must keep asking: its row does not exist yet.
+        live.begin("audit the repo config".into());
+        assert!(!live.landed, "begin is a new send, not a resume");
+    }
+
+    /// A finished answer keeps its place in the conversation while the next
+    /// request runs. The card owns one exchange at a time, so only the turn it
+    /// is drawing may be hidden; the previous turn prints from its rows even
+    /// though the new turn holds the busy flag for its whole duration (#2709).
+    #[test]
+    fn the_previous_answer_is_drawn_while_the_next_turn_runs() {
+        // Four turns on screen, the fourth being the one the card draws.
+        let last = 3;
+        assert!(
+            !persisted_turn_is_hidden(2, last, true),
+            "the answer just finished must not vanish when a new request starts"
+        );
+        assert!(
+            !persisted_turn_is_hidden(0, last, true),
+            "older turns are never hidden by the live card"
+        );
+        assert!(
+            persisted_turn_is_hidden(last, last, true),
+            "the exchange the card is drawing stays out of the rows"
+        );
+        assert!(
+            !persisted_turn_is_hidden(last, last, false),
+            "with no card on screen the newest turn prints from its rows"
+        );
+    }
+
+    /// Narration is the card's own summary, never a chat row of its own: the
+    /// collapsed card previews the newest paragraph inside its frame, and the
+    /// body prints every paragraph in order once the card is opened.
+    #[test]
+    fn narration_previews_inside_the_collapsed_card() {
+        let mut live = LiveTurn::default();
+        live.begin("go".into());
+        live.push_tool(ToolCall::running("bash".into(), "bash: ls".into()));
+        live.push_narration("I'll audit the repo config first.");
+        live.push_narration("Then I'll check the runner setup.");
+        let said: Vec<&str> = live.narration().collect();
+        assert_eq!(
+            said,
+            vec![
+                "I'll audit the repo config first.",
+                "Then I'll check the runner setup."
+            ],
+            "narration keeps the order it was spoken in"
+        );
+        assert_eq!(
+            collapsed_narration(&live).as_deref(),
+            Some("Then I'll check the runner setup."),
+            "the collapsed card previews the newest paragraph only"
+        );
+        assert_eq!(
+            live.answer(),
+            None,
+            "narration is not the answer: the bubble below the card stays empty"
+        );
+
+        let mut quiet = LiveTurn::default();
+        quiet.begin("go".into());
+        quiet.push_tool(ToolCall::running("bash".into(), "bash: ls".into()));
+        assert_eq!(
+            collapsed_narration(&quiet),
+            None,
+            "a card that has said nothing previews nothing"
+        );
+    }
+
+    /// The preview clips on a character boundary, so a long paragraph in a
+    /// non-ASCII language never splits a glyph.
+    #[test]
+    fn a_collapsed_preview_clips_on_a_character_boundary() {
+        let mut live = LiveTurn::default();
+        live.begin("go".into());
+        live.push_narration(&"é".repeat(COLLAPSED_NARRATION_CHARS + 40));
+        let preview = collapsed_narration(&live).expect("a preview");
+        assert_eq!(
+            preview.chars().count(),
+            COLLAPSED_NARRATION_CHARS + 1,
+            "the budget plus the ellipsis"
+        );
+        assert!(preview.ends_with('\u{2026}'), "a clipped preview says so");
+    }
+
+    /// The preview renders under `.line_clamp(3)`. gpui shapes each
+    /// newline-separated line against the budget the earlier lines left, and
+    /// subtracts with overflow once a line wraps past the clamp, aborting the
+    /// window (#2731). The preview must stay a single source line so that
+    /// subtraction can never run.
+    #[test]
+    fn a_collapsed_preview_is_a_single_source_line() {
+        let mut live = LiveTurn::default();
+        live.begin("go".into());
+        let first = "word ".repeat(40);
+        live.push_narration(&format!("{first}\nand a second paragraph"));
+        let preview = collapsed_narration(&live).expect("a preview");
+        assert!(
+            !preview.contains('\n') && !preview.contains('\r'),
+            "a clamped preview carries no line break gpui could underflow on"
+        );
+        assert!(
+            !preview.contains("  "),
+            "whitespace runs collapse to a single space"
+        );
+    }
+
+    /// One drawn text segment of an inline-crab line: the offset the row's copy
+    /// string gives it. This is the transcript's own `begin_segment` rule,
+    /// written out so the arithmetic below can be replayed without a window.
+    fn segment_start(offset: &mut usize, segments: &mut usize, accounted: usize) -> usize {
+        let start = if *segments == 0 { 0 } else { *offset + 1 };
+        *offset = start + accounted;
+        *segments += 1;
+        start
+    }
+
+    /// A flex row breaks between children, never inside one, so a long run of
+    /// words is cut at its spaces (#2771). Each chunk ends after its space, and
+    /// the chunk lengths are what the selection accounting consumes.
+    #[test]
+    fn an_inline_line_wraps_at_its_spaces() {
+        let chunks = inline_chunks("one two three", 0..13, 13);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].0, 0..4);
+        assert_eq!(chunks[1].0, 4..8);
+        assert_eq!(chunks[2].0, 8..13);
+        // The drawn bytes of the run are exactly the chunks, in order.
+        assert_eq!(
+            chunks.iter().map(|(range, _)| range.len()).sum::<usize>(),
+            13
+        );
+        // A single word is one chunk that claims the whole run.
+        assert_eq!(inline_chunks("hi ", 0..3, 3), vec![(0..3, 3)]);
+    }
+
+    /// The reason `inline_chunks` carries lengths at all: replay what
+    /// `inline_crabs` declares to `SelectionContext` and every text chunk must
+    /// start at the offset the whole, unsplit line puts it at. A picture takes
+    /// no segment, and its bytes ride on the run ahead of it. Drift here moves
+    /// drag-select and copy by one character per split.
+    #[test]
+    fn split_chunks_keep_the_offsets_of_the_whole_line() {
+        for line in [
+            "hi :cry: there",
+            "one two :ok: three four five",
+            ":cry: a long line of words still wraps",
+            "a :ok: b",
+            ":cry:",
+            "plain words only",
+        ] {
+            let Some(pieces) = topic_icons::inline_pieces(line) else {
+                continue;
+            };
+            let mut offset = 0;
+            let mut segments = 0;
+            for piece in pieces {
+                if piece.crab.is_some() {
+                    continue;
+                }
+                if piece.range.is_empty() {
+                    segment_start(&mut offset, &mut segments, piece.accounted);
+                    continue;
+                }
+                let chunks = inline_chunks(line, piece.range.clone(), piece.accounted);
+                assert!(!chunks.is_empty(), "{line}: a run draws nothing");
+                for (range, accounted) in chunks {
+                    let start = segment_start(&mut offset, &mut segments, accounted);
+                    assert_eq!(
+                        start, range.start,
+                        "{line}: a chunk starts at {start}, not {}",
+                        range.start
+                    );
+                }
+            }
+            assert_eq!(offset, line.len(), "{line}: the row ends short");
+        }
+    }
+
+    /// A bold span crossing a crab stays bold on both sides of it: each chunk
+    /// keeps the part of the span it covers, moved onto its own bytes (#2771).
+    #[test]
+    fn a_highlight_follows_the_chunk_it_lands_in() {
+        let bold = HighlightStyle::default();
+        let highlights = vec![(0..9, bold)];
+        assert!(local_highlights(&highlights, &(9..12)).is_empty());
+        assert_eq!(local_highlights(&highlights, &(4..9)), vec![(0..5, bold)]);
+        assert_eq!(local_highlights(&highlights, &(2..6)), vec![(0..4, bold)]);
+    }
+
+    /// Cutting a run at its spaces must keep every chunk on a char boundary: a
+    /// chunk range becomes a slice of the line at paint time, and accented text
+    /// or an emoji sitting next to a crab would panic there instead of failing
+    /// here (#2771, #2298).
+    #[test]
+    fn multi_byte_runs_cut_on_char_boundaries() {
+        for line in [
+            "ação pedaço 🦀 fim",
+            "日本語 と :cry: と 漢字",
+            "olá :cry: mundo",
+        ] {
+            for chunks in [
+                inline_chunks(line, 0..line.len(), line.len()),
+                topic_icons::inline_pieces(line)
+                    .map(|pieces| {
+                        pieces
+                            .iter()
+                            .filter(|piece| piece.crab.is_none() && !piece.range.is_empty())
+                            .flat_map(|piece| {
+                                inline_chunks(line, piece.range.clone(), piece.accounted)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ] {
+                for (range, _) in chunks {
+                    assert!(
+                        line.is_char_boundary(range.start),
+                        "{line}: a chunk starts mid-character at {}",
+                        range.start
+                    );
+                    assert!(
+                        line.is_char_boundary(range.end),
+                        "{line}: a chunk ends mid-character at {}",
+                        range.end
+                    );
+                    line.get(range.clone())
+                        .unwrap_or_else(|| panic!("{line}: chunk range is not a slice"));
+                }
+            }
+        }
     }
 }

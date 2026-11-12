@@ -646,6 +646,26 @@ const TABLE_19: &[DialogKey] = &[
         verb: "delete",
     },
     DialogKey {
+        events: &[k(KeyCode::Char('t'))],
+        label: "t",
+        verb: "topic",
+    },
+    DialogKey {
+        events: &[k(KeyCode::Char('g'))],
+        label: "g",
+        verb: "group",
+    },
+    DialogKey {
+        events: &[k(KeyCode::Char('c'))],
+        label: "c",
+        verb: "close",
+    },
+    DialogKey {
+        events: &[k(KeyCode::Char('z'))],
+        label: "z",
+        verb: "fold",
+    },
+    DialogKey {
         events: &[k(KeyCode::Char('f'))],
         label: "f",
         verb: "files",
@@ -672,6 +692,16 @@ const TABLE_19: &[DialogKey] = &[
         events: &[k(KeyCode::Char('_'))],
         label: "_",
         verb: "split v",
+    },
+    DialogKey {
+        events: &[k(KeyCode::Char('s'))],
+        label: "s",
+        verb: "plan filter",
+    },
+    DialogKey {
+        events: &[k(KeyCode::Char('a'))],
+        label: "a",
+        verb: "automation",
     },
     DialogKey {
         events: &[k(KeyCode::Char('/'))],

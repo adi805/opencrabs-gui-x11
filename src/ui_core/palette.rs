@@ -488,6 +488,18 @@ pub enum PaletteAction {
     /// The conversation picked in the favorite picker: the frontend runs
     /// its own pin toggle on it, the same one its rail button walks (#2487).
     FavoriteToggle(u128),
+    /// Arm the card as a session picker for grouping: the conversation the
+    /// pick names is the holder, and the frontend's own group topics modal
+    /// attaches the existing conversations under it (#2713).
+    GroupTopics,
+    /// The conversation picked in the group picker: the frontend opens the
+    /// group topics modal it already reaches from a rail row's right-click
+    /// menu (#2713).
+    GroupTopicsOn(u128),
+    /// Start a split with the layout the row names: the frontend walks the
+    /// same door its chord and its row menu walk, from the pane holding the
+    /// caret (#2712).
+    BeginSplit(crate::ui_core::split::Layout),
 }
 
 /// Why the card is armed as a session picker. The purpose decides what a
@@ -498,6 +510,23 @@ pub enum PickFor {
     NewTopic,
     /// The pick pins the conversation to the top of the rail.
     Favorite,
+    /// The pick names the conversation that holds the topics the group modal
+    /// attaches under it (#2713).
+    GroupTopics,
+}
+
+/// The one sentence a frontend prints while the card is armed, so both
+/// surfaces say the same thing and neither keeps a second copy (#2711).
+///
+/// The pick is a list of conversations with an empty field, which reads as
+/// the ordinary card unless the field names the job. Each sentence is short
+/// enough to sit in one field line at the narrowest card width.
+pub fn pick_prompt(purpose: PickFor) -> &'static str {
+    match purpose {
+        PickFor::NewTopic => "pick the session that gets the new topic",
+        PickFor::Favorite => "pick the session to pin to the top",
+        PickFor::GroupTopics => "pick the session that holds the topics",
+    }
 }
 
 /// One pickable row, already flat: the frontend paints it and nothing else.
@@ -726,6 +755,11 @@ const SHORT_TOKENS: &[&str] = &[
 const MIN_EXACT_CHARS: usize = 3;
 const MIN_PREFIX_CHARS: usize = 4;
 const SKILL_DESCRIPTION_WORDS: usize = 12;
+/// A session is named only by its title, so a word of four or more characters
+/// may land inside one title word and still find it. The tier sits below a
+/// whole-word keyword or subtitle hit, so a mid-word guess never outranks a
+/// field that actually says the word.
+const TITLE_SUBSTRING_POINTS: u16 = 450;
 const PHRASE_ABBREVIATIONS: &[(&str, &[&str])] = &[("gst", &["git", "status"])];
 /// A generic intent can name more than one docs page. Keep the established
 /// destination when a newer page also carries the same word.
@@ -760,9 +794,19 @@ fn score_normalized(query: &NormalizedQuery, item: &PaletteItem) -> Option<u16> 
     // that duplicate as the same bounded prose, not as a stronger keyword
     // field that can reintroduce matches the description limit rejected.
     let skill_prose = item.kind == PaletteKind::Skill;
+    // A session carries its name in the title alone, and that name is not
+    // always a whole word: `proxy` has to find `OCProxy`. Every other kind
+    // keeps whole-word title matching, because its keywords and its subtitle
+    // already carry the intent and a mid-word guess there is only noise.
+    let title_substring = if item.kind == PaletteKind::Session {
+        TITLE_SUBSTRING_POINTS
+    } else {
+        0
+    };
     let fields = [
         (&command, 1100u16, false, false),
         (&title, 1000, false, false),
+        (&title, title_substring, false, true),
         (&keywords, 700, false, false),
         (
             &subtitle,
@@ -777,6 +821,10 @@ fn score_normalized(query: &NormalizedQuery, item: &PaletteItem) -> Option<u16> 
     for group in query.groups() {
         let mut best = None;
         for (tokens, weight, is_prose, allow_substring) in &fields {
+            // A zero weight switches a field off for this item kind.
+            if *weight == 0 {
+                continue;
+            }
             if *is_prose && (item.kind != PaletteKind::Skill || query.groups().len() < 2) {
                 continue;
             }
@@ -1088,6 +1136,21 @@ impl PaletteState {
         self.cursor = Some(row.min(len - 1));
     }
 
+    /// Swap the row catalog while the card stays open, keeping the query and
+    /// caret. The Seeker's deep search rebuilds the conversation rows when
+    /// content hits land (#2721); the armed row and scroll re-clamp to the new
+    /// list so neither points past it. A refresh is not a typed edit, so it
+    /// keeps the user's place instead of disarming it.
+    pub fn refresh_items(&mut self, items: Vec<PaletteItem>) {
+        self.items = items;
+        let len = self.visible().len();
+        self.cursor = match self.cursor {
+            Some(ix) if len > 0 => Some(ix.min(len - 1)),
+            _ => None,
+        };
+        self.scroll = self.scroll.min(len.saturating_sub(1));
+    }
+
     /// Replace a character range and put the caret after the replacement.
     /// Every real edit funnels through here, so every edit also disarms the
     /// old result row and returns the list to its first page (#2534).
@@ -1269,6 +1332,7 @@ impl PaletteState {
                     item.action = match purpose {
                         PickFor::NewTopic => PaletteAction::NewTopicOn(id),
                         PickFor::Favorite => PaletteAction::FavoriteToggle(id),
+                        PickFor::GroupTopics => PaletteAction::GroupTopicsOn(id),
                     };
                 }
                 score_normalized(&normalized, &item).map(|score| PaletteRow { item, score })
@@ -2023,6 +2087,105 @@ mod tests {
         assert_eq!(rows[0].item.action, PaletteAction::RunSlash("/whisper"));
     }
 
+    /// #2721: a session whose title never names the query still surfaces when
+    /// its messages do. The deep search hands the row the matching snippet as
+    /// its subtitle and the query as a keyword, so the engine ranks it in.
+    #[test]
+    fn seeker_content_only_session_surfaces_with_a_snippet() {
+        let snippet = "we shipped the kubernetes rollout today";
+        let mut state = PaletteState::new(vec![
+            PaletteItem::new(
+                "Deploy notes",
+                snippet,
+                PaletteKind::Session,
+                PaletteAction::OpenSession(42),
+            )
+            .with_keywords("kubernetes"),
+        ]);
+        state.insert_text("kubernetes");
+        let rows = state.visible();
+        let row = rows
+            .iter()
+            .find(|r| r.item.action == PaletteAction::OpenSession(42))
+            .expect("the content-only session surfaces");
+        assert_eq!(row.item.subtitle, snippet, "the snippet stands in");
+    }
+
+    /// #2721: a title match keeps its date subtitle and still ranks in. Deep
+    /// search adds content hits without changing how a named session is found.
+    #[test]
+    fn seeker_title_match_is_unchanged_by_deep_search() {
+        let mut state = PaletteState::new(vec![PaletteItem::new(
+            "kubernetes deploy",
+            "2026-11-05 12:00",
+            PaletteKind::Session,
+            PaletteAction::OpenSession(7),
+        )]);
+        state.insert_text("kubernetes");
+        let rows = state.visible();
+        let row = rows
+            .iter()
+            .find(|r| r.item.action == PaletteAction::OpenSession(7))
+            .expect("the title match surfaces");
+        assert_eq!(row.item.subtitle, "2026-11-05 12:00", "the date stays");
+    }
+
+    /// #2721: swapping the catalog keeps the query and caret, and re-clamps the
+    /// armed row so it never points past the shorter list.
+    #[test]
+    fn seeker_refresh_items_keeps_query_and_clamps_cursor() {
+        let mut state = PaletteState::new(vec![
+            item("alpha one", PaletteKind::Command),
+            item("alpha two", PaletteKind::Command),
+            item("alpha three", PaletteKind::Command),
+        ]);
+        state.insert_text("alpha");
+        state.arm(2);
+        assert_eq!(state.cursor, Some(2));
+        state.refresh_items(vec![item("alpha one", PaletteKind::Command)]);
+        assert_eq!(state.query(), "alpha", "the query survives");
+        assert_eq!(state.caret(), 5, "the caret survives");
+        assert_eq!(state.cursor, Some(0), "the cursor clamps to the list");
+    }
+
+    /// #2721: the card opens with title rows only, then the debounced content
+    /// read lands and refresh_items rebuilds the catalog. The late hit now
+    /// surfaces with its snippet while the typed query is left untouched.
+    #[test]
+    fn seeker_refresh_items_surfaces_a_late_content_hit() {
+        let mut state = PaletteState::new(vec![PaletteItem::new(
+            "Deploy notes",
+            "2026-11-05 12:00",
+            PaletteKind::Session,
+            PaletteAction::OpenSession(42),
+        )]);
+        state.insert_text("kubernetes");
+        assert!(
+            state
+                .visible()
+                .iter()
+                .all(|r| r.item.action != PaletteAction::OpenSession(42)),
+            "no title match before the content read"
+        );
+        let snippet = "we shipped the kubernetes rollout today";
+        state.refresh_items(vec![
+            PaletteItem::new(
+                "Deploy notes",
+                snippet,
+                PaletteKind::Session,
+                PaletteAction::OpenSession(42),
+            )
+            .with_keywords("kubernetes"),
+        ]);
+        let rows = state.visible();
+        let row = rows
+            .iter()
+            .find(|r| r.item.action == PaletteAction::OpenSession(42))
+            .expect("the late content hit surfaces");
+        assert_eq!(row.item.subtitle, snippet);
+        assert_eq!(state.query(), "kubernetes", "the query is untouched");
+    }
+
     /// The favorite row answers to the words a user types (#2487).
     #[test]
     fn seeker_favorite_row_answers_to_the_words() {
@@ -2087,6 +2250,90 @@ mod tests {
         );
     }
 
+    /// The pick prints one sentence naming its job, and no two purposes share
+    /// it: a card that says the same thing for every pick names nothing
+    /// (#2711).
+    #[test]
+    fn every_pick_prints_its_own_sentence() {
+        let purposes = [PickFor::NewTopic, PickFor::Favorite, PickFor::GroupTopics];
+        let sentences: Vec<&str> = purposes.iter().map(|it| pick_prompt(*it)).collect();
+        for (purpose, sentence) in purposes.iter().zip(&sentences) {
+            assert!(!sentence.is_empty(), "{purpose:?} prints a sentence");
+            assert_eq!(
+                *sentence,
+                pick_prompt(*purpose),
+                "{purpose:?} says the same thing twice"
+            );
+        }
+        assert_eq!(
+            sentences[0], "pick the session that gets the new topic",
+            "the topic pick names the session that receives the topic"
+        );
+        assert_eq!(
+            sentences[1], "pick the session to pin to the top",
+            "the favorite pick names the pin"
+        );
+        assert_eq!(
+            sentences[2], "pick the session that holds the topics",
+            "the group pick names the holder"
+        );
+    }
+
+    /// Picking the group row arms the same picker and the pick names the
+    /// conversation that holds the topics, instead of opening it (#2713).
+    #[test]
+    fn seeker_group_pick_names_the_holder() {
+        let sessions = vec![PaletteItem::new(
+            "crabsland ops",
+            "2026-11-03 08:00",
+            PaletteKind::Session,
+            PaletteAction::OpenSession(7),
+        )];
+        let mut state = PaletteState::picking(PickFor::GroupTopics, sessions);
+        assert_eq!(
+            state.visible().len(),
+            1,
+            "an empty field prints every conversation"
+        );
+        for c in "crabs".chars() {
+            state.type_char(c);
+        }
+        assert_eq!(
+            state.selected().map(|r| r.item.action),
+            Some(PaletteAction::GroupTopicsOn(7)),
+            "the pick names the holder, it does not open the chat"
+        );
+    }
+
+    /// Every purpose maps a session row to its own action: a new variant
+    /// cannot fall through to opening the chat (#2711).
+    #[test]
+    fn every_pick_purpose_maps_to_its_own_action() {
+        let row = || {
+            vec![PaletteItem::new(
+                "invoices",
+                "2026-11-02 21:00",
+                PaletteKind::Session,
+                PaletteAction::OpenSession(2),
+            )]
+        };
+        for (purpose, expected) in [
+            (PickFor::NewTopic, PaletteAction::NewTopicOn(2)),
+            (PickFor::Favorite, PaletteAction::FavoriteToggle(2)),
+            (PickFor::GroupTopics, PaletteAction::GroupTopicsOn(2)),
+        ] {
+            let mut state = PaletteState::picking(purpose, row());
+            for c in "invo".chars() {
+                state.type_char(c);
+            }
+            assert_eq!(
+                state.selected().map(|r| r.item.action),
+                Some(expected),
+                "{purpose:?} must carry its own action"
+            );
+        }
+    }
+
     /// Picking the row re-arms the card as a picker: empty field, every
     /// conversation, typing narrows, and a pick names the session for the
     /// topic dialog instead of opening the chat. A miss in the picker stays
@@ -2139,6 +2386,85 @@ mod tests {
         assert!(score("configuracao", &target).is_some());
         assert!(score("ção", &target).is_none());
         assert!(score("zzz", &target).is_none());
+    }
+
+    /// A session is named by its title and nothing else, so a word that sits
+    /// inside that name still has to find it (#2674).
+    #[test]
+    fn session_title_matches_a_word_inside_it() {
+        let session = PaletteItem::new(
+            "OCProxy",
+            "2026-11-07 01:28",
+            PaletteKind::Session,
+            PaletteAction::OpenSession(9),
+        );
+        assert!(
+            score("proxy", &session).is_some(),
+            "lowercase proxy must find the OCProxy session"
+        );
+        assert!(
+            score("PROXY", &session).is_some(),
+            "uppercase PROXY must find it too"
+        );
+        assert!(score("ocproxy", &session).is_some(), "exact title");
+        assert!(
+            score("ocpr", &session).is_some(),
+            "a four-letter prefix still matches"
+        );
+        assert!(
+            score("ocp", &session).is_none(),
+            "three characters stay below the prefix floor"
+        );
+        assert!(score("ox", &session).is_none(), "two letters stay noise");
+        assert!(
+            score("roxy", &session).is_some(),
+            "a four-letter word inside the title matches"
+        );
+    }
+
+    /// The mid-word title tier is a guess, so a field that actually says the
+    /// word still wins (#2674).
+    #[test]
+    fn a_whole_word_hit_outranks_a_mid_word_title() {
+        let mid_word = PaletteItem::new(
+            "OCProxy",
+            "2026-11-07 01:28",
+            PaletteKind::Session,
+            PaletteAction::OpenSession(9),
+        );
+        let keyword = PaletteItem::new(
+            "Session nine",
+            "2026-11-07 01:28",
+            PaletteKind::Session,
+            PaletteAction::OpenSession(10),
+        )
+        .with_keywords("proxy");
+        let mid = score("proxy", &mid_word).expect("mid-word title match");
+        let word = score("proxy", &keyword).expect("keyword match");
+        assert!(
+            word > mid,
+            "keyword {word} must outrank mid-word title {mid}"
+        );
+    }
+
+    /// Only a session leans on its title for its name. A command keeps
+    /// whole-word title matching, so a mid-word guess cannot surface it.
+    #[test]
+    fn a_command_title_keeps_whole_word_matching() {
+        let command = PaletteItem::new(
+            "OCProxy",
+            "saved shortcut",
+            PaletteKind::Command,
+            PaletteAction::RunSlash("/proxy"),
+        );
+        assert!(
+            score("proxy", &command).is_none(),
+            "a command title does not match a word inside it"
+        );
+        assert!(
+            score("ocproxy", &command).is_some(),
+            "the whole title still matches"
+        );
     }
 
     /// The idle card opens on the curated menu: destinations lead, the two

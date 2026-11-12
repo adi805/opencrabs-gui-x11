@@ -2237,18 +2237,10 @@ pub fn apply_all_prompt_text(provider_name: &str, model: &str, sessions: usize) 
 
 /// The model a provider tile may switch to without a second screen.
 ///
-/// A picker listing exactly one model has nothing to choose: the tile the
-/// user just tapped IS the choice. v0.5.15 answered that tap with a second
-/// screen holding the one model already marked ✓ (it is the active one), so
-/// the tap read as dead. The built-in `opencrabs` provider has exactly one
-/// model, which is how it surfaced. Returns `None` for zero or several
-/// models, where the list is a real choice and must still be shown.
-pub fn single_model_choice(models: &[String]) -> Option<&str> {
-    match models {
-        [only] => Some(only.as_str()),
-        _ => None,
-    }
-}
+/// The decision lives in `ui_core` beside the catalogue, so the TUI, the GUI
+/// and every channel resolve through the same rule (#2782). Re-exported here
+/// because the channel callers and their tests reach it at this path.
+pub use crate::ui_core::model_selector::single_model_choice;
 
 /// Build the Telegram `callback_data` for a model button, guaranteed to fit
 /// Telegram's 64-byte limit. Uses the literal `model:<provider>|<name>` when
@@ -2324,10 +2316,17 @@ async fn resolve_loose_pair(
     use crate::utils::model_match::{ModelMatch, match_model, split_provider_and_model};
 
     let Some((provider_ref, model_ref)) = split_provider_and_model(arg) else {
-        return Err(format!(
-            "'{arg}' names a provider but no model. Try `/models <provider> <model>`, \
-             or send /models for the picker."
-        ));
+        // A bare provider name is not a model reference, but it can still be
+        // the whole answer: a provider offering exactly one model has nothing
+        // to pick, so `/models opencrabs` means
+        // `/models opencrabs/deepseek-v4.1-flash` (#2782). Zero or several
+        // models keep the prompt, because a guessed model is the failure this
+        // path exists to avoid.
+        if !crate::brain::provider::factory::is_known_provider_name(config, arg) {
+            return Err(bare_provider_err(arg));
+        }
+        let offered = models_for_provider(arg).await;
+        return bare_provider_pair(arg, &offered.models);
     };
 
     if !crate::brain::provider::factory::is_known_provider_name(config, &provider_ref) {
@@ -2354,6 +2353,29 @@ async fn resolve_loose_pair(
             "No model on {provider_ref} matches '{model_ref}'. Send /models for the picker."
         )),
     }
+}
+
+/// Resolve a bare provider name against the models that provider offers.
+///
+/// `offered` is the list the picker renders, so the two agree on what counts
+/// as one model. Exactly one model is the answer; zero (no key, nothing
+/// configured) or several (a real choice) return the qualify-it prompt rather
+/// than a guess.
+pub(crate) fn bare_provider_pair(
+    arg: &str,
+    offered: &[String],
+) -> Result<(String, String), String> {
+    match single_model_choice(offered) {
+        Some(model) => Ok((arg.to_string(), model.to_string())),
+        None => Err(bare_provider_err(arg)),
+    }
+}
+
+fn bare_provider_err(arg: &str) -> String {
+    format!(
+        "'{arg}' names a provider but no model. Try `/models <provider> <model>`, \
+         or send /models for the picker."
+    )
 }
 
 /// Direct-argument model switch (#467): `/models <provider/model>` applies

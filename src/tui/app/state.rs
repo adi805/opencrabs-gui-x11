@@ -7,107 +7,7 @@ use super::events::{
     SudoPasswordResponse, ToolApprovalRequest, ToolApprovalResponse, TuiEvent,
 };
 
-/// Live tok/s accumulator for the footer field.
-///
-/// Tracks ACTIVE streaming time (windows where token deltas are arriving
-/// continuously) and stashes the last finalized rate so the footer keeps
-/// showing the previous turn's tok/s during idle until the next turn
-/// produces its first token. Excludes tool execution waits, approval
-/// prompts, between-stream network round-trips — anything more than 1s
-/// without a token closes the current window.
-///
-/// 2026-05-28 user report: pre-tracker the footer divided streaming
-/// tokens by full wall-clock elapsed, so a 30s tool exec turned a
-/// 200 tok/s burst into "8 tok/s" mid-turn.
-#[derive(Debug, Clone, Default)]
-pub struct StreamingTpsTracker {
-    /// Accumulated active streaming seconds for the current turn.
-    active_secs: f64,
-    /// Instant the current open window started.
-    window_start: Option<std::time::Instant>,
-    /// Instant of the most recent advance() call (= last token event).
-    last_token_at: Option<std::time::Instant>,
-    /// Last finalized tok/s value. Persists across idle until the next
-    /// finalize().
-    pub last_tps: Option<f64>,
-}
-
-impl StreamingTpsTracker {
-    /// A gap longer than this between consecutive token events closes
-    /// the current active window. Tool execution, approval waits, and
-    /// between-response network round-trips all exceed this threshold,
-    /// so they're correctly excluded from the rate denominator.
-    const IDLE_GAP_SECS: f64 = 1.0;
-
-    /// Call on every `StreamingOutputTokens` event after incrementing
-    /// the token counter. `now` is `Instant::now()` (parameterized so
-    /// tests can drive the clock deterministically).
-    pub fn advance(&mut self, now: std::time::Instant) {
-        match (self.window_start, self.last_token_at) {
-            (None, _) => {
-                // First token this turn — open a window starting now.
-                self.window_start = Some(now);
-            }
-            (Some(start), Some(last)) => {
-                if (now - last).as_secs_f64() > Self::IDLE_GAP_SECS {
-                    // Idle gap — close the prior window and open a new one.
-                    self.active_secs += (last - start).as_secs_f64();
-                    self.window_start = Some(now);
-                }
-                // else: still inside the active window.
-            }
-            (Some(_), None) => {
-                // window_start without last_token: shouldn't normally
-                // happen but be safe — reset window start to `now`.
-                self.window_start = Some(now);
-            }
-        }
-        self.last_token_at = Some(now);
-    }
-
-    /// Total active seconds so far, including the currently-open
-    /// window if any. Window time is always measured between window
-    /// start and the LAST token event — never extended to `now`, so
-    /// idle ticks past the last token don't inflate the rate.
-    pub fn active_secs_now(&self, _now: std::time::Instant) -> f64 {
-        let in_flight = match (self.window_start, self.last_token_at) {
-            (Some(start), Some(last)) => (last - start).as_secs_f64().max(0.0),
-            _ => 0.0,
-        };
-        self.active_secs + in_flight
-    }
-
-    /// Stash the just-finished turn's rate as `last_tps` and reset the
-    /// accumulator for the next turn. A turn with zero tokens leaves
-    /// `last_tps` untouched (preserves the previous visible rate).
-    ///
-    /// `authoritative` is the agent service's computed tok/s from
-    /// `AgentResponse.tokens_per_second` — provider-reported output
-    /// tokens divided by summed per-iteration active streaming time.
-    /// When present, it overrides the local tiktoken-estimated rate
-    /// because (a) tiktoken's cl100k_base tokenizer over-counts
-    /// Qwen/Kimi/GLM bytes by ~1.5-2×, and (b) the local window
-    /// covers only the visible final-message streaming, not earlier
-    /// tool-call-iteration streaming. When `None` (CLI providers, or
-    /// any turn where the streaming layer couldn't measure active
-    /// time) we fall back to the local estimate so the footer
-    /// continues to show something rather than going blank.
-    pub fn finalize(&mut self, total_tokens: u32, authoritative: Option<f64>) {
-        let active = match (self.window_start, self.last_token_at) {
-            (Some(start), Some(last)) => self.active_secs + (last - start).as_secs_f64().max(0.0),
-            _ => self.active_secs,
-        };
-        if let Some(tps) = authoritative.filter(|t| t.is_finite() && *t > 0.0) {
-            self.last_tps = Some(tps);
-        } else if total_tokens > 0 && active > 0.0 {
-            self.last_tps = Some(total_tokens as f64 / active);
-        }
-        self.active_secs = 0.0;
-        self.window_start = None;
-        self.last_token_at = None;
-    }
-}
-use super::onboarding::OnboardingWizard;
+use super::onboarding::{OnboardingWizard, WizardAction};
 use crate::brain::agent::AgentService;
 use crate::brain::provider::Provider;
 use crate::brain::{BrainLoader, CommandLoader, SelfUpdater, UserCommand};
@@ -115,6 +15,7 @@ use crate::db::models::{Message, Session};
 use crate::services::{FileService, MessageService, ServiceContext, SessionService};
 use crate::tui::pane::PaneManager;
 use crate::tui::render::notice::{CLIPBOARD_HINT_TTL, ERROR_TTL, NOTIFICATION_TTL, notice_expired};
+pub use crate::ui_core::rate::StreamingTpsTracker;
 use crate::utils::prompt_analyzer::PromptAnalyzer;
 use anyhow::Result;
 use ratatui::text::Line;
@@ -484,10 +385,41 @@ pub struct App {
     /// batched query per list load. A row that is not a topic-bound Telegram
     /// session has no entry and keeps its stored name.
     pub(crate) topic_titles: HashMap<Uuid, String>,
+    /// Sessions with topics switched on (#2701). Read from `topics_enabled`,
+    /// not by counting children: the same flag the window's chat bar reads, so
+    /// `t` can tell "first press turns it on" from "second press prompts".
+    pub(crate) topics_enabled_sessions: HashSet<Uuid>,
     /// Closed sessions (#2305): dimmed in the dialog, refuse new turns.
     pub(crate) closed_sessions: HashSet<Uuid>,
     /// Sessions whose topic tree is folded: their topics are not listed (#2427).
     pub(crate) collapsed_sessions: HashSet<Uuid>,
+    /// Newest message of every listed session, for the row's preview line
+    /// (#2701). Loaded in ONE batched query per list load, never per row.
+    pub(crate) session_previews: super::session_cards::PreviewMap,
+    /// Per-session plan progress, `(done, total)`, drawn as a ten-cell bar on
+    /// the row. Absent means the session has no live plan.
+    pub(crate) session_plan_progress: HashMap<Uuid, (usize, usize)>,
+    /// Sessions whose plan file is ready for a hand: the row shows a glyph so
+    /// a waiting plan is visible from the list.
+    pub(crate) session_plan_ready: HashSet<Uuid>,
+    /// Reader for the plan files under the agents root. Holds an mtime cache,
+    /// so re-reading on a sweep is cheap; `None` roots never archive or
+    /// delete, they only look.
+    pub(crate) plan_row_index: crate::ui_core::plan_index::PlanIndex,
+    /// When the plan sweep last ran; throttles the refresh below.
+    pub(crate) plan_sweep_at: Option<std::time::Instant>,
+    /// The chat's topic bar (#2701): present when the conversation on screen
+    /// has topics on and at least one topic. Rebuilt on every session load, so
+    /// a topic attached from the list shows up the next time its parent opens.
+    pub(crate) chat_topic_bar: Option<super::session_cards::ChatTopicBar>,
+    /// Alt+T hides the bar without turning topics off: a view preference, not
+    /// a stored setting.
+    pub(crate) chat_topic_bar_hidden: bool,
+    /// The group-topics prompt (`g`), open while the user picks sessions to
+    /// attach under a target.
+    pub(crate) group_topics: Option<super::session_cards::GroupTopicsPick>,
+    /// The delete confirmation (`d`), open until answered.
+    pub(crate) delete_confirm: Option<super::session_cards::DeleteConfirm>,
     /// The name prompt for a new topic in the sessions dialog (#2306).
     pub(crate) topic_naming: bool,
     pub(crate) topic_name_buffer: String,
@@ -678,6 +610,36 @@ pub struct App {
     /// Session search/filter state (activated with `/` in /sessions)
     pub session_search: String,
     pub session_search_active: bool,
+    /// Session-list filter: plan-state chip + cron/RSI visibility (#2723).
+    /// The default hides automation per A1 and leaves the chip on All.
+    pub session_filter: crate::tui::session_filter::SessionFilter,
+    /// Cached plan state per loaded session, refreshed on `load_sessions` so
+    /// the filter reads no filesystem on the paint path (#2723). A session
+    /// absent from the cache reads as no plan.
+    pub session_plan_states:
+        std::collections::HashMap<uuid::Uuid, crate::utils::plan_files::PlanFilterState>,
+    /// The shared plan index behind the cache (#2723). Read and classify only:
+    /// a sweep never archives or deletes a plan.
+    pub(crate) plan_index: crate::utils::plan_files::PlanIndex,
+    /// Deep hits for the session-list keyword search (#2724): deduped session
+    /// rows from the shared core content search, newest-first. Empty whenever
+    /// no search is typed. The list draws a hit's snippet after the title so
+    /// the reader sees why the row matched.
+    pub session_content_matches: Vec<crate::db::repository::ContentSearchRow>,
+    /// Generation guard behind the debounced content search (#2724). Every
+    /// query change bumps it; a spawned read checks it before touching the
+    /// database, and its result only lands while it still matches.
+    pub(crate) session_search_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Seeker deep-search cache (#2725): trimmed query to deduped content
+    /// hits, so a repeated query rebuilds the card at once without a read.
+    pub(crate) seeker_find:
+        std::collections::HashMap<String, Vec<crate::db::repository::ContentSearchRow>>,
+    /// Generation guard behind the Seeker's debounced read (#2725). Same
+    /// newest-query-wins rule as the session-list search.
+    pub(crate) seeker_find_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The query the Seeker read was last scheduled for (#2725). An unchanged
+    /// query never reschedules, so caret moves and arrows cost no read.
+    pub(crate) seeker_scheduled_query: String,
     /// Viewport scroll offset for session list (first visible session index)
     pub sessions_scroll: usize,
 
@@ -690,6 +652,9 @@ pub struct App {
     pub(crate) input_history_index: Option<usize>,
     /// Saves current input when entering history
     pub(crate) input_history_stash: String,
+    /// Half-typed text keyed by the conversation it was typed in, so a session
+    /// switch and a switch back return the same draft (#2494).
+    pub(crate) drafts: crate::ui_core::composer::DraftStore,
 
     /// Working directory
     pub working_directory: std::path::PathBuf,
@@ -1031,6 +996,57 @@ mod sidebar_action_tests {
             dispatch.contains("PaletteAction::CloseSidebar => self.apply_sidebar_action(false)")
         );
     }
+
+    /// The Seeker's split rows walk the same pane path the `|` and `_` keys
+    /// walk, and land the caret on the sessions list to pick the session for
+    /// the new pane (#2712).
+    #[test]
+    fn the_split_rows_split_the_pane_instead_of_printing_a_notice() {
+        let source = include_str!("state.rs");
+        let dispatch = source
+            .rsplit("async fn apply_palette_action")
+            .next()
+            .and_then(|tail| tail.split("/// Handle keyboard input").next())
+            .expect("palette dispatch");
+
+        let arm = dispatch
+            .split("PaletteAction::BeginSplit(layout) =>")
+            .nth(1)
+            .and_then(|tail| tail.split("PaletteAction::OpenDocs").next())
+            .expect("the split arm is in the dispatch");
+
+        assert!(
+            !arm.contains("window only"),
+            "the terminal owns panes, so the row must split one"
+        );
+        assert!(
+            arm.contains("self.pane_manager.split(direction)"),
+            "the row splits the pane the caret is on"
+        );
+        assert!(
+            arm.contains("crate::tui::pane::SplitDirection::Horizontal")
+                && arm.contains("crate::tui::pane::SplitDirection::Vertical"),
+            "both layouts map to a real direction"
+        );
+        assert!(
+            arm.contains("self.switch_mode(AppMode::Sessions).await?;"),
+            "the caret lands on the list that fills the new pane"
+        );
+        assert!(
+            arm.contains("pane.session_id = Some(sid)"),
+            "the pane being split keeps the session it shows"
+        );
+
+        let group = dispatch
+            .split("PaletteAction::GroupTopics =>")
+            .nth(1)
+            .and_then(|tail| tail.split("PaletteAction::GroupTopicsOn").next())
+            .expect("the group arm is in the dispatch");
+        assert!(
+            group.contains("opens in the window"),
+            "the terminal says where the group modal lives"
+        );
+    }
 }
 
 impl App {
@@ -1057,8 +1073,18 @@ impl App {
             session_favorites: HashSet::new(),
             topic_parents: std::collections::HashMap::new(),
             topic_titles: HashMap::new(),
+            topics_enabled_sessions: HashSet::new(),
             closed_sessions: HashSet::new(),
             collapsed_sessions: HashSet::new(),
+            session_previews: super::session_cards::PreviewMap::new(),
+            session_plan_progress: HashMap::new(),
+            session_plan_ready: HashSet::new(),
+            plan_row_index: crate::ui_core::plan_index::PlanIndex::default(),
+            plan_sweep_at: None,
+            chat_topic_bar: None,
+            chat_topic_bar_hidden: false,
+            group_topics: None,
+            delete_confirm: None,
             topic_naming: false,
             topic_name_buffer: String::new(),
             usage_ledger_stats: Vec::new(),
@@ -1135,11 +1161,20 @@ impl App {
             session_rename_buffer: String::new(),
             session_search: String::new(),
             session_search_active: false,
+            session_filter: crate::tui::session_filter::SessionFilter::default(),
+            session_plan_states: std::collections::HashMap::new(),
+            plan_index: crate::utils::plan_files::PlanIndex::default(),
+            session_content_matches: Vec::new(),
+            session_search_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            seeker_find: std::collections::HashMap::new(),
+            seeker_find_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            seeker_scheduled_query: String::new(),
             sessions_scroll: 0,
             ps: crate::tui::provider_selector::ProviderSelectorState::default(),
             input_history: Self::load_history(),
             input_history_index: None,
             input_history_stash: String::new(),
+            drafts: crate::ui_core::composer::DraftStore::new(),
             working_directory: crate::utils::cwd::launch_cwd(),
             pending_context: std::collections::HashMap::new(),
             #[cfg(unix)]
@@ -1277,23 +1312,186 @@ impl App {
         self.current_session.as_ref().map(|s| s.id) == Some(session_id)
     }
 
-    /// Returns indices into `self.sessions` that match the current search filter.
-    /// When no search is active, returns all indices.
+    /// Returns indices into `self.sessions` that the list should draw (#2723,
+    /// #2724).
+    ///
+    /// One pure rule decides each row: an explicit keyword search spans every
+    /// session (A1), while the browsing list applies the plan chip and hides
+    /// cron/RSI unless the automation toggle is on. The plan state comes from
+    /// the cache `load_sessions` refreshes, so this reads no filesystem and the
+    /// same inputs always give the same view.
+    ///
+    /// While searching, title matches lead in ledger order and content-only
+    /// hits follow in the deep search's newest-first rank, mirroring the GUI
+    /// rail's `merge_find_results` (#2720). A session found both ways appears
+    /// once, in the title block.
     pub(crate) fn visible_session_indices(&self) -> Vec<usize> {
-        if self.session_search.is_empty() {
-            (0..self.sessions.len()).collect()
-        } else {
-            let search = self.session_search.to_lowercase();
-            self.sessions
+        use crate::tui::session_filter::session_row_visible;
+        use crate::utils::plan_files::PlanFilterState;
+        let searching = !self.session_search.trim().is_empty();
+        let mut title_hits: Vec<usize> = Vec::new();
+        let mut content_only: Vec<usize> = Vec::new();
+        for (i, s) in self.sessions.iter().enumerate() {
+            let title = s.title.as_deref().unwrap_or("New Chat");
+            let plan = self
+                .session_plan_states
+                .get(&s.id)
+                .copied()
+                .unwrap_or(PlanFilterState::None);
+            let content_hit = self
+                .session_content_matches
                 .iter()
-                .enumerate()
-                .filter(|(_, s)| {
-                    let name = s.title.as_deref().unwrap_or("New Chat").to_lowercase();
-                    name.contains(&search)
-                })
-                .map(|(i, _)| i)
-                .collect()
+                .any(|r| r.session_id == s.id);
+            if !session_row_visible(
+                &self.session_filter,
+                title,
+                plan,
+                &self.session_search,
+                content_hit,
+            ) {
+                continue;
+            }
+            if searching
+                && title
+                    .to_lowercase()
+                    .contains(&self.session_search.trim().to_lowercase())
+            {
+                title_hits.push(i);
+            } else {
+                content_only.push(i);
+            }
         }
+        if searching {
+            // Content-only rows keep the deep search's rank (newest-first).
+            content_only.sort_by_key(|&i| {
+                self.session_content_matches
+                    .iter()
+                    .position(|r| r.session_id == self.sessions[i].id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        title_hits.extend(content_only);
+        title_hits
+    }
+
+    /// Kick the deep content read for the session-list keyword search (#2724).
+    ///
+    /// Every query change bumps the generation; the spawned read sleeps
+    /// 250ms so a burst of keystrokes costs one query, checks the generation
+    /// before touching the database, and only lands its rows while the
+    /// generation still matches. An empty query clears the hits at once and
+    /// schedules nothing. Mirrors the GUI's `schedule_seeker_find` guard
+    /// (#2721) on the TUI's event rail.
+    pub(crate) fn schedule_session_content_search(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let generation = self.session_search_gen.fetch_add(1, SeqCst) + 1;
+        let query = self.session_search.trim().to_string();
+        if query.is_empty() {
+            self.session_content_matches.clear();
+            return;
+        }
+        let search_gen = self.session_search_gen.clone();
+        let pool = self.session_service.pool();
+        let sender = self.event_sender();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if search_gen.load(SeqCst) != generation {
+                return;
+            }
+            let messages = crate::db::repository::MessageRepository::new(pool.clone());
+            let sessions = crate::db::repository::SessionRepository::new(pool);
+            match crate::db::repository::search_session_content(&messages, &sessions, &query, 50)
+                .await
+            {
+                Ok(rows) => {
+                    let _ = sender.send(TuiEvent::SessionContentSearchResult { generation, rows });
+                }
+                Err(e) => {
+                    tracing::warn!("session content search failed: {e}");
+                }
+            }
+        });
+    }
+
+    /// Seeker deep search (#2725): schedule a content read for the open
+    /// card's query. Mirrors the GUI's `schedule_seeker_find`: an unchanged
+    /// query never reschedules, an empty query needs no read, and a cached
+    /// query rebuilds the rows at once. A fresh read lets the typing settle
+    /// 250ms, checks the generation before touching the database, and its
+    /// result only lands while the generation still matches.
+    pub(crate) fn schedule_seeker_content_search(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let query = self
+            .command_palette
+            .as_ref()
+            .map(|state| state.query().trim().to_string())
+            .unwrap_or_default();
+        if query == self.seeker_scheduled_query {
+            return;
+        }
+        self.seeker_scheduled_query = query.clone();
+        if query.is_empty() {
+            return;
+        }
+        if self.seeker_find.contains_key(&query) {
+            self.refresh_seeker_items();
+            return;
+        }
+        let generation = self.seeker_find_gen.fetch_add(1, SeqCst) + 1;
+        let search_gen = self.seeker_find_gen.clone();
+        let pool = self.session_service.pool();
+        let sender = self.event_sender();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if search_gen.load(SeqCst) != generation {
+                return;
+            }
+            let messages = crate::db::repository::MessageRepository::new(pool.clone());
+            let sessions = crate::db::repository::SessionRepository::new(pool);
+            match crate::db::repository::search_session_content(&messages, &sessions, &query, 50)
+                .await
+            {
+                Ok(rows) => {
+                    let _ = sender.send(TuiEvent::SeekerContentSearchResult {
+                        generation,
+                        query,
+                        rows,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("seeker content search failed: {e}");
+                }
+            }
+        });
+    }
+
+    /// Rebuild the open Seeker's rows from the catalog (which now folds in
+    /// any cached content hits) without touching the query or caret (#2725).
+    /// A closed card has nothing to rebuild; the cache keeps the hits warm
+    /// for the next open.
+    fn refresh_seeker_items(&mut self) {
+        if self.command_palette.is_none() {
+            return;
+        }
+        let items = self.palette_items();
+        if let Some(state) = self.command_palette.as_mut() {
+            state.refresh_items(items);
+        }
+    }
+
+    /// The full-list index of the session the cursor is on, resolved through
+    /// the filtered view (#2723).
+    ///
+    /// `selected_session_index` is a position in the visible (searched +
+    /// filtered) list, the same space the render highlights and
+    /// `focus_current_session` anchors in. Acting on a session must resolve
+    /// through here, never index `sessions` with the raw cursor: once a filter
+    /// hides rows the two spaces differ and the raw index opens the wrong
+    /// session.
+    pub(crate) fn selected_session_actual_index(&self) -> Option<usize> {
+        self.visible_session_indices()
+            .get(self.selected_session_index)
+            .copied()
     }
 
     /// Put the picker cursor on the session the user is currently in.
@@ -1444,7 +1642,23 @@ impl App {
     /// necessarily the one holding the keyboard. The config flag is read at the
     /// moment of the chime, so flipping
     /// `[agent] completion_notification_enabled` takes effect without a restart.
-    fn chime_settled_plan_tasks(&mut self) {
+    async fn chime_settled_plan_tasks(&mut self) {
+        if self.settle_plan_tasks().await == 0 {
+            return;
+        }
+        Self::play_task_chime();
+    }
+
+    /// Record the plan tasks that settled since the last tick and pulse the
+    /// pane that owns each one. Returns the count the chime responds to.
+    ///
+    /// Every pane is refreshed from its own file first. Reloading only the
+    /// focused pane left a background session's checklist frozen at the
+    /// moment it was opened, so its settle chimed minutes later, on the click
+    /// that finally reloaded it (#2733).
+    pub(crate) async fn settle_plan_tasks(&mut self) -> usize {
+        self.pane_manager.bind_missing_plan_paths().await;
+        self.pane_manager.refresh_plans_changed_on_disk();
         // Each pane's document is checked against ITS OWN session, so the
         // chime also knows which panel to blink (#2593). The window-level plan
         // is folded in afterwards for the case where no pane owns it; it has
@@ -1464,7 +1678,7 @@ impl App {
         let mut settled = 0usize;
         let mut flashes: Vec<Uuid> = Vec::new();
         for (session_id, plan) in &per_pane {
-            let count = crate::utils::completion_sound::newly_resolved(
+            let count = crate::utils::desktop_notify::announce_settled_tasks(
                 &mut self.announced_task_completions,
                 &[plan.as_ref()],
             );
@@ -1475,18 +1689,15 @@ impl App {
                 flashes.push(*session_id);
             }
         }
-        settled += crate::utils::completion_sound::newly_resolved(
+        settled += crate::utils::desktop_notify::announce_settled_tasks(
             &mut self.announced_task_completions,
             &[window_plan.as_ref()],
         );
-        if settled == 0 {
-            return;
-        }
         let now = std::time::Instant::now();
         for session_id in flashes {
             self.plan_completion_flash.insert(session_id, now);
         }
-        Self::play_task_chime();
+        settled
     }
 
     /// The chime itself, honouring the operator's opt-in and the build feature.
@@ -2501,7 +2712,16 @@ impl App {
                 // The tick is the right place: the plan file is written by
                 // the tool and re-read here, so no tool path has to know
                 // whether a sound is wanted.
-                self.chime_settled_plan_tasks();
+                self.chime_settled_plan_tasks().await;
+
+                // Plan rows are live, not a snapshot of when the list opened:
+                // a task settles while the owner stares at the cards, and the
+                // rail on the desktop side updates for it. The sweep throttles
+                // itself to `SWEEP_EVERY`, so this is one `read_dir` pass every
+                // five seconds, and only while the list is the visible screen.
+                if self.mode == AppMode::Sessions {
+                    self.sweep_plans();
+                }
             }
             TuiEvent::ToolApprovalRequested(request) => {
                 self.handle_approval_requested(request);
@@ -3281,6 +3501,16 @@ impl App {
                         outcome.models
                     };
                     wizard.ps.resolve_selected_model_index();
+                    // A provider whose live catalogue holds a single model never
+                    // needs the picker: commit it and advance (#2782). A
+                    // non-`None` action is the built-in install token, which only
+                    // the key handler can dispatch, so the step stays up there
+                    // and Enter takes it (#2047).
+                    if let Some(action) = wizard.advance_past_sole_model()
+                        && matches!(action, WizardAction::None)
+                    {
+                        tracing::debug!("[onboarding] advanced past the sole-model step");
+                    }
                 }
             }
             TuiEvent::GitHubDeviceCode(code) => {
@@ -3611,12 +3841,17 @@ impl App {
             }
             TuiEvent::FocusGained => {
                 self.window_focused = true;
+                // #2729: an OS banner is noise while the user is looking at
+                // the app, so the surface reports its focus and the transport
+                // suppresses while it holds.
+                crate::utils::desktop_notify::set_surface_focused(true);
                 // Immediate probe, bypassing the cooldown: alt-tabbing back is
                 // the moment a screenshot taken elsewhere becomes visible (#1816).
                 self.refresh_clipboard_hint(true);
             }
             TuiEvent::FocusLost => {
                 self.window_focused = false;
+                crate::utils::desktop_notify::set_surface_focused(false);
             }
             TuiEvent::Resize(w, h) => {
                 // Invalidate render cache on terminal resize (content width changes)
@@ -3633,6 +3868,37 @@ impl App {
                 // succeeded; the exit status is the real answer (#2170).
                 self.notification = Some(format!("Could not open {target}: {detail}"));
                 self.notification_shown_at = Some(std::time::Instant::now());
+            }
+            TuiEvent::SessionContentSearchResult { generation, rows } => {
+                // Only the newest query's read may land: an older read that
+                // finishes last must not overwrite fresher hits (#2724).
+                if generation
+                    == self
+                        .session_search_gen
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.session_content_matches = rows;
+                    let visible = self.visible_session_indices().len();
+                    if self.selected_session_index >= visible {
+                        self.selected_session_index = visible.saturating_sub(1);
+                    }
+                }
+            }
+            TuiEvent::SeekerContentSearchResult {
+                generation,
+                query,
+                rows,
+            } => {
+                // Only the newest query's read may land; the cache keys by
+                // the exact query it answered (#2725).
+                if generation
+                    == self
+                        .seeker_find_gen
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.seeker_find.insert(query, rows);
+                    self.refresh_seeker_items();
+                }
             }
         }
         Ok(())
@@ -3695,17 +3961,45 @@ impl App {
                 .with_description(&skill.description),
             );
         }
+        // Deep search (#2725): when the query names message content, the
+        // conversation row carries the matching snippet in place of the date
+        // and the query as a keyword, so a session whose title never mentions
+        // the word still surfaces. With no content hit the row is unchanged.
+        let seeker_query = self
+            .command_palette
+            .as_ref()
+            .map(|state| state.query().trim().to_string())
+            .unwrap_or_default();
+        let snippets: std::collections::HashMap<Uuid, String> = self
+            .seeker_find
+            .get(&seeker_query)
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| (row.session_id, row.snippet.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         for session in &self.sessions {
             let title = session
                 .title
                 .clone()
                 .unwrap_or_else(|| "Untitled conversation".to_string());
-            items.push(PaletteItem::new(
-                title,
-                session.updated_at.format("%Y-%m-%d %H:%M").to_string(),
-                PaletteKind::Session,
-                PaletteAction::OpenSession(session.id.as_u128()),
-            ));
+            let item = match snippets.get(&session.id) {
+                Some(snippet) if !seeker_query.is_empty() => PaletteItem::new(
+                    title,
+                    snippet.clone(),
+                    PaletteKind::Session,
+                    PaletteAction::OpenSession(session.id.as_u128()),
+                )
+                .with_keywords(&seeker_query),
+                _ => PaletteItem::new(
+                    title,
+                    session.updated_at.format("%Y-%m-%d %H:%M").to_string(),
+                    PaletteKind::Session,
+                    PaletteAction::OpenSession(session.id.as_u128()),
+                ),
+            };
+            items.push(item);
         }
         items
     }
@@ -3719,20 +4013,30 @@ impl App {
             return Ok(());
         }
         let mut run = None;
+        let mut edited = false;
         if let Some(state) = self.command_palette.as_mut() {
             match event.code {
                 KeyCode::Enter => run = state.selected().map(|row| row.item.action),
                 KeyCode::Up => state.move_by(-1, crate::ui_core::palette::MAX_ROWS),
                 KeyCode::Down => state.move_by(1, crate::ui_core::palette::MAX_ROWS),
-                KeyCode::Backspace => state.backspace(),
+                KeyCode::Backspace => {
+                    state.backspace();
+                    edited = true;
+                }
                 KeyCode::Char(c)
                     if !event.modifiers.contains(KeyModifiers::CONTROL)
                         && !event.modifiers.contains(KeyModifiers::SUPER) =>
                 {
                     state.type_char(c);
+                    edited = true;
                 }
                 _ => {}
             }
+        }
+        // A typed edit re-runs the deep search; the scheduler dedupes an
+        // unchanged query, so caret moves and arrows never read (#2725).
+        if edited {
+            self.schedule_seeker_content_search();
         }
         if let Some(action) = run {
             self.command_palette = None;
@@ -3869,6 +4173,54 @@ impl App {
                     format!("Pinned to top: {title}")
                 });
                 self.notification_shown_at = Some(std::time::Instant::now());
+            }
+            PaletteAction::GroupTopics => {
+                // The group modal is a window surface, so the terminal names
+                // it instead of arming a pick that ends nowhere (#2713).
+                self.notification = Some("Group topics opens in the window".to_string());
+                self.notification_shown_at = Some(std::time::Instant::now());
+            }
+            PaletteAction::GroupTopicsOn(_) => {
+                // Nothing arms the group pick in the terminal, so this arm
+                // keeps the match exhaustive and says where the modal lives
+                // (#2713).
+                self.notification = Some("Group topics opens in the window".to_string());
+                self.notification_shown_at = Some(std::time::Instant::now());
+            }
+            PaletteAction::BeginSplit(layout) => {
+                // The same door the `|` and `_` keys walk (#2712): pin the
+                // focused pane to the session it is showing, stash the input
+                // with it, split, then leave the caret on the list to pick the
+                // session for the new pane.
+                if let Some(ref session) = self.current_session {
+                    let sid = session.id;
+                    if let Some(pane) = self.pane_manager.focused_pane_mut() {
+                        pane.session_id = Some(sid);
+                    }
+                }
+                self.pane_manager.stash_input(
+                    &mut self.input_buffer,
+                    &mut self.cursor_position,
+                    &mut self.input_history_index,
+                    &mut self.input_history_stash,
+                );
+                let direction = match layout {
+                    crate::ui_core::split::Layout::Side => {
+                        crate::tui::pane::SplitDirection::Horizontal
+                    }
+                    crate::ui_core::split::Layout::Stack => {
+                        crate::tui::pane::SplitDirection::Vertical
+                    }
+                };
+                self.pane_manager.split(direction);
+                self.pane_manager.adopt_input(
+                    &mut self.input_buffer,
+                    &mut self.cursor_position,
+                    &mut self.input_history_index,
+                    &mut self.input_history_stash,
+                );
+                self.pane_manager.save_layout();
+                self.switch_mode(AppMode::Sessions).await?;
             }
             PaletteAction::OpenDocs(path) => {
                 // Detached, exactly like a previewed file: waiting on the
@@ -4258,6 +4610,7 @@ impl App {
                 &mut self.input_buffer,
                 &mut self.cursor_position,
                 &mut self.input_history_index,
+                &mut self.input_history_stash,
             );
             self.pane_manager.save_layout();
             if let Some(pane) = self.pane_manager.focused_pane()
@@ -4311,6 +4664,7 @@ impl App {
                 &mut self.input_buffer,
                 &mut self.cursor_position,
                 &mut self.input_history_index,
+                &mut self.input_history_stash,
             );
             if clockwise {
                 self.pane_manager.focus_next();
@@ -4321,6 +4675,7 @@ impl App {
                 &mut self.input_buffer,
                 &mut self.cursor_position,
                 &mut self.input_history_index,
+                &mut self.input_history_stash,
             );
             if let Some(pane) = self.pane_manager.focused_pane()
                 && let Some(session_id) = pane.session_id

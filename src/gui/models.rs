@@ -11,7 +11,7 @@
 
 use opencrabs::tui::onboarding_render::visible_window;
 use opencrabs::ui_core::model_selector::{
-    CUSTOM_PROVIDER_IDX, ProviderSelectorState, sort_newest_first,
+    CUSTOM_PROVIDER_IDX, ProviderSelectorState, single_model_choice, sort_newest_first,
 };
 
 /// One selectable pair.
@@ -116,6 +116,31 @@ pub fn providers(rows: &[Row]) -> Vec<ProviderRow> {
         }
     }
     out
+}
+
+/// The pair a provider row's click switches to without asking again.
+///
+/// A provider with one model in view has no model row worth picking, so the
+/// click has to be the switch itself. Before this, the tile answered a hand
+/// with a cursor move and the picker stayed open on a list with one row in it
+/// (#2782). `rows` is the slice the provider list was built from, so the
+/// count comes from the rows actually painted rather than a number carried
+/// alongside them.
+///
+/// Returns `None` when there is nothing to switch to: more than one model in
+/// view, or the single model is the pair already answering.
+pub fn single_model_pair(rows: &[Row], row: &ProviderRow) -> Option<String> {
+    // The rows actually painted for this provider, so the one-model rule is
+    // the shared `single_model_choice` and never a second count kept in step
+    // by hand (#2782).
+    let offered: Vec<String> = rows
+        .iter()
+        .filter(|candidate| candidate.provider == row.provider)
+        .map(Row::pair)
+        .collect();
+    let pair = single_model_choice(&offered)?.to_string();
+    let model = rows.iter().find(|candidate| candidate.pair() == pair)?;
+    (!model.current).then_some(pair)
 }
 
 /// Build the grouped, windowed panel the GUI renders. The window arithmetic is
@@ -439,6 +464,54 @@ mod tests {
         assert_eq!(narrowed.len(), 1);
         assert_eq!((narrowed[0].count, narrowed[0].first), (1, 0));
         assert!(providers(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_one_model_provider_click_switches_and_a_bigger_one_does_not() {
+        let mut rows = vec![
+            row("solo", "Solo Provider", "only-model"),
+            row("many", "Many Provider", "alpha"),
+            row("many", "Many Provider", "beta"),
+        ];
+        let grouped = providers(&rows);
+        // One model in view: the click is the switch, and it names the pair the
+        // tile counts instead of leaving the picker open on a single row.
+        assert_eq!(
+            single_model_pair(&rows, &grouped[0]).as_deref(),
+            Some("solo/only-model")
+        );
+        // A real choice is still a choice.
+        assert_eq!(single_model_pair(&rows, &grouped[1]), None);
+
+        // A filter rebuilds the counts from the rows that are painted, so a
+        // narrowed provider switches to the model its tile says it has.
+        let narrowed = filtered_rows(&rows, "beta");
+        let narrowed_rows = providers(&narrowed);
+        assert_eq!(
+            single_model_pair(&narrowed, &narrowed_rows[0]).as_deref(),
+            Some("many/beta")
+        );
+
+        // The pair already answering is not a switch: the click only moves the
+        // cursor, so a live tile never closes the picker onto itself.
+        rows[0].current = true;
+        let grouped = providers(&rows);
+        assert_eq!(single_model_pair(&rows, &grouped[0]), None);
+
+        // An index with no painted row behind it is not a switch either.
+        let empty: Vec<Row> = Vec::new();
+        assert_eq!(
+            single_model_pair(
+                &empty,
+                &ProviderRow {
+                    provider: "ghost".into(),
+                    name: "Ghost".into(),
+                    count: 1,
+                    first: 0,
+                }
+            ),
+            None
+        );
     }
 
     #[test]
